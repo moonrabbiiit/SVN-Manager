@@ -609,7 +609,7 @@ impl SvnApp {
 }
 
 /// 卡片配色：与提交记录明细窗口一致——浅色白底灰边，深色深底浅灰边
-fn card_colors(ui: &Ui) -> (Color32, Color32) {
+pub(crate) fn card_colors(ui: &Ui) -> (Color32, Color32) {
     if ui.visuals().dark_mode {
         (Color32::from_gray(40), Color32::from_gray(65))
     } else {
@@ -618,7 +618,7 @@ fn card_colors(ui: &Ui) -> (Color32, Color32) {
 }
 
 /// 提示 / 警告横幅卡片：`warn` 为真时用橙黄底
-fn note_card(ui: &mut Ui, text: &str, warn: bool) {
+pub(crate) fn note_card(ui: &mut Ui, text: &str, warn: bool) {
     let (fill, stroke, color) = if ui.visuals().dark_mode {
         (
             Color32::from_rgb(58, 50, 22),

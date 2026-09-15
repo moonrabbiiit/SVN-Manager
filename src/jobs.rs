@@ -18,6 +18,11 @@ pub enum Kind {
     CheckUpdate,
     /// AI 生成工作日志（把勾选的提交记录发给 AI，整块结果一次性回传，dir 恒为 usize::MAX）
     AiLog,
+    /// 个人提交统计：按目录各起一个读日志的任务，一次查询同时有几个在跑。
+    /// 池里的 dir 恒为 usize::MAX：`is_busy` 只比目录编号不比种类，用真实编号会把那个
+    /// 目录的「提交 / 更新 / relocate」按钮一起按住，而统计只是读数据，不该妨碍干活。
+    /// 真实目录编号在 `Data::Stats.dir` 里带回来。
+    Stats,
     /// 下载新版本 exe 到临时目录（下载与校验都在程序内完成）
     DownloadUpdate,
     Update,
@@ -56,6 +61,15 @@ pub enum Data {
         content: String,
         message: String,
     },
+    /// 个人提交统计：一个目录在指定区间内的本人提交记录。
+    /// `epoch` 是发起这次查询时代页面上的代号，对不上说明用户中途换了条件，结果直接丢。
+    Stats {
+        dir: usize,
+        epoch: u64,
+        entries: Vec<LogEntry>,
+        ok: bool,
+        message: String,
+    },
     Wc {
         dir: usize,
         info: Option<WcInfo>,
@@ -68,6 +82,9 @@ pub enum Data {
         changed: Option<usize>,
         /// 会进「全部上传」的变动明细（含 ? 自动 add、! 自动 delete 的条目）
         changes: Vec<StatusEntry>,
+        /// 需要人工处理的条目数（冲突 / 不完整），按**未过滤**的 status 结果统计：
+        /// `changed` / `changes` 只留可提交的条目，冲突会被滤掉，不另外数就没人知道自己卡住了
+        conflicts: Option<usize>,
         /// 服务器上已变、本地还没更新的文件数（`svn status -u`）
         out_of_date: Option<usize>,
     },

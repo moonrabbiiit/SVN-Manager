@@ -174,6 +174,17 @@ impl Item {
             _ => (170, 170, 170),
         }
     }
+
+    /// 必须人工干预才动得了的条目：冲突（含 tree conflict，`svn status --xml` 里同样是
+    /// `conflicted`）与不完整。目录行、顶栏汇总和提交页「需处理」都按这个口径数。
+    pub fn blocked(self) -> bool {
+        matches!(self, Self::Conflict | Self::Incomplete)
+    }
+}
+
+/// 需要人工处理的条目数。
+pub fn blocked_count(entries: &[StatusEntry]) -> usize {
+    entries.iter().filter(|entry| entry.item.blocked()).count()
 }
 
 #[derive(Clone, Debug)]
@@ -545,7 +556,15 @@ impl Svn {
     /// 这样即使该文件在本地已被改名 / 删除也能读到记录）。
     /// `limit` > 0 时加 `-l` 限制条数；<= 0 表示不限条数（不带 `-l`，svn 会拉全量）。
     pub fn log(&self, target: &str, limit: i64, author: &str) -> (Vec<LogEntry>, Run) {
-        let mut args: Vec<&str> = vec!["log", "--xml", "-v", "-r", "HEAD:1"];
+        self.log_in(target, "HEAD:1", limit, author)
+    }
+
+    /// 同 `log`，但由调用方给出版本区间（`revspec`，如 `HEAD:1` 或 `{2026-09-11}:{2026-09-04}`）。
+    /// 按日期查统计时必须走这里：`log` 固定的 `HEAD:1` 无法限定区间。
+    /// `revspec` 一律写成「新 → 旧」：`-r` 是正序时 `-l` 会保留区间里**最旧**的 N 条，
+    /// 所以日期区间这里不限制条数（`limit` 传 0），只靠区间本身收口。
+    pub fn log_in(&self, target: &str, revspec: &str, limit: i64, author: &str) -> (Vec<LogEntry>, Run) {
+        let mut args: Vec<&str> = vec!["log", "--xml", "-v", "-r", revspec];
         let count;
         if limit > 0 {
             count = limit.to_string();
@@ -1047,6 +1066,28 @@ mod tests {
 </status>"#;
         assert_eq!(parse_out_of_date(xml), 2, "只有带 repos-status 的条目算待更新");
         assert_eq!(parse_out_of_date("<status>"), 0, "输出残缺时不误报");
+    }
+
+    /// 目录行「冲突 N」与提交页「需处理」共用 blocked_count，口径只能有一处。
+    #[test]
+    fn blocked_count_covers_conflicts_and_incomplete_only() {
+        let xml = r#"<status>
+  <target path="D:\wc">
+    <entry path="D:\wc\a.java"><wc-status item="conflicted" props="none" revision="10"/></entry>
+    <entry path="D:\wc\b.java"><wc-status item="conflicted" props="items" revision="10"/></entry>
+    <entry path="D:\wc\c"><wc-status item="incomplete" props="none" revision="10"/></entry>
+    <entry path="D:\wc\d.java"><wc-status item="modified" props="none" revision="10"/></entry>
+    <entry path="D:\wc\e.java"><wc-status item="unversioned" props="none" revision="10"/></entry>
+  </target>
+</status>"#;
+        let entries = parse_status(xml, Path::new(r"D:\wc"));
+        assert_eq!(blocked_count(&entries), 3, "冲突两条 + 不完整一条");
+        assert_eq!(blocked_count(&[]), 0);
+        let clean = parse_status(
+            r#"<status><target path="D:\wc"><entry path="D:\wc\a.java"><wc-status item="modified" props="none" revision="10"/></entry></target></status>"#,
+            Path::new(r"D:\wc"),
+        );
+        assert_eq!(blocked_count(&clean), 0, "普通改动不算需处理");
     }
 
     #[test]

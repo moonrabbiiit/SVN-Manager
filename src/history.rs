@@ -1,8 +1,10 @@
+use chrono::NaiveDate;
 use egui::{
     Align, Color32, FontId, Frame, Layout, Rect, RichText, ScrollArea, TextEdit, Ui, Vec2,
 };
 
 use crate::jobs::Kind;
+use crate::stats::{parse_date, resolve_range, reversed_hint, RangePreset};
 use crate::svn::{LogEntry, LogPath};
 use crate::{highlight, ink, SvnApp};
 
@@ -22,6 +24,15 @@ pub struct HistoryPage {
     pub mine: bool,
     /// 临时不限读取条数（不带 `-l` 拉全量）：只对本次页面生效，不写进设置
     pub unlimited: bool,
+    /// 区间控件当前选中的预设：`None` = 按「条数」读最近 N 条。只管界面高亮。
+    pub preset: Option<RangePreset>,
+    /// 实际生效的服务器端日期区间（`None` = 不限日期）。读记录看这个，不看 `preset`。
+    pub range: Option<(NaiveDate, NaiveDate)>,
+    /// 「自定义」的两个输入缓冲（`YYYY-MM-DD`，结束留空 = 到今天）
+    pub custom_from: String,
+    pub custom_to: String,
+    /// 区间输入有误时的提示：只报，不动已经读回来的列表
+    pub range_error: String,
 }
 
 impl HistoryPage {
@@ -39,6 +50,11 @@ impl HistoryPage {
             author,
             mine,
             unlimited: false,
+            preset: None,
+            range: None,
+            custom_from: String::new(),
+            custom_to: String::new(),
+            range_error: String::new(),
         }
     }
 
@@ -47,6 +63,17 @@ impl HistoryPage {
         (0..self.entries.len())
             .filter(|index| {
                 let entry = &self.entries[*index];
+                // 按区间读时查询窗口两端各放宽了 1~2 天（躲开 `{日期}` 按本地还是 UTC 解释的
+                // 分歧，也避免当天这种退化区间查不到东西），这里要按用户选的区间裁回去，
+                // 否则列表里会混进区间外的提交，看着就像筛选没生效
+                if let Some((from, to)) = self.range {
+                    let Some(day) = entry.date.get(..10).and_then(parse_date) else {
+                        return false;
+                    };
+                    if day < from || day > to {
+                        return false;
+                    }
+                }
                 filter.is_empty()
                     || entry.message.to_lowercase().contains(&filter)
                     || entry.author.to_lowercase().contains(&filter)
@@ -275,15 +302,20 @@ impl SvnApp {
                     self.cfg.log_limit = page.limit;
                     self.persist();
                     self.history = Some(page.clone());
-                    self.spawn_log(page.dir, page.mine, page.unlimited);
+                    self.spawn_log_in(page.dir, page.mine, page.unlimited, page.range);
                 }
                 // 临时不限条数：只影响本次页面的读取，不写进设置；勾上的瞬间就按新模式重读
-                if ui
-                    .checkbox(&mut page.unlimited, "不限")
+                let by_count = page.range.is_none();
+                let unlimited = ui.add_enabled(
+                    by_count,
+                    egui::Checkbox::new(&mut page.unlimited, "不限"),
+                );
+                if unlimited
                     .on_hover_text(
                         "勾上：本次读取不带条数限制，把服务器上全部提交记录拉下来（大仓库会慢一些）。\n\
                          取消：恢复按「条数」读取。\n\
-                         只对当前这个页面生效，不写入设置；切换后会立刻重新读取。",
+                         只对当前这个页面生效，不写入设置；切换后会立刻重新读取。\n\
+                         选了日期区间时这里会置灰：区间要的是那几天，条数限制用不上。",
                     )
                     .changed()
                 {
@@ -293,13 +325,21 @@ impl SvnApp {
                     self.cfg.log_limit = page.limit;
                     self.persist();
                     self.history = Some(page.clone());
-                    self.spawn_log(page.dir, page.mine, page.unlimited);
+                    self.spawn_log_in(page.dir, page.mine, page.unlimited, page.range);
                 }
                 ui.add_enabled(
-                    !page.unlimited,
+                    by_count && !page.unlimited,
                     egui::DragValue::new(&mut page.limit).range(1..=2000).speed(5),
                 );
-                ui.label(RichText::new("条数").weak().size(12.0));
+                ui.label(
+                    RichText::new(if by_count { "条数" } else { "条数（区间内不限）" })
+                        .weak()
+                        .size(12.0),
+                )
+                .on_hover_text(
+                    "每次从服务器读多少条提交。\n\
+                     选了下面的日期区间时改由区间决定读多少条，这个值暂时不生效。",
+                );
                 ui.add_sized(
                     Vec2::new(300.0, 22.0),
                     TextEdit::singleline(&mut page.filter).hint_text("按说明 / 作者 / 路径过滤"),
@@ -315,7 +355,7 @@ impl SvnApp {
                 self.cfg.log_limit = page.limit;
                 self.persist();
                 self.history = Some(page.clone());
-                self.spawn_log(page.dir, page.mine, page.unlimited);
+                self.spawn_log_in(page.dir, page.mine, page.unlimited, page.range);
             }
             if !server_rev.is_empty() {
                 ui.label(
@@ -334,6 +374,119 @@ impl SvnApp {
                 ui.label(RichText::new("记录取自服务器 HEAD").size(12.0).weak());
             }
         });
+        // 日期区间：走服务器端 `-r {止}:{起}`，比在已读的那批里筛准（条数之外的旧提交也能拿到）
+        let today = chrono::Local::now().date_naive();
+        let mut refetch = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("区间").strong());
+            if ui
+                .selectable_label(page.preset.is_none(), "按条数")
+                .on_hover_text(
+                    "不限制日期，按上面的「条数」读最近 N 条提交（默认就是这个）。",
+                )
+                .clicked()
+                && page.preset.is_some()
+            {
+                page.preset = None;
+                page.range = None;
+                page.range_error.clear();
+                refetch = true;
+            }
+            for preset in [
+                RangePreset::Today,
+                RangePreset::Week,
+                RangePreset::Month,
+                RangePreset::Year,
+                RangePreset::Custom,
+            ] {
+                if !ui
+                    .selectable_label(page.preset == Some(preset), preset.label())
+                    .on_hover_text(if preset == RangePreset::Custom {
+                        "手填起止日期（含两端），填完点「查询」；结束日期留空表示到今天".to_owned()
+                    } else {
+                        preset.hover().to_owned()
+                    })
+                    .clicked()
+                {
+                    continue;
+                }
+                if preset == RangePreset::Custom {
+                    // 只切界面：日期还没填完就发请求，只会读到一批没意义的记录
+                    page.preset = Some(preset);
+                    continue;
+                }
+                match resolve_range(preset, &page.custom_from, &page.custom_to, today) {
+                    Ok(span) => {
+                        page.preset = Some(preset);
+                        page.range = span;
+                        page.range_error.clear();
+                        refetch = true;
+                    }
+                    Err(message) => page.range_error = message,
+                }
+            }
+            if page.preset == Some(RangePreset::Custom) {
+                let from = parse_date(&page.custom_from);
+                let to = parse_date(&page.custom_to);
+                crate::stats::date_input(
+                    ui,
+                    egui::Id::new("hist_custom_from"),
+                    &mut page.custom_from,
+                    "2026-09-01",
+                    today,
+                    crate::stats::DayLimits { from: None, to },
+                );
+                ui.label("至");
+                crate::stats::date_input(
+                    ui,
+                    egui::Id::new("hist_custom_to"),
+                    &mut page.custom_to,
+                    "留空=今天",
+                    today,
+                    crate::stats::DayLimits { from, to: None },
+                );
+                if ui.button("查询").clicked() {
+                    match resolve_range(RangePreset::Custom, &page.custom_from, &page.custom_to, today) {
+                        Ok(span) => {
+                            page.range = span;
+                            page.range_error.clear();
+                            refetch = true;
+                        }
+                        Err(message) => page.range_error = message,
+                    }
+                }
+            }
+            if let Some((from, to)) = page.range {
+                ui.label(
+                    RichText::new(format!("读 {from} ~ {to} 的提交"))
+                        .size(12.0)
+                        .weak(),
+                );
+            }
+        });
+        if page.preset == Some(RangePreset::Custom) {
+            if let Some(warn) = reversed_hint(&page.custom_from, &page.custom_to) {
+                ui.label(
+                    RichText::new(warn)
+                        .size(11.5)
+                        .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                );
+            }
+        }
+        if refetch {
+            page.error.clear();
+            page.entries.clear();
+            page.picked = None;
+            self.history = Some(page.clone());
+            self.spawn_log_in(page.dir, page.mine, page.unlimited, page.range);
+        }
+        if !page.range_error.is_empty() {
+            ui.label(
+                RichText::new(page.range_error.clone())
+                    .size(11.5)
+                    .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+            );
+        }
         if page.author.trim().is_empty() && !loading {
             ui.label(
                 RichText::new("没有取到本机 svn 登录人（svn auth），无法默认只看自己的提交")
@@ -1204,5 +1357,43 @@ impl SvnApp {
         } else {
             Some(log)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::parse_date;
+
+    fn entry(revision: &str, when: &str) -> LogEntry {
+        LogEntry {
+            revision: revision.to_owned(),
+            author: "zhangsan".to_owned(),
+            date: when.to_owned(),
+            message: String::new(),
+            paths: Vec::new(),
+        }
+    }
+
+    /// 按区间读时查询窗口两端各放宽了 1~2 天，列表必须按用户选的区间裁回去
+    #[test]
+    fn range_prunes_the_widened_query_window_out_of_the_list() {
+        let mut page = HistoryPage::new(0, "订单服务".to_owned(), 100, "zhangsan".to_owned(), true);
+        page.entries = vec![
+            entry("1", "2026-08-19 10:00:00"),
+            entry("2", "2026-08-20 10:00:00"),
+            entry("3", "2026-08-25 23:00:00"),
+            entry("4", "2026-08-27 10:00:00"),
+            entry("5", "看不懂的时间"),
+        ];
+        page.range = Some((parse_date("2026-08-20").unwrap(), parse_date("2026-08-25").unwrap()));
+        assert_eq!(
+            page.visible(),
+            vec![1, 2],
+            "放宽窗口带回来的边界外提交、以及读不出日期的记录都不能显示"
+        );
+
+        page.range = None;
+        assert_eq!(page.visible(), vec![0, 1, 2, 3, 4], "不选区间时一切照旧");
     }
 }

@@ -3,7 +3,7 @@ use std::path::Path;
 use egui::{Align, Button, Color32, FontId, Frame, Layout, RichText, ScrollArea, TextEdit, Ui, Vec2};
 
 use crate::jobs::{Data, Kind, Sink};
-use crate::svn::{Item, StatusEntry, Svn};
+use crate::svn::{blocked_count, Item, StatusEntry, Svn};
 use crate::{highlight, ink, Maintain, SvnApp};
 
 /// 「上传 / 提交」页面状态。
@@ -85,17 +85,15 @@ impl CommitPage {
         let mut added = 0;
         let mut modified = 0;
         let mut deleted = 0;
-        let mut blocked = 0;
         for entry in &self.entries {
             match entry.item {
                 Item::Added | Item::Unversioned => added += 1,
                 Item::Modified | Item::Replaced => modified += 1,
                 Item::Deleted | Item::Missing => deleted += 1,
-                Item::Conflict | Item::Incomplete => blocked += 1,
                 _ => {}
             }
         }
-        (added, modified, deleted, blocked)
+        (added, modified, deleted, blocked_count(&self.entries))
     }
 
     fn visible(&self) -> Vec<usize> {

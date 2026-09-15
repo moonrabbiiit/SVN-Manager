@@ -1,6 +1,6 @@
 ﻿[package]
 name = "svn_manager"
-version = "1.2.0"
+version = "1.2.3"
 edition = "2021"
 description = "SVN 管理器 (SVN working-copy manager)"
 license = "MIT OR Apache-2.0"

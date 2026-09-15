@@ -1,5 +1,12 @@
 //! 版本更新检查与自动升级。
 //!
+//! ## 更新源
+//!
+//! - **官方源**：GitHub 仓库的最新 Release（`OFFICIAL_API`）。版本号取 `tag_name`，
+//!   下载地址取资产里第一个 `.exe`，GitHub 同时给出资产的 `sha256` digest，
+//!   正好接进下面那条 certutil 校验链；`releases/latest` 本身已排除草稿与预发布。
+//! - **自定义源**：局域网里自建的静态服务端，读 `{服务端地址}/latest.json`。
+//!
 //! ## 协议（服务端只需要静态文件）
 //!
 //! 客户端把「设置 → 版本更新 → 服务端地址」配置成服务根目录，例如
@@ -36,6 +43,7 @@
 //! 直接结束 cmd 进程，成功、失败两条路径都是。
 //! bat 里的输出全部用 ASCII，避免任何代码页乱码问题。
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
@@ -45,6 +53,21 @@ use std::os::windows::process::CommandExt;
 use crate::svn::CREATE_NO_WINDOW;
 
 use serde::{Deserialize, Serialize};
+
+/// 官方源仓库（GitHub）
+pub const OFFICIAL_REPO: &str = "moonrabbiiit/SVN-Manager";
+/// 最新发布：`releases/latest` 自动排除草稿与预发布，也不按时间排序取，交给 GitHub 判
+pub const OFFICIAL_API: &str = "https://api.github.com/repos/moonrabbiiit/SVN-Manager/releases/latest";
+pub const OFFICIAL_PAGE: &str = "https://github.com/moonrabbiiit/SVN-Manager";
+
+/// 更新源（写在配置的 `update_source` 里）：官方 GitHub 发布 / 自建服务端 latest.json
+pub const SOURCE_OFFICIAL: &str = "official";
+pub const SOURCE_CUSTOM: &str = "custom";
+
+/// 选的是不是官方源。老配置里没有这个字段（空串）按官方算：官方源不用用户填任何东西。
+pub fn is_official(source: &str) -> bool {
+    source.trim() != SOURCE_CUSTOM
+}
 
 /// 服务端 latest.json 的字段（缺省字段宽松处理，兼容以后扩展）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -259,6 +282,191 @@ pub fn check(server: &str) -> Result<UpdateManifest, String> {
     }
     let full = join_url(server, &manifest.url);
     Ok(UpdateManifest { url: full, ..manifest })
+}
+
+/// GitHub `releases/latest` 响应里我们要用到的那几项，其余字段忽略。
+#[derive(Deserialize)]
+struct GitHubAsset {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    browser_download_url: String,
+    /// GitHub 对发布资产给出的校验值，形如 `sha256:<hex>`；老资产可能没有
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    #[serde(default)]
+    tag_name: String,
+    #[serde(default)]
+    published_at: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    assets: Vec<GitHubAsset>,
+}
+
+/// 从 `start` 处（`[` 或 `!`）解出一个 `[文字](地址)`：返回方括号内文字的区间，
+/// 以及整段链接之后的下标。方括号后面没跟圆括号就当普通方括号，不剥。
+fn link_text(chars: &[char], start: usize) -> Option<(Range<usize>, usize)> {
+    let mut index = start;
+    if chars[index] == '!' {
+        index += 1;
+    }
+    if chars.get(index) != Some(&'[') {
+        return None;
+    }
+    let close = (index + 1..chars.len()).find(|&i| chars[i] == ']')?;
+    if chars.get(close + 1) != Some(&'(') {
+        return None;
+    }
+    let end = (close + 2..chars.len()).find(|&i| chars[i] == ')')?;
+    Some((index + 1..close, end + 1))
+}
+
+/// 单行剥标记。
+fn plain_line(line: &str) -> String {
+    let mut text = line;
+    // 标题：1~6 个 `#` 且紧跟空格才算，`#123` 这种 issue 号不动
+    let hashes = text.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) && text[hashes..].starts_with(' ') {
+        text = text[hashes + 1..].trim_start();
+    }
+    // 邮件式引用
+    while let Some(rest) = text.strip_prefix('>') {
+        text = rest.trim_start();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            // 强调（* ~~）与行内代码的标记只丢符号本身；`_` 留着——仓库名里全是下划线
+            '`' | '*' | '~' => index += 1,
+            '[' | '!' => match link_text(&chars, index) {
+                Some((label, next)) => {
+                    out.extend(chars[label].iter().copied());
+                    index = next;
+                }
+                None => {
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            },
+            c => {
+                out.push(c);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Release 正文是 markdown，界面按纯文本渲染会把 `##`、`**`、`` ` ``、`[文字](链接)` 这些
+/// 标记原样露出来。这里只剥标记、不动内容，列表的 `-` 保留（那本来就是纯文本的一部分）。
+pub fn plain_text(markdown: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    for raw in markdown.lines() {
+        let line = raw.trim_end();
+        // 代码围栏整行丢掉，里面的内容当普通文字留着
+        if line.starts_with("```") || line.starts_with("~~~") {
+            continue;
+        }
+        // 只由标点组成的分隔线没有信息量
+        if line.chars().count() >= 3 && line.chars().all(|c| matches!(c, '-' | '=' | '*')) {
+            continue;
+        }
+        kept.push(plain_line(line));
+    }
+    // 连续空行压成一行：正文里列表项之间常夹空行，界面上排一排空行太占地方
+    let mut out = String::new();
+    let mut last_blank = true;
+    for line in kept {
+        let blank = line.trim().is_empty();
+        if blank && last_blank {
+            continue;
+        }
+        last_blank = blank;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&line);
+    }
+    out.trim().to_owned()
+}
+
+/// 解析 `releases/latest` 的响应：版本号取 tag（剥掉 `v` 前缀），下载地址取资产里第一个
+/// `.exe`，GitHub 给的 sha256 digest 直接当校验值（接上原有那条 certutil 校验链）。
+fn parse_release(text: &str) -> Result<UpdateManifest, String> {
+    let release: GitHubRelease = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("解析 GitHub 发布信息失败：{e}"))?;
+    // tag 普遍写成 `v1.2.0`，而界面各处都自己加「V」前缀，这里不剥掉就会显示成 Vv1.2.0
+    let version = release.tag_name.trim().trim_start_matches(['v', 'V']);
+    if version.is_empty() {
+        return Err("GitHub 最新发布没有版本号（tag_name）".to_owned());
+    }
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.trim().to_ascii_lowercase().ends_with(".exe"))
+        .ok_or_else(|| format!("GitHub 最新发布 {version} 里没有 .exe 资产，没法自动更新"))?;
+    if asset.browser_download_url.trim().is_empty() {
+        return Err("GitHub 最新发布的 .exe 资产没有下载地址".to_owned());
+    }
+    let sha256 = asset
+        .digest
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Ok(UpdateManifest {
+        version: version.to_owned(),
+        url: asset.browser_download_url.trim().to_owned(),
+        notes: plain_text(release.body.unwrap_or_default().as_str()),
+        sha256,
+        // 响应里是 `2026-09-08T03:34:21Z`，界面只显示发布日那天就够
+        published_at: release
+            .published_at
+            .split('T')
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
+
+/// GitHub 匿名接口按 IP 限流（每小时 60 次），403 / 404 的原始报错看不出所以然，补一句人话。
+fn enrich_github_error(message: String) -> String {
+    if message.contains("403") {
+        return format!("{message}\n（GitHub 匿名接口按 IP 限流，每小时 60 次；稍后再试，或在「设置 → 版本更新」改用自定义源）");
+    }
+    if message.contains("404") {
+        return format!("{message}\n（读不到最新发布：仓库还没有发布过 Release，或仓库地址写错了）");
+    }
+    message
+}
+
+/// 从 GitHub 取最新发布。返回的 manifest.url 是资产的 `browser_download_url`（绝对地址）。
+pub fn check_github() -> Result<UpdateManifest, String> {
+    let dest = std::env::temp_dir().join("svn_manager_github_latest.json");
+    let _ = std::fs::remove_file(&dest);
+    fetch(OFFICIAL_API, &dest).map_err(enrich_github_error)?;
+    let text = std::fs::read_to_string(&dest)
+        .map_err(|e| format!("读取 GitHub 发布信息失败：{e}"))?;
+    let _ = std::fs::remove_file(&dest);
+    parse_release(&text)
+}
+
+/// 按配置选中的更新源检查一次；`server` 只在自定义源时用到。
+pub fn check_from(source: &str, server: &str) -> Result<UpdateManifest, String> {
+    if is_official(source) {
+        check_github()
+    } else {
+        check(server)
+    }
 }
 
 /// 把 url 下载到 dest（用于新版本 exe），返回下载字节数。
@@ -528,6 +736,151 @@ mod tests {
         let info = check(&server).unwrap_or_else(|e| panic!("检查更新失败：{e}"));
         assert!(!info.version.trim().is_empty(), "服务端版本号为空");
         assert!(info.url.starts_with("http"), "下载地址未拼成绝对地址：{}", info.url);
+    }
+
+    /// 官方源冒烟：真的去读 GitHub 的最新发布（默认跳过）
+    /// `cargo test -- --ignored check_github_smoke`
+    #[test]
+    #[ignore]
+    fn check_github_smoke() {
+        let info = check_github().unwrap_or_else(|e| panic!("读 GitHub 最新发布失败：{e}"));
+        assert!(!info.version.trim().is_empty(), "最新发布没有版本号");
+        assert!(
+            info.url.starts_with("https://github.com/") || info.url.contains("releases/download"),
+            "下载地址不像 GitHub 资产：{}",
+            info.url
+        );
+        // 真实正文里不该再留下 markdown 标记
+        for unwanted in ["## ", "**", "](http"] {
+            assert!(!info.notes.contains(unwanted), "更新说明里还有「{unwanted}」");
+        }
+        println!("NOTES 开头：{}", info.notes.chars().take(160).collect::<String>());
+    }
+
+    /// GitHub `releases/latest` 响应里真正会被读到的那几项（抓下来的真实数据）。
+    /// 定界要用三层井号：正文里的 `"## 更新内容` 恰好等于 `r##"` 的终止符。
+    const RELEASE_FIXTURE: &str = r###"{
+        "tag_name": "v1.2.0",
+        "name": "v1.2.0 发布",
+        "published_at": "2026-09-08T03:34:21Z",
+        "body": "## 更新内容\n- 修了点什么",
+        "draft": false,
+        "prerelease": false,
+        "assets": [
+            {
+                "name": "svn_manager.exe",
+                "size": 9992192,
+                "digest": "sha256:fa100735bf7a1dcfa9db0a5ea28dffd0ddff9f5165397c795d3825fd243ca3d2",
+                "browser_download_url": "https://github.com/moonrabbiiit/SVN-Manager/releases/download/v1.2.0/svn_manager.exe"
+            }
+        ]
+    }"###;
+
+    #[test]
+    fn github_release_becomes_a_manifest() {
+        let info = parse_release(RELEASE_FIXTURE).expect("该能解析真实响应");
+        // tag 上的 v 前缀在这里就剥掉：界面各处自己加「V」，留着会变成 Vv1.2.0
+        assert_eq!(info.version, "1.2.0");
+        assert!(is_newer(&info.version, "1.1.9"));
+        assert_eq!(
+            info.url,
+            "https://github.com/moonrabbiiit/SVN-Manager/releases/download/v1.2.0/svn_manager.exe"
+        );
+        // GitHub 给的 `sha256:<hex>` 剥掉前缀，正好喂给现有的 certutil 校验
+        assert_eq!(
+            info.sha256,
+            "fa100735bf7a1dcfa9db0a5ea28dffd0ddff9f5165397c795d3825fd243ca3d2"
+        );
+        // 界面只展示发布日那天，不带时分秒
+        assert_eq!(info.published_at, "2026-09-08");
+        // 正文是 markdown，标题符号在解析时就该剥干净
+        assert_eq!(info.notes, "更新内容\n- 修了点什么", "实际：{:?}", info.notes);
+    }
+
+    /// Release 正文是 markdown，界面按纯文本渲染：标记要剥掉，但内容一个字符都不能伤
+    #[test]
+    fn release_notes_are_stripped_to_plain_text() {
+        let markdown = "## AI 工作日志（重点更新）\n\
+            \n\
+            - **入口改为右上角开关式**：`AI 日志` 按钮常驻\n\
+            - 多个目录（如 hrp_server + vue_ss_server）反复勾选\n\
+            \n\
+            ***\n\
+            \n\
+            > 详见 [说明文档](https://x/y)\n\
+            ![截图](https://x/z.png)\n\
+            \n\
+            #123 不是标题\n\
+            ```\n\
+            代码块里的字留着\n\
+            ```";
+        let text = plain_text(markdown);
+        assert!(text.starts_with("AI 工作日志（重点更新）"), "{text}");
+        assert!(
+            text.contains("- 入口改为右上角开关式：AI 日志 按钮常驻"),
+            "强调与行内代码符号要没，列表短横留着：{text}"
+        );
+        // 下划线是仓库名的一部分，不能当强调符号吃掉
+        assert!(text.contains("hrp_server + vue_ss_server"), "{text}");
+        assert!(text.contains("详见 说明文档"), "链接只留文字：{text}");
+        assert!(text.contains("截图"), "图片只留说明文字：{text}");
+        assert!(text.contains("代码块里的字留着"), "围栏内容当普通文字留着：{text}");
+        for unwanted in ["##", "**", "`", "](http", ">", "```", "***"] {
+            assert!(!text.contains(unwanted), "还留着「{unwanted}」：{text}");
+        }
+        // issue 号不是标题，井号得原样留着
+        assert!(text.contains("#123 不是标题"), "{text}");
+        // 一个空行在字符串里就是两个换行；要压掉的是连续两个以上的空行和那条分隔线
+        assert!(!text.contains("\n\n\n"), "{text}");
+        assert!(!text.contains("***"), "分隔线该整行去掉：{text}");
+        assert_eq!(plain_text(&text), text, "剥过一次就该稳定，别二次损伤");
+    }
+
+    /// 只发源码没传 exe 的话，自动更新无从下手，要说清是哪一次发布缺东西
+    #[test]
+    fn github_release_without_an_exe_asset_is_rejected() {
+        let text = r#"{"tag_name":"v1.3.0","assets":[{"name":"source.zip","browser_download_url":"https://x/y.zip"}]}"#;
+        let err = parse_release(text).expect_err("没有 exe 资产不该算成功");
+        assert!(err.contains("1.3.0"), "报错要指出是哪次发布：{err}");
+        assert!(err.contains(".exe"), "报错要说清缺什么：{err}");
+        // 版本号为空、资产有 exe 但没给下载地址，也都要拦住
+        assert!(parse_release(r#"{"tag_name":"  ","assets":[]}"#).is_err());
+        assert!(
+            parse_release(r#"{"tag_name":"v1.3.0","assets":[{"name":"a.exe","browser_download_url":" "}]}"#).is_err()
+        );
+    }
+
+    /// 早先上传的资产可能没有 digest 字段：没给就不校验，而不是当解析失败
+    #[test]
+    fn github_digest_is_optional() {
+        let info = parse_release(
+            r#"{"tag_name":"v1.2.0","assets":[{"name":"SVN_MANAGER.EXE","browser_download_url":"https://x/y.EXE"}]}"#,
+        )
+        .expect("没有 digest 也要能解析");
+        assert_eq!(info.sha256, "", "没给校验值就留空");
+        // 资产名大小写不限，下载地址原样带回来
+        assert_eq!(info.url, "https://x/y.EXE");
+    }
+
+    #[test]
+    fn source_choice_routes_the_check() {
+        // 官方源不依赖任何地址；只有自定义源仍然要求填地址
+        assert!(is_official(SOURCE_OFFICIAL));
+        assert!(is_official(""), "老配置里没有这个字段要按官方算");
+        assert!(is_official("别写错的值"), "认不全的值也退回官方源而不是查一个空地址");
+        assert!(!is_official(SOURCE_CUSTOM));
+        assert!(check_from(SOURCE_CUSTOM, "  ").is_err());
+    }
+
+    #[test]
+    fn github_http_errors_get_a_human_hint() {
+        assert!(enrich_github_error("下载失败：The requested URL returned error: 403".to_owned())
+            .contains("限流"));
+        assert!(enrich_github_error("下载失败：The requested URL returned error: 404".to_owned())
+            .contains("Release"));
+        // 超时之类的原因不硬扯到限流，免得误导
+        let plain = enrich_github_error("下载失败：curl: (28) Connection timed out".to_owned());
+        assert_eq!(plain, "下载失败：curl: (28) Connection timed out");
     }
 
     #[test]
