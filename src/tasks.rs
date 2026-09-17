@@ -11,10 +11,6 @@ use crate::config::DirConfig;
 use crate::history::{FileDiff, FileLog, HistoryPage, Zoom};
 use crate::jobs::{Data, Kind};
 use crate::svn::{LogEntry, LogPath};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-use crate::svn::CREATE_NO_WINDOW;
 
 impl SvnApp {
     // ------------------------------------------------------------ 后台任务
@@ -55,9 +51,15 @@ impl SvnApp {
             });
     }
 
+    /// 当前选的更新源是否可用：官方源不需要任何配置，自定义源得填了服务根目录地址。
+    pub fn update_source_ready(&self) -> bool {
+        update::is_official(&self.cfg.update_source) || !self.cfg.update_server.trim().is_empty()
+    }
+
     /// 后台检查一次版本更新（官方 GitHub 发布或自建服务端 latest.json，与目录无关的任务）。
-    /// 地址有改动时会顺带保存配置。
-    pub fn spawn_update_check(&mut self) {
+    /// 地址有改动时会顺带保存配置。`quiet` 给定时自动检查用：过程不写日志区，
+    /// 免得每 5 分钟刷两行、把真正的 svn 记录挤出输出区。
+    pub fn spawn_update_check(&mut self, quiet: bool) {
         let official = update::is_official(&self.cfg.update_source);
         if !official && self.cfg.update_server.trim().is_empty() {
             self.hint("未配置更新服务端地址，请在「设置 → 版本更新」里填写");
@@ -76,20 +78,33 @@ impl SvnApp {
         };
         self.pool
             .spawn(Kind::CheckUpdate, usize::MAX, "检查更新".into(), move |sink| {
+                let sink = if quiet { sink.muted() } else { sink };
                 sink.line(format!("$ 检查版本更新：{from}"));
                 match update::check_from(&source, &server) {
                     Ok(manifest) => {
                         sink.line(format!("→ 最新版本：V{}", manifest.version.trim()));
+                        // 「有没有新版」按文件哈希判（要跑一次 certutil）：在后台这一趟算好，
+                        // 界面那三处只读结论，别每帧重算
+                        let ready = update::has_update(&manifest, crate::APP_VERSION);
+                        sink.line(if ready {
+                            "→ 更新源上的构建与本地不同：有可更新版本"
+                        } else {
+                            "→ 与本地运行的程序一致：已是最新"
+                        });
                         Data::UpdateCheck {
                             ok: true,
                             message: String::new(),
                             info: Some(manifest),
+                            ready,
+                            quiet,
                         }
                     }
                     Err(e) => Data::UpdateCheck {
                         ok: false,
                         message: e,
                         info: None,
+                        ready: false,
+                        quiet,
                     },
                 }
             });
@@ -112,7 +127,7 @@ impl SvnApp {
             "下载更新".into(),
             move |sink| {
                 sink.line(format!("$ 正在下载新版本：{url}"));
-                let dest = std::env::temp_dir().join("svn_manager_update.exe");
+                let dest = std::env::temp_dir().join(update::STAGED_EXE);
                 let _ = std::fs::remove_file(&dest);
                 match update::download(&url, &dest) {
                     Ok(bytes) => {
@@ -185,7 +200,20 @@ impl SvnApp {
                 return;
             }
         };
-        let bat_text = update::build_apply_bat(&exe);
+        // 新版 exe 先暂存到程序目录：收尾 bat 里只出现文件名 + `%~dp0`，
+        // 程序装在中文目录里也不会让 cmd 按代码页解码脚本时把路径读乱
+        let downloaded = std::env::temp_dir().join(update::STAGED_EXE);
+        let staged = exe.with_file_name(update::STAGED_EXE);
+        if let Err(e) = std::fs::copy(&downloaded, &staged) {
+            let message = format!(
+                "没法把新版 exe 暂存到程序目录（{}）：{e}；请手动下载新版本替换，或把它放到有写权限的目录再更新",
+                staged.display()
+            );
+            self.hint(message.clone());
+            self.push(Level::Error, message);
+            return;
+        }
+        let bat_text = update::build_apply_bat();
         // bat 默认写到程序自身目录：杀软对 %TEMP% 里的 .bat 扫描最凶，
         // 脚本跑到一半被查删就会报「找不到批处理文件」。
         // 程序目录不可写（如 Program Files）时回退到 %TEMP%。
@@ -217,13 +245,7 @@ impl SvnApp {
         );
         // 启动器本身用 CREATE_NO_WINDOW：不闪 cmd 黑框；
         // `start` 会给 bat 另起一个控制台窗口，覆盖失败时的 pause 仍看得见。
-        let mut launcher = std::process::Command::new("cmd");
-        #[cfg(windows)]
-        launcher.creation_flags(CREATE_NO_WINDOW);
-        match launcher
-            .args(["/C", "start", "", &bat.to_string_lossy()])
-            .spawn()
-        {
+        match update::apply_launcher(&bat, &exe).spawn() {
             Ok(_) => {
                 self.push(Level::Success, "程序即将退出，由更新脚本完成覆盖并自动重启…");
                 // 下载的临时 exe 只在本进程内持有路径，退出后 bat 直接接管
@@ -342,7 +364,23 @@ impl SvnApp {
                         remote_msg = probe.summary();
                     }
                 }
-                let (entries, status) = svn.status(&path);
+                // 服务器可达时一次走完整棵树就够：`svn status -u --xml` 的输出同时带
+                // 本地改动（wc-status）与服务器上已变更的条目（repos-status）。
+                // 早先分两条命令等于把树走两遍，七万文件的目录要多等三秒。
+                let (entries, out_of_date, status) = if remote == Some(true) {
+                    let (entries, pending, run) = svn.status_against_server(&path);
+                    if run.ok {
+                        (entries, pending, run)
+                    } else {
+                        // 带 -u 的这次没走通（服务器中途断了 / 认证问题）：退回只读本地
+                        let (local, local_run) = svn.status(&path);
+                        (local, None, local_run)
+                    }
+                } else {
+                    // 连接已经判定不通，就别再让那条走网络的命令卡到超时
+                    let (local, local_run) = svn.status(&path);
+                    (local, None, local_run)
+                };
                 // 统计口径与「全部上传」一致：? 会在提交时自动 add、! 自动 delete，
                 // 所以它们也算待提交项，用户看到的数量和真正提交上去的数量才对得上
                 let changes: Vec<crate::svn::StatusEntry> = entries
@@ -354,13 +392,6 @@ impl SvnApp {
                 // 冲突数在未过滤的 entries 上数：changes 里已经没有冲突条目了。
                 // status 读失败只能给 None——给 0 会把「没读到」显示成「没有冲突」
                 let conflicts = status.ok.then(|| crate::svn::blocked_count(&entries));
-                // 「可更新」以服务器为准：提交只把被提交路径的版本推进，工作副本根目录
-                // 还停在旧版本上，光比本地 r 和远端 HEAD 会把自己刚提交完的目录误报成可更新
-                let out_of_date = if remote == Some(true) {
-                    svn.out_of_date(&path)
-                } else {
-                    None
-                };
                 if let Some(pending) = out_of_date.filter(|count| *count > 0) {
                     sink.line(format!("[{label}] 服务器上有 {pending} 项本地还没更新"));
                 }

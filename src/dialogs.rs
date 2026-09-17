@@ -1,10 +1,10 @@
 //! 各个独立窗口：修改仓库地址、全部上传（含单目录待提交明细）、发现新版本时的升级确认。
 
 
-use egui::{Color32, Frame, Key, RichText, ScrollArea, TextEdit, Vec2};
+use egui::{Align, Color32, Frame, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 
 use crate::jobs::Kind;
-use crate::{APP_VERSION, Level, SvnApp, UploadAll, ink};
+use crate::{update, APP_VERSION, Level, SvnApp, UploadAll, ink};
 
 impl SvnApp {
     // ------------------------------------------------------------ 「修改仓库地址」窗口
@@ -451,12 +451,14 @@ impl SvnApp {
             return;
         }
         let Some(manifest) = self.update_info.clone() else {
-            // 没有可用的更新信息（理论上只有 has_new 才打开）就顺手关掉
+            // 没有可用的更新信息（理论上只有 update_ready 才打开）就顺手关掉
             self.show_update_confirm = false;
             return;
         };
         let downloading = self.pool.has(Kind::DownloadUpdate, usize::MAX);
         let mut open = self.show_update_confirm;
+        // 点了「稍后再说」要到窗口收尾时才写回，见下面那句
+        let mut later = false;
         egui::Window::new("发现新版本")
             .open(&mut open)
             .collapsible(false)
@@ -464,17 +466,27 @@ impl SvnApp {
             .default_width(440.0)
             .default_pos(egui::pos2(430.0, 200.0))
             .show(ctx, |ui| {
-                // 版本对比一行看明白：当前（弱） → 新版本（大、主题蓝）
+                let latest = manifest.version.trim();
+                // 版本号没变、只是更新源重新发布过构建时不做「旧 → 新」的对比：
+                // 同一个号画两遍看着像没更新，这里只把要装上去的版本说清楚
+                let replaced = update::same_version(latest, APP_VERSION);
                 ui.horizontal(|ui| {
                     ui.add_space(2.0);
-                    ui.label(RichText::new(format!("V{APP_VERSION}")).size(17.0).weak());
-                    ui.label(RichText::new("→").size(17.0).weak());
+                    if !replaced {
+                        ui.label(RichText::new(format!("V{APP_VERSION}")).size(17.0).weak());
+                        ui.label(RichText::new("→").size(17.0).weak());
+                    }
+                    // 新旧版本号同字号、同字重：字大一号会把两个号看成两个量级。
+                    // 新版号走金色（与日志区 Warning 同一档），在深浅两套主题下都压得住
                     ui.label(
-                        RichText::new(format!("V{}", manifest.version.trim()))
-                            .size(20.0)
+                        RichText::new(format!("V{latest}"))
+                            .size(17.0)
                             .strong()
-                            .color(ink(ui, Color32::from_rgb(120, 190, 240))),
+                            .color(ink(ui, Color32::from_rgb(240, 190, 70))),
                     );
+                    if replaced {
+                        ui.label(RichText::new("内容有更新（版本号没变）").size(11.5).weak());
+                    }
                     if !manifest.published_at.trim().is_empty() {
                         ui.label(
                             RichText::new(format!("发布于 {}", manifest.published_at.trim()))
@@ -538,22 +550,28 @@ impl SvnApp {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let start = ui.add_enabled(
-                        !downloading,
-                        egui::Button::new(
-                            RichText::new(if downloading { "下载中…" } else { "开始更新" }).strong(),
-                        ),
-                    );
-                    if start.clicked() {
-                        // 保持在对话框里看下载状态，不再一按就关
-                        self.update_error = None;
-                        self.begin_update();
-                    }
-                    if ui.add_enabled(!downloading, egui::Button::new("稍后再说")).clicked() {
-                        self.show_update_confirm = false;
-                    }
+                    // 动作行整组靠右；add 顺序反过来，「开始更新」才仍然排在「稍后再说」左边
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add_enabled(!downloading, egui::Button::new("稍后再说")).clicked() {
+                            later = true;
+                        }
+                        let start = ui.add_enabled(
+                            !downloading,
+                            egui::Button::new(
+                                RichText::new(if downloading { "下载中…" } else { "开始更新" })
+                                    .strong(),
+                            ),
+                        );
+                        if start.clicked() {
+                            // 保持在对话框里看下载状态，不再一按就关
+                            self.update_error = None;
+                            self.begin_update();
+                        }
+                    });
                 });
             });
-        self.show_update_confirm = open;
+        // 关窗口这件事统一在这里收口：在按钮里改 self.show_update_confirm 会被下面这行
+        // 按旧的 open 覆盖回去，窗口关不掉（点「稍后再说」等于没点）
+        self.show_update_confirm = open && !later;
     }
 }

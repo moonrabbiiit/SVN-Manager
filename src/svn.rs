@@ -539,14 +539,20 @@ impl Svn {
         )
     }
 
-    /// 有几个文件在服务器上已经变了、本地还没更新。要走网络，只在后台检测里调。
-    /// 返回 None 表示探测失败（断网 / 认证异常），调用方不能据此断定「已是最新」。
-    pub fn out_of_date(&self, dir: &Path) -> Option<usize> {
-        let run = self.call(
-            &["status", "-u", "--xml", &dir.to_string_lossy()],
-            None,
-        );
-        run.ok.then(|| parse_out_of_date(&run.out))
+    /// 一次走完整棵树同时读出两件事：本地未提交的改动（`wc-status`）和服务器上已变更、
+    /// 本地还没更新的条目（`repos-status`）。早先分 `status` + `status -u` 两条命令等于
+    /// 把树走两遍——七万文件的工作副本要多等三秒。要走网络，只在后台检测里调。
+    /// 可更新数返回 None 表示这次没读到（断网 / 认证异常），调用方不能据此断定「已是最新」。
+    pub fn status_against_server(&self, dir: &Path) -> (Vec<StatusEntry>, Option<usize>, Run) {
+        let run = self.call(&["status", "-u", "--xml", &dir.to_string_lossy()], None);
+        if !run.ok {
+            return (Vec::new(), None, run);
+        }
+        (
+            parse_status(&run.out, dir),
+            Some(parse_out_of_date(&run.out)),
+            run,
+        )
     }
 
     /// 提交记录一律读服务器：不带 `-r HEAD:1` 时，在工作副本里执行 `svn log`
@@ -1066,6 +1072,28 @@ mod tests {
 </status>"#;
         assert_eq!(parse_out_of_date(xml), 2, "只有带 repos-status 的条目算待更新");
         assert_eq!(parse_out_of_date("<status>"), 0, "输出残缺时不误报");
+    }
+
+    /// 合并读取的前提：同一份 `svn status -u --xml` 输出要能同时给出「本地待提交数」
+    /// 和「服务器可更新数」，这样检测时不必把整棵工作副本树走两遍。
+    #[test]
+    fn one_status_u_read_yields_both_counts() {
+        let xml = r#"<status>
+  <target path="D:\wc">
+    <entry path="D:\wc\a.vue"><wc-status item="modified" props="none" revision="1097"/></entry>
+    <entry path="D:\wc\note.txt"><wc-status item="unversioned" props="none"/></entry>
+    <entry path="D:\wc\clash.vue"><wc-status item="conflicted" props="none" revision="1097"/></entry>
+    <entry path="D:\wc\b.vue"><wc-status item="normal" props="none" revision="1097"/><repos-status item="modified" props="none"/></entry>
+  </target>
+  <against revision="1098"/>
+</status>"#;
+        let entries = parse_status(xml, Path::new(r"D:\wc"));
+        assert_eq!(entries.len(), 4, "四个条目都该收到");
+        // 口径同「全部上传」：修改 + 未版本控制算待提交，冲突要先人工处理
+        let changes = entries.iter().filter(|e| e.item.uploadable()).count();
+        assert_eq!(changes, 2, "待提交数不该把冲突或 normal 条目算进来");
+        assert_eq!(blocked_count(&entries), 1, "冲突单独数一处");
+        assert_eq!(parse_out_of_date(xml), 1, "只有带 repos-status 的那条算可更新");
     }
 
     /// 目录行「冲突 N」与提交页「需处理」共用 blocked_count，口径只能有一处。

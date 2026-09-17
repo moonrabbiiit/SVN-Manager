@@ -5,10 +5,10 @@
 客户端启动时会读取  {服务端地址}/latest.json，格式：
 
     {
-      "version": "1.2.0",                     # 最新版本号（支持 V 前缀）
+      "version": "1.2.0",                     # 最新版本号（只用于界面显示，任意写法；客户端会剥掉 v/V 前缀）
       "url": "files/app_1.2.0.exe",           # 下载地址：相对 latest.json 所在目录，或完整 http(s) 地址
       "notes": "修复了 xxx",                   # 更新说明，可省略
-      "sha256": "…",                          # exe 摘要，可省略；提供后客户端会校验
+      "sha256": "…",                          # exe 摘要，发布时自动写入；客户端用它判有没有新版、下载后也用它校验
       "published_at": "2026-09-03 20:00:00"   # 发布时间，仅展示
     }
 
@@ -24,14 +24,15 @@
      每次都会询问版本号，窗口里带填写说明：
        回车    = 沿用默认值（文件名里的版本 > exe 旁 version.txt /
                  脚本旁 version.txt > 上一次发布的版本）
-       1.1.2   = 直接写版本号（只能是数字和点）
-        +       = 补丁号 +1（1.1.1 -> 1.1.2）
-       ++      = 次版本号 +1、补丁归零（1.1.9 -> 1.2.0）
+       任意文字 = 直接写版本号，不限制格式（1.1.2 / 1.2.4-加固 / V1.2.4 / 2026.09.17 都收）
+       +       = 默认值补丁号 +1（1.1.1 -> 1.1.2；默认值不是数字和点时给提示）
+       ++      = 默认值次版本号 +1、补丁归零（1.1.9 -> 1.2.0）
        q       = 取消本次发布
      更新说明：回车 = 不写（可放 notes.txt 在 exe 旁 / 脚本旁自动沿用）；
                输入里的字面 \n 会被转成换行，整段多行建议直接用 notes.txt
-     注意：版本号要与程序内嵌版本（Cargo.toml 的 version）一致，
-     不一致会导致客户端更新后版本号错位、反复提示有新版本。
+     注意：客户端判「有没有新版」比的是文件 sha256（下面发布时自动写入），不看版本号，
+     所以同一版本号重新发一次也会被识别成新构建；版本号只用于界面展示，
+     写岔了顶多是界面上那个 V 号与程序内嵌版本（Cargo.toml 的 version）对不上。
 
   2) 命令行发布（拷贝 exe 进目录、生成/覆盖 latest.json）：
       python update_server.py D:\\update_root --publish app_1.2.0.exe --notes "修复xxx"
@@ -59,6 +60,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 
+# 只用于判断「+ / ++」能不能在默认值上自动递增：版本号本身不限制格式
 VERSION_RE = re.compile(r"^\d+(\.\d+)+$")
 
 
@@ -134,14 +136,18 @@ def bump_version(base: str, minor: bool = False) -> str:
 
 
 def ask_version(exe: Path, root: Path) -> str:
-    """拖拽模式：打印填写说明并询问版本号，回车沿用默认值（含上一发布版本的继承）。"""
+    """拖拽模式：打印填写说明并询问版本号，回车沿用默认值（含上一发布版本的继承）。
+
+    版本号不限制格式：客户端判「有没有新版」比的是文件 sha256（发布时自动写入），
+    版本号只用于界面显示，所以 1.2.4-加固 / V1.2.4 / 2026.09.17 这类写法都直接收。
+    """
     prev = last_published_version(root)
     default = default_version(exe, prev)
     print(f"  版本目录：{root}")
     print(f"  上一发布：{prev or '（无）'}")
-    print("  填写说明：回车 = 沿用默认值；也可直接填版本号（如 1.1.2）")
-    print("            + = 补丁号+1（1.1.1 -> 1.1.2）  ++ = 次版本号+1（1.1.9 -> 1.2.0）  q = 取消")
-    print("            注意：版本号需与程序内嵌版本（Cargo.toml）一致")
+    print("  填写说明：回车 = 沿用默认值；也可直接填版本号（任意写法都收，如 1.2.4-加固）")
+    print("            + = 默认值补丁号+1（1.1.1 -> 1.1.2）  ++ = 次版本号+1（1.1.9 -> 1.2.0）  q = 取消")
+    print("            版本号只用于界面显示，客户端按文件 sha256 判有没有新版")
     while True:
         label = f"请输入版本号 [回车 = {default}]" if default else "请输入版本号（如 1.1.2）"
         try:
@@ -158,14 +164,16 @@ def ask_version(exe: Path, root: Path) -> str:
         if raw.lower() in ("q", "quit", "exit"):
             sys.exit("已取消发布")
         if raw in ("+", "++"):
-            base = default or prev
+            base = (default or prev).strip()
             if not base:
                 print("  没有可递增的基准版本号，请直接输入完整版本号")
                 continue
+            # 自定义过版本号（如 1.2.4-加固）就没法自动递增了，让用户手填，
+            # 而不是在这里抛 ValueError
+            if not VERSION_RE.match(base):
+                print(f"  基准版本号「{base}」不是数字和点，没法自动递增，请直接输入完整版本号")
+                continue
             return bump_version(base, minor=(raw == "++"))
-        if not VERSION_RE.match(raw):
-            print(f"  格式不对：「{raw}」——版本号只能是数字和点，如 1.1.2")
-            continue
         return raw
 
 
@@ -260,7 +268,7 @@ def main() -> None:
                     help="版本目录（存放 latest.json 与 files/）；省略时按 "
                          "update_root.txt > 脚本旁 update_root\\ 的顺序确定")
     ap.add_argument("--publish", metavar="EXE", help="发布一个新版本 exe")
-    ap.add_argument("--version", help="版本号（默认从 exe 文件名提取）")
+    ap.add_argument("--version", help="版本号（任意写法；默认从 exe 文件名提取）")
     ap.add_argument("--notes", default="",
                     help="更新说明；字面 \\n 会被转成换行，多行说明也可用 notes.txt")
     ap.add_argument("--serve", action="store_true", help="启动静态文件服务")

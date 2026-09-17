@@ -1,6 +1,6 @@
 ﻿[package]
 name = "svn_manager"
-version = "1.2.3"
+version = "1.2.4"
 edition = "2021"
 description = "SVN 管理器 (SVN working-copy manager)"
 license = "MIT OR Apache-2.0"
@@ -14,6 +14,7 @@ roxmltree = "0.21.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 encoding_rs = "0.8.35"
 rfd = "0.17.2"
+regex = "1.13.1"
 
 # 开机自启：直接写 HKCU Run 键（rfd 已带入 0.60，不再多拉依赖）
 [target.'cfg(windows)'.dependencies]

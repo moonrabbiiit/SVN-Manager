@@ -78,7 +78,7 @@ impl SvnApp {
                         });
                     }
                     ui.separator();
-                    ui.collapsing("Beyond Compare（外部对比工具）", |ui| {
+                    ui.collapsing("Beyond Compare 设置", |ui| {
                         ui.horizontal(|ui| {
                             ui.add_sized(
                                 Vec2::new((ui.available_width() - 150.0).max(180.0), 22.0),
@@ -208,13 +208,6 @@ impl SvnApp {
                                 self.reset_bc();
                             }
                         });
-                        ui.label(
-                            RichText::new(
-                                "顶部「Beyond Compare」按钮优先用「更多 → 绑定对比对象」的目录，其次匹配对比记录（含记录里的对比筛选条件）；提交页选中文件后可用 BASE 版本与本地版本对比。",
-                            )
-                            .weak()
-                            .size(11.5),
-                        );
                     });
                     ui.separator();
                     ui.collapsing("仓库账号（留空则使用 svn 已缓存的凭据）", |ui| {
@@ -356,7 +349,7 @@ impl SvnApp {
                                     .hint_text("如 deepseek-chat / gpt-4o-mini / qwen-plus"),
                             );
                         });
-                        ui.label(RichText::new("口吻（生成窗口打开时预填，长期保留）").size(11.5).weak());
+                        ui.label(RichText::new("口吻").size(11.5).weak());
                         ui.add(
                             TextEdit::multiline(&mut self.cfg.ai_tone)
                                 .desired_rows(2)
@@ -374,9 +367,9 @@ impl SvnApp {
                         );
                     });
                     ui.separator();
-                    ui.collapsing("版本更新（检查并升级到新版本）", |ui| {
+                    ui.collapsing("版本更新", |ui| {
                         let official = update::is_official(&self.cfg.update_source);
-                        ui.label(RichText::new("从哪里取最新版本").size(11.5).weak());
+                        ui.label(RichText::new("更新源").size(11.5).weak());
                         ui.horizontal(|ui| {
                             // 两个都先求值再判断：`||` 短路会让没求值的那个 radio 某帧消失
                             let pick_official = ui.radio_value(
@@ -406,7 +399,7 @@ impl SvnApp {
                         if !official {
                             ui.label(
                                 RichText::new(
-                                    "在下方填写服务端托管地址，启动时会自动检测是否有新版本发布",
+                                    "在下方填写服务端托管地址",
                                 )
                                 .size(11.5)
                                 .weak(),
@@ -423,6 +416,31 @@ impl SvnApp {
                                 }
                             });
                         }
+                        // 自动检查更新：开着程序时每 5 分钟查一次，只提醒不自动下载
+                        let auto = ui
+                            .checkbox(
+                                &mut self.cfg.auto_update_check,
+                                format!(
+                                    "自动检查更新（每 {} 分钟）",
+                                    update::AUTO_CHECK_EVERY_SECS / 60
+                                ),
+                            )
+                            .on_hover_text(
+                                "开着程序时每隔 5 分钟自动查一次更新：发现新版本只在顶部亮起「↑ 新版本」按钮，\n\
+                                 不会自己下载或覆盖。关掉后仍然有启动时检查和手动「检查更新」。\n\
+                                 官方源是匿名访问 GitHub 接口（按 IP 限流 60 次/小时），5 分钟一次用不掉额度。",
+                            );
+                        if auto.changed() {
+                            self.persist();
+                            // 刚勾上就重新掐表，不用等上一轮留下的旧时刻
+                            self.next_update_check = std::time::Instant::now()
+                                + std::time::Duration::from_secs(update::AUTO_CHECK_EVERY_SECS);
+                            self.hint(if self.cfg.auto_update_check {
+                                "已开启自动检查更新：每 5 分钟一次"
+                            } else {
+                                "已关闭自动检查更新"
+                            });
+                        }
                         ui.horizontal(|ui| {
                             let checking = self.pool.has(Kind::CheckUpdate, usize::MAX);
                             if ui
@@ -430,12 +448,10 @@ impl SvnApp {
                                 .clicked()
                                 && !checking
                             {
-                                self.spawn_update_check();
+                                self.spawn_update_check(false);
                             }
-                            let has_new = self
-                                .update_info
-                                .as_ref()
-                                .is_some_and(|m| update::is_newer(m.version.trim(), APP_VERSION));
+                            // 判定在后台检查那趟就算好了（按文件 sha256，见 update::has_update）
+                            let has_new = self.update_ready;
                             if ui.button("立即更新").clicked() {
                                 if has_new {
                                     // 与顶部「↑ 新版本」按钮同一个确认对话框

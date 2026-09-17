@@ -1,7 +1,6 @@
 //! 顶部状态栏：仓库连接状态、页面切换、主题与设置入口，以及有新版本时的那个按钮。
 
-use crate::{APP_TITLE, APP_VERSION, DirView, Page, SvnApp, ink};
-use crate::update;
+use crate::{APP_TITLE, DirView, Page, SvnApp, ink};
 use egui::{Align, Color32, Layout, RichText, Ui};
 use crate::jobs::Kind;
 
@@ -76,11 +75,9 @@ impl SvnApp {
                 // 检查到新版本时这里常驻入口，点击直接弹确认框，确认后即开始更新。
                 // 文字七彩流动：每个字错开一点色相（LayoutJob 逐字上色），整行铺满一道
                 // 彩虹并随时间向前流动，约 4 秒转一圈；按钮在屏幕上就要持续重绘。
-                if self
-                    .update_info
-                    .as_ref()
-                    .is_some_and(|m| update::is_newer(m.version.trim(), APP_VERSION))
-                {
+                // 有没有新版由 update_ready 定（后台检查那趟按文件 sha256 算好的结论）：
+                // 版本号没动但换了构建时，这里照样亮起
+                if self.update_ready {
                     let latest = self
                         .update_info
                         .as_ref()
@@ -153,7 +150,7 @@ impl SvnApp {
                 }
                 if ui
                     .button("Beyond Compare")
-                    .on_hover_text("优先用「更多 → 绑定对比对象」的目录，其次按文件夹名匹配 Beyond Compare 已保存的对比记录，并带上记录里的名称筛选打开；都没有时打开主窗口")
+                    .on_hover_text("启动Beyond Compare")
                     .clicked()
                 {
                     self.open_bcompare_matched();
@@ -200,19 +197,6 @@ impl SvnApp {
         ui.horizontal(|ui| {
             let exe = if self.cfg.svn_exe.is_empty() { "未设置".to_owned() } else { self.cfg.svn_exe.clone() };
             ui.label(RichText::new(format!("svn.exe：{exe}")).weak().size(12.0));
-            ui.separator();
-            ui.label(
-                RichText::new("提示：可把文件夹直接拖入窗口添加；双击目录行打开文件夹")
-                    .weak()
-                    .size(12.0),
-            );
         });
-        if !self.hint.is_empty() {
-            ui.label(
-                RichText::new(self.hint.clone())
-                    .size(12.5)
-                    .color(ink(ui, Color32::from_rgb(140, 205, 255))),
-            );
-        }
     }
 }

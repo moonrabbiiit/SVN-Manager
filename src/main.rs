@@ -36,7 +36,7 @@ use crate::stats::StatsPage;
 use crate::svn::{Svn, WcInfo};
 
 // 通用绘制工具搬到 ui.rs，这里转出一层，history / commit / stats 里的 crate::ink 照旧可用
-pub use ui::{highlight, ink};
+pub use ui::{highlight, highlight_with, ink, Search};
 
 pub const APP_TITLE: &str = "SVN 管理器";
 /// 程序版本号，取自 Cargo.toml；发布新版本时只改那里
@@ -201,8 +201,14 @@ pub struct SvnApp {
     pub font_note: String,
     /// 最新版本信息（官方 GitHub 发布或自建服务端的 latest.json，检查过更新才有）
     pub update_info: Option<update::UpdateManifest>,
+    /// 更新源上确实有可装的新东西：按文件 sha256 判定（见 `update::has_update`，
+    /// 同一个版本号重新发布的构建也算），检查那一趟的后台线程算好后放这里，
+    /// 界面每帧只读它，不重算哈希
+    pub update_ready: bool,
     /// 启动后第一次检查更新的时刻（None = 已触发过）
     pub update_check_at: Option<Instant>,
+    /// 开了「自动检查更新」后的下一次检查时刻（每 5 分钟一轮）
+    pub next_update_check: Instant,
     /// 「发现新版本」确认对话框开关（header 与设置里的更新入口都走它）
     pub show_update_confirm: bool,
     /// 最近一次下载新版本失败的原因（None = 没在失败状态）；对话框里内联显示

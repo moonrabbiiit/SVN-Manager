@@ -4,11 +4,11 @@
 
 use crate::config;
 use crate::{APP_TITLE, APP_VERSION, DirView, Level, OutLine, Page, SvnApp};
-use crate::{bcompare, fonts, update};
+use crate::{bcompare, fonts, ink, update};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use egui::{Align, Layout, RichText, ScrollArea, Ui, Vec2};
+use egui::{Align, Color32, Layout, RichText, ScrollArea, Ui};
 use crate::config::Config;
 use crate::jobs::{Data, Kind, Pool};
 use crate::svn::Svn;
@@ -27,10 +27,8 @@ impl SvnApp {
         };
         let cfg = Config::load();
         for style_theme in [egui::Theme::Dark, egui::Theme::Light] {
-            cc.egui_ctx.style_mut_of(style_theme, |style| {
-                style.spacing.item_spacing = Vec2::new(7.0, 5.0);
-                style.spacing.button_padding = Vec2::new(8.0, 3.0);
-            });
+            cc.egui_ctx
+                .style_mut_of(style_theme, |style| crate::ui::tune_style(style));
         }
         // 直接 with_maximized 会让首帧画在旧尺寸上且不重绘，改为第一帧后再最大化
         cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
@@ -90,8 +88,11 @@ impl SvnApp {
             pending_refresh: Vec::new(),
             font_note,
             update_info: None,
+            update_ready: false,
             // 启动 3 秒后开始检查更新：避开启动瞬间的 svn 探测高峰
             update_check_at: Some(Instant::now() + Duration::from_secs(3)),
+            // 开关打开后每隔 5 分钟查一次；这里先给一个周期，开启时会重置
+            next_update_check: Instant::now() + Duration::from_secs(update::AUTO_CHECK_EVERY_SECS),
             show_update_confirm: false,
             update_error: None,
             ai_picks: Vec::new(),
@@ -256,29 +257,39 @@ impl SvnApp {
                     // 统计页可能正等这个登录人（打开时还没探测到），拿到人就补跑一次
                     self.stats_after_user_probe();
                 }
-                (Kind::CheckUpdate, Data::UpdateCheck { ok, message, info }) => {
+                (Kind::CheckUpdate, Data::UpdateCheck { ok, message, info, ready, quiet }) => {
                     if !ok {
-                        // 启动时的自动检查失败只温和提醒（服务器没开是常态），不弹错误打断使用
-                        self.push(Level::Warning, format!("检查更新失败：{message}"));
+                        // 启动时的自动检查失败只温和提醒（服务器没开是常态），不弹错误打断使用；
+                        // 定时那一轮直接闭嘴，下一轮到点再试
+                        if !quiet {
+                            self.push(Level::Warning, format!("检查更新失败：{message}"));
+                        }
                     } else {
                         match info {
                             Some(manifest) => {
                                 let latest = manifest.version.trim().to_owned();
                                 let notes = manifest.notes.trim().to_owned();
-                                let has_new = update::is_newer(&latest, APP_VERSION);
                                 self.update_info = Some(manifest);
-                                if has_new {
+                                self.update_ready = ready;
+                                if ready {
+                                    // 版本号没动、只是换了构建时不能报「新版本 V1.2.4（当前 V1.2.4）」
+                                    let replaced = update::same_version(&latest, APP_VERSION);
                                     self.push(
                                         Level::Warning,
-                                        format!("发现新版本 V{latest}（当前 V{APP_VERSION}）"),
+                                        if replaced {
+                                            format!("发现新版本 V{latest}（新构建）")
+                                        } else {
+                                            format!("发现新版本 V{latest}（当前 V{APP_VERSION}）")
+                                        },
                                     );
                                     if !notes.is_empty() {
                                         self.push(Level::Info, format!("更新说明：\n{notes}"));
                                     }
                                     self.hint(format!(
-                                        "有新版本 V{latest}，点击顶部「↑ 新版本」按钮即可更新"
+                                        "发现可更新版本 V{latest}，点击顶部「↑ 新版本」按钮即可更新"
                                     ));
-                                } else {
+                                } else if !quiet {
+                                    // 定时检查没查到新版本就什么都不说，日志区只留 svn 操作
                                     self.push(
                                         Level::Success,
                                         format!("已是最新版本（V{APP_VERSION}）"),
@@ -530,12 +541,21 @@ impl SvnApp {
         if let Some(at) = self.update_check_at {
             if Instant::now() >= at {
                 self.update_check_at = None;
-                let ready = update::is_official(&self.cfg.update_source)
-                    || !self.cfg.update_server.trim().is_empty();
-                if self.cfg.check_update_on_start && ready {
-                    self.spawn_update_check();
+                if self.cfg.check_update_on_start && self.update_source_ready() {
+                    self.spawn_update_check(false);
                 }
             }
+        }
+        // 自动检查更新：开关打开后每 5 分钟查一次。正在查的时候不重复起，
+        // 过程静音（只有发现新版本或失败才在日志区说一声）
+        if self.cfg.auto_update_check
+            && Instant::now() >= self.next_update_check
+            && self.update_source_ready()
+            && !self.pool.has(Kind::CheckUpdate, usize::MAX)
+        {
+            self.next_update_check =
+                Instant::now() + Duration::from_secs(update::AUTO_CHECK_EVERY_SECS);
+            self.spawn_update_check(true);
         }
         if self.cfg.auto_refresh > 0
             && !self.probing
@@ -563,6 +583,15 @@ impl SvnApp {
     // ------------------------------------------------------------ 底部输出面板
 
     fn output_panel(&mut self, ui: &mut Ui) {
+        // 提示条常驻在日志正下方：先占住面板底部这一行，日志区（含滚动条）只吃剩下的高度，
+        // 消息来、消息换都不会把上面那块顶得一跳
+        egui::Panel::bottom("hint_bar").show(ui, |ui| {
+            ui.label(
+                RichText::new(self.hint.clone())
+                    .size(12.5)
+                    .color(ink(ui, Color32::from_rgb(140, 205, 255))),
+            );
+        });
         let count = self.output.len();
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("输出记录（{count} 行）")).strong().size(13.0));
@@ -635,5 +664,119 @@ impl eframe::App for SvnApp {
         self.file_diff_window(&ctx);
         self.file_log_window(&ctx);
         self.worklog_window(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testbed::{base_input, stub_app, Stage};
+    use egui::{Context, Rect, ThemePreference};
+
+    /// 提示条要落在日志正文下面，而且空提示也得占着同一行——上面那块日志区的高度
+    /// 不能因为「来了消息 / 消息空着」上下跳一下。
+    #[test]
+    fn hint_bar_stays_below_the_log() {
+        let ctx = Context::default();
+        ctx.set_theme(ThemePreference::Dark);
+        crate::fonts::install_cjk(&ctx);
+        let mut app = stub_app(false);
+        app.output.push(OutLine { level: Level::Info, text: "svn status".to_owned() });
+
+        let frame = |app: &mut SvnApp| -> Vec<(String, Rect)> {
+            let mut out = ctx.run_ui(base_input(), |ui| app.output_panel(ui));
+            out.textures_delta.clear();
+            out.shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_string(),
+                        item.shape.visual_bounding_rect(),
+                    )),
+                    _ => None,
+                })
+                .filter(|(text, _)| !text.trim().is_empty())
+                .collect()
+        };
+        let strip = |ctx: &Context| {
+            egui::containers::PanelState::load(ctx, egui::Id::new("hint_bar"))
+                .map(|state| state.size().y)
+        };
+
+        // 面板尺寸第一帧才量得出来，第二帧才是稳的
+        let _ = frame(&mut app);
+        let _ = frame(&mut app);
+        let empty_strip = strip(&ctx).expect("提示条该一直占着这一条");
+
+        app.hint = "已添加目录：C:\\Test".to_owned();
+        let _ = frame(&mut app);
+        let texts = frame(&mut app);
+        let hint = Stage::rect_of(&texts, "已添加目录：C:\\Test").expect("提示条要画出来");
+        let title = Stage::rect_of(&texts, "输出记录（1 行）").expect("日志标题");
+        let line = Stage::rect_of(&texts, "svn status").expect("日志正文");
+
+        assert!(hint.min.y > title.max.y, "提示条要在日志标题下面：{hint:?} / {title:?}");
+        assert!(hint.min.y > line.max.y, "提示条要在日志正文下面：{hint:?} / {line:?}");
+        assert!(
+            hint.max.y <= base_input().screen_rect.unwrap().max.y,
+            "提示条不该顶出窗口下沿：{hint:?}"
+        );
+        assert_eq!(
+            empty_strip,
+            strip(&ctx).unwrap(),
+            "空提示和有提示该占同一条，日志区高度不能跟着变"
+        );
+    }
+
+    /// 官方源不用填任何地址；自定义源没地址就不算可用
+    #[test]
+    fn only_a_configured_source_is_ready() {
+        let mut app = stub_app(false);
+        app.cfg.update_source = update::SOURCE_OFFICIAL.to_owned();
+        app.cfg.update_server.clear();
+        assert!(app.update_source_ready(), "官方源总是可用");
+
+        app.cfg.update_source = update::SOURCE_CUSTOM.to_owned();
+        assert!(!app.update_source_ready(), "自定义源没填地址不该去查一个空地址");
+        app.cfg.update_server = "http://192.168.1.251:20700".to_owned();
+        assert!(app.update_source_ready());
+    }
+
+    /// 定时那一轮：没到点 / 没开开关都不该起任务；到点了起一次并把节拍往后推
+    #[test]
+    fn auto_check_fires_only_on_its_own_beat() {
+        // 定时检查会写配置（spawn 里顺带 persist），别碰到用户真实的 config.json
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("svn_manager_auto_check_test"),
+        );
+        let ctx = Context::default();
+        let mut app = stub_app(false);
+        app.cfg.update_source = update::SOURCE_CUSTOM.to_owned();
+        // 指向本机一个必定连不通的端口：这一轮只会失败，不会真去联网
+        app.cfg.update_server = "http://127.0.0.1:9".to_owned();
+        app.next_update_check = Instant::now() - Duration::from_secs(1);
+
+        // 开关关着：到点也不动
+        let before = app.next_update_check;
+        app.cfg.auto_update_check = false;
+        app.tick(&ctx);
+        assert!(
+            !app.pool.has(Kind::CheckUpdate, usize::MAX),
+            "没开开关不该自动检查"
+        );
+        assert_eq!(app.next_update_check, before, "没开开关不该动节拍");
+
+        // 开关打开：到点起一轮，并把下一次推到 5 分钟后
+        app.cfg.auto_update_check = true;
+        app.tick(&ctx);
+        assert!(app.pool.has(Kind::CheckUpdate, usize::MAX), "到点该起一轮检查");
+        assert!(
+            app.next_update_check > Instant::now() + Duration::from_secs(update::AUTO_CHECK_EVERY_SECS - 2),
+            "节拍要往后推一个周期：还有 {:.0}s",
+            app.next_update_check
+                .checked_duration_since(Instant::now())
+                .map_or(0.0, |d| d.as_secs_f64()),
+        );
     }
 }

@@ -42,6 +42,8 @@ pub struct Config {
     pub update_server: String,
     /// 启动时自动检查版本更新
     pub check_update_on_start: bool,
+    /// 运行中定期自动检查版本更新（每 5 分钟一次，见 `update::AUTO_CHECK_EVERY_SECS`）
+    pub auto_update_check: bool,
     /// 提交成功后自动补跑一次 `svn update`，把整棵工作副本树的版本号推到最新
     pub update_after_commit: bool,
     /// 开机自动启动（实际生效写在注册表 HKCU Run 键里，这里只做记录）
@@ -76,6 +78,8 @@ impl Default for Config {
             update_source: "official".to_owned(),
             update_server: String::new(),
             check_update_on_start: true,
+            // 默认关闭：每 5 分钟联网查一次，要不要开由用户决定
+            auto_update_check: false,
             // 默认开启：提交后补一次 update，列表里的「本地 r」会立刻跟上新版本
             update_after_commit: true,
             // 默认关闭：开机自启要用户自己决定，开了就写 HKCU Run 键
@@ -142,6 +146,13 @@ mod tests {
         // 版本更新是后加的设置：老配置没有也要按默认值补齐（不检查、地址为空）
         assert!(parsed.update_server.is_empty());
         assert!(parsed.check_update_on_start);
+        // 定期自动检查是后加的设置：老配置没有要按默认值（关闭）补齐
+        assert!(!parsed.auto_update_check);
+        assert!(
+            serde_json::from_str::<Config>(r#"{"auto_update_check":true}"#)
+                .unwrap()
+                .auto_update_check
+        );
         // 更新源也是后加的：老配置没有要按默认值（官方 GitHub）补齐，写了 custom 才用自建地址
         assert_eq!(parsed.update_source, "official");
         assert_eq!(

@@ -48,6 +48,11 @@ pub enum Data {
         ok: bool,
         message: String,
         info: Option<crate::update::UpdateManifest>,
+        /// 更新源上确实有可装的新东西：按文件 sha256 判定（见 `update::has_update`），
+        /// 在检查那一趟的后台线程里算好，界面只读这个结论
+        ready: bool,
+        /// 定时自动检查来的结果：没新版本 / 检查失败时不往日志区刷，免得每 5 分钟一排
+        quiet: bool,
     },
     /// 新版本下载结果（ok=false 时 message 是原因；bytes 是下载字节数）
     UpdateDownloaded {

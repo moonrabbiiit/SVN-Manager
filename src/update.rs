@@ -23,13 +23,20 @@
 //!   "version": "1.2.0",
 //!   "url": "files/svn_manager_1.2.0.exe",
 //!   "notes": "修复了 xxx",
-//!   "sha256": "……（可省略，提供后更新脚本会用 certutil 校验）"
+//!   "sha256": "……（发布脚本会写；客户端拿它判有没有新版，下载后也用它校验）"
 //! }
 //! ```
 //!
 //! - `url` 相对 `latest.json` 所在目录拼接；写完整的 http(s) 地址也可以。
 //! - 服务端用 `tools/update_server.py` 即可（发布 + 托管），nginx / IIS 等
 //!   静态服务器同样适用。
+//!
+//! ## 怎么算「有新版本」
+//!
+//! 不看版本号，看文件：把更新源给的 `sha256`（自建源由 `update_server.py` 发布时写入，
+//! 官方源用 GitHub 资产的 digest）与本地正在运行的 exe 的 sha256 比，**不同就算有新版本**。
+//! 同一个版本号重新发布的构建因此也能被发现；源没给 `sha256`（早先上传的老资产）或本地
+//! exe 算不出哈希时，退回版本号比较（[`has_update`]）。
 //!
 //! ## 更新流程
 //!
@@ -72,7 +79,7 @@ pub fn is_official(source: &str) -> bool {
 /// 服务端 latest.json 的字段（缺省字段宽松处理，兼容以后扩展）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateManifest {
-    /// 服务端最新版本号，如 "1.2.0"（允许 V1.2.0 / v1.2.0 这类前缀）
+    /// 服务端最新版本号，如 "1.2.0"（V1.2.0 / v1.2.0 这类前缀在解析时就剥掉）
     pub version: String,
     /// 新版 exe 下载地址（相对或绝对）
     pub url: String,
@@ -109,6 +116,41 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
         }
     }
     false
+}
+
+/// 版本号取用前先剥掉 `v` / `V` 前缀：界面各处都自己加「V」，留着会显示成 Vv1.2.4。
+/// GitHub 的 tag 与手写 / 老版本发布的 latest.json 都可能带这个前缀。
+pub fn version_text(raw: &str) -> String {
+    raw.trim().trim_start_matches(['v', 'V']).trim().to_owned()
+}
+
+/// 两处版本号是不是同一版（逐段比，短的补 0：1.2 与 1.2.0 算同一版）。
+/// 任一边解析不出数字就不算同一版：一个连版本号都没写的源不该被当成「没变化」。
+pub fn same_version(left: &str, right: &str) -> bool {
+    let (left, right) = (parse_version(left), parse_version(right));
+    !left.is_empty()
+        && !right.is_empty()
+        && (0..left.len().max(right.len())).all(|index| {
+            left.get(index).copied().unwrap_or(0) == right.get(index).copied().unwrap_or(0)
+        })
+}
+
+/// 更新源上有没有可装的新东西——以文件为准。
+///
+/// 源给了 `sha256` 就与本地正在运行的 exe 的 sha256 比，不同即算有新版本：同一个版本号
+/// 重新发布的构建也能被发现。源没给 `sha256`（早先上传的老资产）、或本地 exe 取不到 /
+/// 算不出哈希时，退回版本号比较。哈希要走一次 certutil，只在后台检查那一趟调用，
+/// 别放进每帧的界面代码里。
+pub fn has_update(manifest: &UpdateManifest, current_version: &str) -> bool {
+    let remote = manifest.sha256.trim().to_ascii_lowercase();
+    if !remote.is_empty() {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Ok(local) = sha256_of(&exe) {
+                return local != remote;
+            }
+        }
+    }
+    is_newer(manifest.version.trim(), current_version)
 }
 
 /// 拼接下载地址：绝对 http(s) URL 原样返回，相对路径拼到服务根目录后面。
@@ -274,14 +316,16 @@ pub fn check(server: &str) -> Result<UpdateManifest, String> {
     let text = text.trim_start_matches('\u{feff}');
     let manifest: UpdateManifest = serde_json::from_str(text)
         .map_err(|e| format!("解析版本信息失败：{e}（{url}）"))?;
-    if manifest.version.trim().is_empty() {
+    // 服务端写 V1.2.4 也认：剥掉前缀再交给界面（界面各处自己加「V」）
+    let version = version_text(&manifest.version);
+    if version.is_empty() {
         return Err("服务端版本号为空".to_owned());
     }
     if manifest.url.trim().is_empty() {
         return Err("服务端未提供下载地址（url 字段）".to_owned());
     }
     let full = join_url(server, &manifest.url);
-    Ok(UpdateManifest { url: full, ..manifest })
+    Ok(UpdateManifest { version, url: full, ..manifest })
 }
 
 /// GitHub `releases/latest` 响应里我们要用到的那几项，其余字段忽略。
@@ -403,7 +447,7 @@ fn parse_release(text: &str) -> Result<UpdateManifest, String> {
     let release: GitHubRelease = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("解析 GitHub 发布信息失败：{e}"))?;
     // tag 普遍写成 `v1.2.0`，而界面各处都自己加「V」前缀，这里不剥掉就会显示成 Vv1.2.0
-    let version = release.tag_name.trim().trim_start_matches(['v', 'V']);
+    let version = version_text(&release.tag_name);
     if version.is_empty() {
         return Err("GitHub 最新发布没有版本号（tag_name）".to_owned());
     }
@@ -424,7 +468,7 @@ fn parse_release(text: &str) -> Result<UpdateManifest, String> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     Ok(UpdateManifest {
-        version: version.to_owned(),
+        version,
         url: asset.browser_download_url.trim().to_owned(),
         notes: plain_text(release.body.unwrap_or_default().as_str()),
         sha256,
@@ -562,34 +606,42 @@ pub fn sha256_of(path: &Path) -> Result<String, String> {
     Err("certutil 输出中没有校验值".to_owned())
 }
 
+/// 运行中自动检查更新的间隔（秒）。GitHub 匿名接口按 IP 限流 60 次/小时，
+/// 5 分钟一次只有 12 次/小时，余量都留给手动「检查更新」。
+pub const AUTO_CHECK_EVERY_SECS: u64 = 300;
+
+/// 暂存的新版 exe 的文件名。固定 ASCII：脚本里只出现这个名字（配合 `%~dp0`），
+/// 中文目录因此完全不影响 cmd 读脚本。
+pub const STAGED_EXE: &str = "svn_manager_update.exe";
+
+/// 收尾 bat 里用到的两个文件名走环境变量（由 [`apply_env`] 设置）：
+/// 脚本内容因此永远保持纯 ASCII，中文目录 / 中文文件名都由 cmd 在内存里按 UTF-16 展开。
+pub const TARGET_ENV: &str = "SVN_MGR_TARGET";
+pub const STAGED_ENV: &str = "SVN_MGR_STAGED";
+
 /// 生成应用更新的收尾 bat：杀残留实例 → 等主程序退出 → 覆盖原 exe
-/// （被占用则重试，上限 15 次）→ 删临时文件 → 重启 → bat 自删。
-/// 下载与校验已由程序完成，这里只做几秒钟的文件替换，输出全 ASCII。
-pub fn build_apply_bat(target: &Path) -> String {
-    let target = target.display().to_string();
-    let exe_name = target
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or("svn_manager.exe")
-        .to_owned();
-    let download = std::env::temp_dir()
-        .join("svn_manager_update.exe")
-        .display()
-        .to_string();
+/// （被占用则重试，上限 15 次）→ 删暂存文件 → 重启 → bat 自删。
+///
+/// 为什么不把路径写进脚本：cmd 是按控制台代码页把 .bat 当**文本**读的，脚本里一旦出现
+/// 中文目录或中文文件名就乱码，「从哪覆盖到哪」全错——这正是「更新器不支持中文目录」的根因。
+/// 所以：目录用 `%~dp0`（cmd 自己展开），文件名用环境变量（Rust 以 UTF-16 传给子进程），
+/// 脚本本身永远是纯 ASCII；环境变量没设时退回下面两个默认名，手工重跑脚本也照样能覆盖。
+/// 新版 exe 由调用方先暂存到程序目录、名字固定为 [`STAGED_EXE`]。
+pub fn build_apply_bat() -> String {
     format!(
         r#"@echo off
 setlocal
 title SVN Manager Update
-set "TARGET={target}"
-set "DOWNLOAD={download}"
+if "%{target_env}%"=="" set "{target_env}=svn_manager.exe"
+if "%{staged_env}%"=="" set "{staged_env}={staged}"
 set /a TRIES=0
 
 echo Applying SVN Manager update ...
-taskkill /f /im "{exe_name}" >nul 2>&1
+taskkill /f /im "%{target_env}%" >nul 2>&1
 {WIN_WAIT} /t 2 /nobreak >nul
 
 :copy_retry
-copy /y "%DOWNLOAD%" "%TARGET%" >nul 2>&1
+copy /y "%~dp0%{staged_env}%" "%~dp0%{target_env}%" >nul 2>&1
 if not errorlevel 1 goto copy_ok
 set /a TRIES+=1
 if %TRIES% GEQ 15 goto copy_fail
@@ -598,25 +650,50 @@ echo File is locked, retrying (%TRIES%/15) ...
 goto copy_retry
 
 :copy_ok
-del "%DOWNLOAD%" >nul 2>&1
-start "" "%TARGET%"
+del "%~dp0%{staged_env}%" >nul 2>&1
+start "" "%~dp0%{target_env}%"
 del "%~f0" & exit 0
 
 :copy_fail
-echo Cannot overwrite "%TARGET%" (file locked).
+echo Cannot overwrite "%{target_env}%" in this folder (file locked).
 echo Re-run this script to retry: %~f0
 pause
 exit 1
 "#,
-        target = target,
-        download = download,
-        exe_name = exe_name,
+        staged = STAGED_EXE,
+        target_env = TARGET_ENV,
+        staged_env = STAGED_ENV,
         // 必须写全路径：PATH 里若混进 Git Bash / MinGW 的 usr/bin（从 Git Bash
         // 启动本程序就会），裸写 timeout 会命中 GNU coreutils 的 timeout，
         // 报 "invalid time interval '/t'" 并立刻返回——重试循环会瞬间打完 15 次，
         // 更新必然卡在「文件被占用」。
         WIN_WAIT = r"%SystemRoot%\System32\timeout.exe",
     )
+}
+
+/// 把「要覆盖哪个 exe」告诉收尾脚本：文件名走环境变量，中文名也不会被代码页搞坏。
+pub fn apply_env<'a>(
+    command: &'a mut std::process::Command,
+    target: &Path,
+) -> &'a mut std::process::Command {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "svn_manager.exe".to_owned());
+    command.env(TARGET_ENV, name).env(STAGED_ENV, STAGED_EXE)
+}
+
+/// 启动收尾脚本：目录由脚本自己用 `%~dp0` 认（cmd 在内存里展开），
+/// 文件名由 [`apply_env`] 从环境变量带过去。
+pub fn apply_launcher(bat: &Path, target: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("cmd");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    apply_env(&mut command, target);
+    // `start` 会给脚本另起一个控制台窗口：不闪主程序的框，覆盖失败时的 pause 也看得见
+    command.args(["/C", "start", "", &bat.to_string_lossy()]);
+    command
 }
 
 #[cfg(test)]
@@ -650,16 +727,18 @@ mod tests {
         // 目标程序用 rundll32 的副本：启动即退出，不会弹界面
         let target = dir.join("fake_target.exe");
         std::fs::copy(r"C:\Windows\System32\rundll32.exe", &target).unwrap();
-        // bat 里新 exe 的路径是固定的 temp\svn_manager_update.exe
-        let download = std::env::temp_dir().join("svn_manager_update.exe");
-        std::fs::write(&download, b"new-binary-bytes").unwrap();
+        // 新版 exe 由程序自己暂存到目标隔壁（名字固定 STAGED_EXE），bat 只认 %~dp0 + 这个名字
+        let staged = dir.join(STAGED_EXE);
+        std::fs::write(&staged, b"new-binary-bytes").unwrap();
 
         let bat = dir.join("apply.bat");
-        std::fs::write(&bat, build_apply_bat(&target)).unwrap();
-        let out = std::process::Command::new("cmd")
+        std::fs::write(&bat, build_apply_bat().as_bytes()).unwrap();
+        let mut command = std::process::Command::new("cmd");
+        command
             .args(["/C", &bat.to_string_lossy()])
-            .output()
-            .unwrap();
+            .stdin(std::process::Stdio::null());
+        apply_env(&mut command, &target);
+        let out = command.output().unwrap();
         // 不看退出码：bat 最后一步是 del "%~f0" 自删，cmd 读不到后续行时
         // 退出码并不总是 0（真实流程里主程序早已退出，这个值无人关心）。
         // 真正要守住的是下面三个效果和「等待命令没被 GNU timeout 抢走」。
@@ -675,8 +754,56 @@ mod tests {
             b"new-binary-bytes".to_vec(),
             "目标程序未被新版本覆盖"
         );
-        assert!(!download.exists(), "下载的临时文件没有被清理");
+        assert!(!staged.exists(), "暂存的新版 exe 没有被清理");
         // del "%~f0" 在脚本末尾执行，进程结束后文件应已消失（等一小会儿）
+        for _ in 0..20 {
+            if !bat.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!bat.exists(), "批处理文件没有自删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 真机演练中文目录：程序装在中文目录、连 exe 都改成了中文名时，收尾 bat 仍要
+    /// 照常覆盖并重启。用户报的「更新器不支持中文目录」就是这个场景的回归。
+    /// 默认跳过，手动跑：`cargo test -- --ignored apply_bat`
+    #[test]
+    #[ignore]
+    fn apply_bat_works_in_a_chinese_directory() {
+        let dir = std::env::temp_dir().join("svn管理器_中文目录测试");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("测试程序.exe");
+        std::fs::copy(r"C:\Windows\System32\rundll32.exe", &target).unwrap();
+        let staged = dir.join(STAGED_EXE);
+        std::fs::write(&staged, b"new-binary-bytes").unwrap();
+
+        let bat = dir.join("apply.bat");
+        let text = build_apply_bat();
+        assert!(
+            text.is_ascii(),
+            "中文目录与中文名都不能进脚本（走 %~dp0 与环境变量）：\n{text}"
+        );
+        assert!(!text.contains("测试程序"), "目标名不该出现在脚本里");
+        std::fs::write(&bat, text.as_bytes()).unwrap();
+        let mut command = std::process::Command::new("cmd");
+        command
+            .args(["/C", &bat.to_string_lossy()])
+            .stdin(std::process::Stdio::null());
+        apply_env(&mut command, &target);
+        let out = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(!stderr.contains("Cannot overwrite"), "覆盖失败：{stderr}");
+        assert!(!stdout.contains("batch file"), "脚本没能读完：{stdout}{stderr}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"new-binary-bytes".to_vec(),
+            "中文目录里的目标程序没被覆盖"
+        );
+        assert!(!staged.exists(), "暂存的新版 exe 没有被清理");
         for _ in 0..20 {
             if !bat.exists() {
                 break;
@@ -699,15 +826,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("fake_target.exe");
         std::fs::copy(r"C:\Windows\System32\rundll32.exe", &target).unwrap();
-        std::fs::write(std::env::temp_dir().join("svn_manager_update.exe"), b"new-binary-bytes").unwrap();
+        std::fs::write(dir.join(STAGED_EXE), b"new-binary-bytes").unwrap();
         let bat = dir.join("apply.bat");
-        std::fs::write(&bat, build_apply_bat(&target)).unwrap();
+        std::fs::write(&bat, build_apply_bat().as_bytes()).unwrap();
         // stdin 给空设备：万一脚本又只是返回，cmd 会读完输入直接退出而不是挂住等人按键
-        let out = std::process::Command::new("cmd")
+        let mut command = std::process::Command::new("cmd");
+        command
             .args(["/K", &bat.to_string_lossy()])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
+            .stdin(std::process::Stdio::null());
+        apply_env(&mut command, &target);
+        let out = command.output().unwrap();
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -904,6 +1032,49 @@ mod tests {
         assert!(!is_newer("1.0.9", "1.1.0"));
     }
 
+    /// 版本号从源里取出来时统一剥掉 v / V 前缀：界面各处自己加「V」，留着会变成 Vv1.2.4
+    #[test]
+    fn version_prefixes_are_stripped() {
+        assert_eq!(version_text("  v1.2.4 "), "1.2.4");
+        assert_eq!(version_text("V1.2.4"), "1.2.4");
+        assert_eq!(version_text("1.2.4"), "1.2.4");
+        assert_eq!(version_text("  "), "");
+    }
+
+    /// 「版本号没变」要能认出来：窗口据此不说「旧 → 新」那套
+    #[test]
+    fn same_version_ignores_a_missing_segment() {
+        assert!(same_version("1.2", "1.2.0"));
+        assert!(same_version("V1.2.4", "1.2.4"));
+        assert!(!same_version("1.2.4", "1.2.5"));
+        assert!(!same_version("无数字", "无数字"), "两边都解析不出数字就不算同一版");
+    }
+
+    /// 判定以文件为准：源上的 sha256 与本地 exe 不同就算有新版本（同一个版本号
+    /// 重新发布的构建也能发现）；源没给 sha256 才退回版本号比较。
+    #[test]
+    fn update_is_decided_by_the_file_hash() {
+        let manifest = |sha: &str, version: &str| UpdateManifest {
+            version: version.to_owned(),
+            url: "http://x/y.exe".to_owned(),
+            notes: String::new(),
+            sha256: sha.to_owned(),
+            published_at: String::new(),
+        };
+        // 本地 exe 的真实哈希：与源上一致就不算更新，哪怕源上的版本号写着 1.0.0
+        let mine = sha256_of(&std::env::current_exe().expect("测试进程自己的 exe")).unwrap();
+        assert!(!has_update(&manifest(&mine, "1.0.0"), "9.9.9"));
+        assert!(
+            !has_update(&manifest(&mine.to_uppercase(), "1.0.0"), "9.9.9"),
+            "大小写不同的同一个哈希不该算成新版本"
+        );
+        // 换过一次构建：版本号没动也算更新
+        assert!(has_update(&manifest(&"0f".repeat(32), "1.2.4"), "1.2.4"));
+        // 源没给 sha256（早先上传的老资产）：退回版本号比较
+        assert!(has_update(&manifest("", "1.2.5"), "1.2.4"));
+        assert!(!has_update(&manifest("", "1.2.4"), "1.2.4"));
+    }
+
     #[test]
     fn urls_are_joined() {
         assert_eq!(
@@ -977,18 +1148,55 @@ mod tests {
 
     #[test]
     fn apply_bat_contains_the_whole_swap_flow() {
-        let bat = build_apply_bat(Path::new(r"D:\tools\svn_manager.exe"));
+        let bat = build_apply_bat();
         // 覆盖目标、杀残留、重试、重启、自删
-        assert!(bat.contains(r#"set "TARGET=D:\tools\svn_manager.exe""#));
-        assert!(bat.contains(r#"taskkill /f /im "svn_manager.exe""#));
+        assert!(
+            bat.contains(r#"copy /y "%~dp0%SVN_MGR_STAGED%" "%~dp0%SVN_MGR_TARGET%""#),
+            "{bat}"
+        );
+        assert!(bat.contains(r#"taskkill /f /im "%SVN_MGR_TARGET%""#));
         assert!(bat.contains("goto copy_retry"));
-        assert!(bat.contains(r#"start "" "%TARGET%""#));
+        assert!(bat.contains(r#"start "" "%~dp0%SVN_MGR_TARGET%""#));
         assert!(bat.contains(r#"del "%~f0""#));
         // 下载与校验已在程序内完成，bat 里不应再出现
         assert!(!bat.contains("curl"), "下载已在程序内完成");
         assert!(!bat.contains("certutil"), "校验已在程序内完成");
-        // 覆盖目标与 echo 输出必须全 ASCII，任何代码页都不会乱码
+        // 脚本必须全 ASCII：中文目录与中文文件名一律走 %~dp0 与环境变量，
+        // 不经过控制台代码页，这是「更新器不支持中文目录」的解法
         assert!(bat.is_ascii(), "bat 输出必须全 ASCII");
+        // 环境变量没设时退回默认名：手工重跑脚本也照样能覆盖
+        assert!(bat.contains(r#"if "%SVN_MGR_TARGET%"=="" set "SVN_MGR_TARGET=svn_manager.exe""#));
+        assert!(bat.contains(r#"if "%SVN_MGR_STAGED%"=="" set "SVN_MGR_STAGED=svn_manager_update.exe""#));
+    }
+
+    /// 中文目录曾让更新器直接失效：脚本里写着绝对路径，而 cmd 是按控制台代码页把 .bat
+    /// 当文本读的，中文一进脚本就乱码，「从哪覆盖到哪」全错。
+    /// 现在脚本内容与真实路径彻底解耦——目标名只从 apply_env 的环境变量来（UTF-16）。
+    #[test]
+    fn apply_bat_never_contains_the_target_path() {
+        let bat = build_apply_bat();
+        assert!(bat.is_ascii(), "{bat}");
+        assert!(!bat.contains("程序") && !bat.contains(r"D:\"), "路径不该进脚本：\n{bat}");
+        let mut command = std::process::Command::new("cmd");
+        apply_env(&mut command, Path::new(r"D:\程序\SVN 管理器\SVN管理器.exe"));
+        let vars: Vec<(String, String)> = command
+            .get_envs()
+            .filter(|(key, _)| *key == TARGET_ENV || *key == STAGED_ENV)
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap_or_default().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert!(
+            vars.iter().any(|(key, value)| key == TARGET_ENV && value == "SVN管理器.exe"),
+            "目标文件名要原样带过去：{vars:?}"
+        );
+        assert!(
+            vars.iter().any(|(key, value)| key == STAGED_ENV && value == STAGED_EXE),
+            "暂存名是固定的 ASCII：{vars:?}"
+        );
     }
 
     #[test]

@@ -107,7 +107,10 @@ pub fn stub_app(compact: bool) -> SvnApp {
         pending_refresh: Vec::new(),
         font_note: String::new(),
         update_info: None,
+        update_ready: false,
         update_check_at: None,
+        // 无头跑帧不该触发定时检查：给个远未来的时刻
+        next_update_check: Instant::now() + std::time::Duration::from_secs(3600),
         show_update_confirm: false,
         update_error: None,
         ai_picks: Vec::new(),
