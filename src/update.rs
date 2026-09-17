@@ -41,14 +41,15 @@
 //! ## 更新流程
 //!
 //! 发现新版本 → 用户确认 → 程序内下载新 exe（日志区可见进度）→ certutil 校验
-//! SHA256（服务端提供时）→ 生成收尾 bat（杀残留实例 → 等主程序退出 → 覆盖 →
-//! 重启 → 自删）并启动 → 主程序退出，后续交给 bat 完成。
-//! 下载与校验不放進 bat：脚本在磁盘上停留越久，越容易被安全软件当成可疑文件查删。
-//! bat 由 `start` 拉起，而 start 打开 .bat 等价于 `cmd /K 脚本`：脚本自删之后只是
-//! 「返回」（`exit /b`）的话，cmd 会回到已经不存在的脚本上，打印一句
-//! 「找不到批处理文件。」并留下一个空着的命令行窗口——所以脚本结尾必须用 `exit`
-//! 直接结束 cmd 进程，成功、失败两条路径都是。
-//! bat 里的输出全部用 ASCII，避免任何代码页乱码问题。
+//! SHA256（服务端提供时）→ 落到程序目录暂存 → [`swap_in_place`] 把**正在运行的**
+//! 旧程序改名让路、新文件顶上正式名字 → [`relaunch`] 拉起新版 → 本进程退出；
+//! 新版启动时 [`clean_leftovers`] 收掉 `.old.exe`。
+//!
+//! 全程没有收尾脚本，也就没有「交给控制台按代码页解码的文本文件」这一环：早先用
+//! 收尾 bat 时，脚本里一旦出现中文目录/中文文件名，cmd 读脚本就会把行拆错
+//! （`'ARGET' 不是内部或外部命令`、`Unknown subcommand: 'Manager'` 那一类），
+//! 「更新器不支持中文目录」就是这么来的。换成改名后路径完全不参与解码。
+//! Windows 不允许覆盖或删除正在运行的镜像，但**允许改名**，这就是能不用脚本的全部依据。
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -610,90 +611,76 @@ pub fn sha256_of(path: &Path) -> Result<String, String> {
 /// 5 分钟一次只有 12 次/小时，余量都留给手动「检查更新」。
 pub const AUTO_CHECK_EVERY_SECS: u64 = 300;
 
-/// 暂存的新版 exe 的文件名。固定 ASCII：脚本里只出现这个名字（配合 `%~dp0`），
-/// 中文目录因此完全不影响 cmd 读脚本。
+/// 新版 exe 暂存用的文件名。程序目录与 %TEMP% 下各放一份都用它。
 pub const STAGED_EXE: &str = "svn_manager_update.exe";
 
-/// 收尾 bat 里用到的两个文件名走环境变量（由 [`apply_env`] 设置）：
-/// 脚本内容因此永远保持纯 ASCII，中文目录 / 中文文件名都由 cmd 在内存里按 UTF-16 展开。
-pub const TARGET_ENV: &str = "SVN_MGR_TARGET";
-pub const STAGED_ENV: &str = "SVN_MGR_STAGED";
+/// 旧程序让路时改成的名字：`svn_manager.exe` → `svn_manager.old.exe`。
+/// 名字由正式名推得出来，所以新进程不需要任何跨进程传参就能清掉残局。
+pub fn old_path(exe: &Path) -> PathBuf {
+    exe.with_extension("old.exe")
+}
 
-/// 生成应用更新的收尾 bat：杀残留实例 → 等主程序退出 → 覆盖原 exe
-/// （被占用则重试，上限 15 次）→ 删暂存文件 → 重启 → bat 自删。
+/// 就地把**正在运行的** `exe` 换成暂存的 `staged`，成功时返回让路后的旧程序路径。
 ///
-/// 为什么不把路径写进脚本：cmd 是按控制台代码页把 .bat 当**文本**读的，脚本里一旦出现
-/// 中文目录或中文文件名就乱码，「从哪覆盖到哪」全错——这正是「更新器不支持中文目录」的根因。
-/// 所以：目录用 `%~dp0`（cmd 自己展开），文件名用环境变量（Rust 以 UTF-16 传给子进程），
-/// 脚本本身永远是纯 ASCII；环境变量没设时退回下面两个默认名，手工重跑脚本也照样能覆盖。
-/// 新版 exe 由调用方先暂存到程序目录、名字固定为 [`STAGED_EXE`]。
-pub fn build_apply_bat() -> String {
-    format!(
-        r#"@echo off
-setlocal
-title SVN Manager Update
-if "%{target_env}%"=="" set "{target_env}=svn_manager.exe"
-if "%{staged_env}%"=="" set "{staged_env}={staged}"
-set /a TRIES=0
-
-echo Applying SVN Manager update ...
-taskkill /f /im "%{target_env}%" >nul 2>&1
-{WIN_WAIT} /t 2 /nobreak >nul
-
-:copy_retry
-copy /y "%~dp0%{staged_env}%" "%~dp0%{target_env}%" >nul 2>&1
-if not errorlevel 1 goto copy_ok
-set /a TRIES+=1
-if %TRIES% GEQ 15 goto copy_fail
-echo File is locked, retrying (%TRIES%/15) ...
-{WIN_WAIT} /t 2 /nobreak >nul
-goto copy_retry
-
-:copy_ok
-del "%~dp0%{staged_env}%" >nul 2>&1
-start "" "%~dp0%{target_env}%"
-del "%~f0" & exit 0
-
-:copy_fail
-echo Cannot overwrite "%{target_env}%" in this folder (file locked).
-echo Re-run this script to retry: %~f0
-pause
-exit 1
-"#,
-        staged = STAGED_EXE,
-        target_env = TARGET_ENV,
-        staged_env = STAGED_ENV,
-        // 必须写全路径：PATH 里若混进 Git Bash / MinGW 的 usr/bin（从 Git Bash
-        // 启动本程序就会），裸写 timeout 会命中 GNU coreutils 的 timeout，
-        // 报 "invalid time interval '/t'" 并立刻返回——重试循环会瞬间打完 15 次，
-        // 更新必然卡在「文件被占用」。
-        WIN_WAIT = r"%SystemRoot%\System32\timeout.exe",
-    )
+/// Windows 不允许覆盖或删除正在运行的镜像（会报拒绝访问），但允许改名——这就是不用
+/// 收尾脚本也能自更新的全部依据：旧程序改名让路 → 空出来的名字放新文件 → 调用方
+/// 拉起新程序、自己退出。好处是路径完全不经过控制台代码页，脚本文件、`%~dp0`、
+/// 环境变量传名那一套都不需要了，中文目录 / 中文文件名一视同仁。
+///
+/// 第二步失败会把旧程序改回原名再返回错误（不留「正式名字下没有程序」的中间态）；
+/// 调用方在这之后要么重试，要么让用户手动替换。
+pub fn swap_in_place(exe: &Path, staged: &Path) -> Result<PathBuf, String> {
+    let old = old_path(exe);
+    // 上一次更新留下的旧程序这时已经退出，能删就删；删不掉也不挡这次换名
+    if old.exists() {
+        let _ = std::fs::remove_file(&old);
+    }
+    std::fs::rename(exe, &old)
+        .map_err(|e| format!("没法把正在运行的程序改名让路（{}）：{e}", exe.display()))?;
+    match std::fs::rename(staged, exe) {
+        Ok(()) => Ok(old),
+        Err(e) => {
+            let _ = std::fs::rename(&old, exe);
+            Err(format!("没法把新版本改名到位（{}）：{e}", exe.display()))
+        }
+    }
 }
 
-/// 把「要覆盖哪个 exe」告诉收尾脚本：文件名走环境变量，中文名也不会被代码页搞坏。
-pub fn apply_env<'a>(
-    command: &'a mut std::process::Command,
-    target: &Path,
-) -> &'a mut std::process::Command {
-    let name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "svn_manager.exe".to_owned());
-    command.env(TARGET_ENV, name).env(STAGED_ENV, STAGED_EXE)
-}
-
-/// 启动收尾脚本：目录由脚本自己用 `%~dp0` 认（cmd 在内存里展开），
-/// 文件名由 [`apply_env`] 从环境变量带过去。
-pub fn apply_launcher(bat: &Path, target: &Path) -> std::process::Command {
-    let mut command = std::process::Command::new("cmd");
+/// 拉起换好名的新版程序。父进程随后 `exit` 不影响它继续跑：Windows 不会连坐子进程。
+pub fn relaunch(exe: &Path) -> Result<(), String> {
+    let mut command = std::process::Command::new(exe);
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
-    apply_env(&mut command, target);
-    // `start` 会给脚本另起一个控制台窗口：不闪主程序的框，覆盖失败时的 pause 也看得见
-    command.args(["/C", "start", "", &bat.to_string_lossy()]);
     command
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("拉起新版本失败（{}）：{e}", exe.display()))
+}
+
+/// 启动时收拾上一次自更新的残局，返回「这次启动是更新后的第一次启动」。
+///
+/// `.old.exe` 只能在**新版自己**起来之后删：换名那会儿旧进程还在跑，它的镜像还映射着，
+/// 系统不给删（`remove_file` 直接失败）。新版起来时旧进程通常刚好在退出，所以这里短促
+/// 重试几次；实在删不掉就留着，下一次启动还会再收一遍。
+///
+/// 顺手清掉两个暂存文件：下载完没走到换名就退出（用户取消、或上一次更新失败）时留下的。
+pub fn clean_leftovers(exe: &Path) -> bool {
+    let old = old_path(exe);
+    let mut updated = false;
+    if old.exists() {
+        updated = true;
+        for _ in 0..10 {
+            if std::fs::remove_file(&old).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    }
+    if let Some(dir) = exe.parent() {
+        let _ = std::fs::remove_file(dir.join(STAGED_EXE));
+    }
+    let _ = std::fs::remove_file(std::env::temp_dir().join(STAGED_EXE));
+    updated
 }
 
 #[cfg(test)]
@@ -715,137 +702,87 @@ mod tests {
         );
     }
 
-    /// 真机演练收尾 bat：用无害替身跑完整一遍「杀进程 → 覆盖 → 重启 → 删除临时
-    /// 文件 → 自删」。这是更新链里最脆的一段（早先出过「未找到批处理文件」），
-    /// 默认跳过，手动跑：`cargo test -- --ignored apply_bat`
+    /// 换名的正路：新文件顶上正式名字，旧程序让到 `.old.exe`，暂存文件不再存在；
+    /// 残局由启动时的 `clean_leftovers` 收掉。目录与 exe 名都用中文——这条路不经过
+    /// 控制台代码页，中文不该有任何影响（脚本方案就是死在这儿的）。
     #[test]
-    #[ignore]
-    fn apply_bat_replaces_target_and_cleans_up() {
-        let dir = std::env::temp_dir().join("svn_manager_bat_probe");
+    fn swap_in_place_puts_the_new_exe_in_place() {
+        let dir = std::env::temp_dir().join("svn管理器_换名测试");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // 目标程序用 rundll32 的副本：启动即退出，不会弹界面
-        let target = dir.join("fake_target.exe");
-        std::fs::copy(r"C:\Windows\System32\rundll32.exe", &target).unwrap();
-        // 新版 exe 由程序自己暂存到目标隔壁（名字固定 STAGED_EXE），bat 只认 %~dp0 + 这个名字
+        let exe = dir.join("SVN管理器.exe");
         let staged = dir.join(STAGED_EXE);
-        std::fs::write(&staged, b"new-binary-bytes").unwrap();
+        std::fs::write(&exe, b"old-binary").unwrap();
+        std::fs::write(&staged, b"new-binary").unwrap();
 
-        let bat = dir.join("apply.bat");
-        std::fs::write(&bat, build_apply_bat().as_bytes()).unwrap();
-        let mut command = std::process::Command::new("cmd");
-        command
-            .args(["/C", &bat.to_string_lossy()])
-            .stdin(std::process::Stdio::null());
-        apply_env(&mut command, &target);
-        let out = command.output().unwrap();
-        // 不看退出码：bat 最后一步是 del "%~f0" 自删，cmd 读不到后续行时
-        // 退出码并不总是 0（真实流程里主程序早已退出，这个值无人关心）。
-        // 真正要守住的是下面三个效果和「等待命令没被 GNU timeout 抢走」。
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        assert!(
-            !stderr.contains("invalid time interval"),
-            "等待命令被 GNU coreutils 的 timeout 抢走了（要写全 System32 路径）：{stderr}"
-        );
-        assert!(!stderr.contains("Cannot overwrite"), "覆盖失败：{stderr}");
+        let old = swap_in_place(&exe, &staged).expect("换名该成功");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary".to_vec(), "正式名字下要是新版");
+        assert_eq!(std::fs::read(&old).unwrap(), b"old-binary".to_vec(), "旧程序要改名让路");
+        assert!(!staged.exists(), "暂存文件该被换走");
 
-        assert_eq!(
-            std::fs::read(&target).unwrap(),
-            b"new-binary-bytes".to_vec(),
-            "目标程序未被新版本覆盖"
-        );
-        assert!(!staged.exists(), "暂存的新版 exe 没有被清理");
-        // del "%~f0" 在脚本末尾执行，进程结束后文件应已消失（等一小会儿）
-        for _ in 0..20 {
-            if !bat.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(!bat.exists(), "批处理文件没有自删");
+        assert!(clean_leftovers(&exe), "有 .old.exe 就算「更新后的第一次启动」");
+        assert!(!old.exists(), ".old.exe 没被清掉");
+        assert!(!clean_leftovers(&exe), "清完再启动就不该再报「刚更新过」");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 真机演练中文目录：程序装在中文目录、连 exe 都改成了中文名时，收尾 bat 仍要
-    /// 照常覆盖并重启。用户报的「更新器不支持中文目录」就是这个场景的回归。
-    /// 默认跳过，手动跑：`cargo test -- --ignored apply_bat`
+    /// 第二步失败要回滚：旧程序改回原名，程序还是能跑的那个版本，
+    /// 不会停在「正式名字下没有程序」的中间态。
     #[test]
-    #[ignore]
-    fn apply_bat_works_in_a_chinese_directory() {
-        let dir = std::env::temp_dir().join("svn管理器_中文目录测试");
+    fn swap_in_place_rolls_back_when_the_staged_file_is_gone() {
+        let dir = std::env::temp_dir().join("svn_manager_swap_rollback");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("测试程序.exe");
-        std::fs::copy(r"C:\Windows\System32\rundll32.exe", &target).unwrap();
-        let staged = dir.join(STAGED_EXE);
-        std::fs::write(&staged, b"new-binary-bytes").unwrap();
+        let exe = dir.join("svn_manager.exe");
+        std::fs::write(&exe, b"old-binary").unwrap();
+        let staged = dir.join(STAGED_EXE); // 故意不存在
 
-        let bat = dir.join("apply.bat");
-        let text = build_apply_bat();
-        assert!(
-            text.is_ascii(),
-            "中文目录与中文名都不能进脚本（走 %~dp0 与环境变量）：\n{text}"
-        );
-        assert!(!text.contains("测试程序"), "目标名不该出现在脚本里");
-        std::fs::write(&bat, text.as_bytes()).unwrap();
-        let mut command = std::process::Command::new("cmd");
-        command
-            .args(["/C", &bat.to_string_lossy()])
-            .stdin(std::process::Stdio::null());
-        apply_env(&mut command, &target);
-        let out = command.output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        assert!(!stderr.contains("Cannot overwrite"), "覆盖失败：{stderr}");
-        assert!(!stdout.contains("batch file"), "脚本没能读完：{stdout}{stderr}");
-        assert_eq!(
-            std::fs::read(&target).unwrap(),
-            b"new-binary-bytes".to_vec(),
-            "中文目录里的目标程序没被覆盖"
-        );
-        assert!(!staged.exists(), "暂存的新版 exe 没有被清理");
-        for _ in 0..20 {
-            if !bat.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(!bat.exists(), "批处理文件没有自删");
+        assert!(swap_in_place(&exe, &staged).is_err(), "暂存文件不在就该报错");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old-binary".to_vec(), "旧程序要回到原名下");
+        assert!(!old_path(&exe).exists(), "回滚后不该留下 .old.exe");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 真实启动方式是 `start 脚本`，而 start 打开 .bat 等价于 `cmd /K 脚本`：
-    /// 脚本自删后若只是返回（`exit /b`），cmd 会回到已经不存在的脚本上打印
-    /// 「找不到批处理文件。」并留下一个空窗口。这条按 /K 复现，守住「结尾必须 exit」。
-    /// 默认跳过，手动跑：`cargo test -- --ignored apply_bat`
+    /// 真机回归：**正在运行**的 exe 只有改名是允许的（覆盖、删除都会被系统拒绝），
+    /// 这是「不用收尾脚本也能自更新」的全部依据，所以拿一个真跑着的进程过一遍。
+    /// 替身用 System32 里 ping.exe 的副本（不是系统里那个），跑几秒不占界面；
+    /// 换名之后它照旧跑着，正好顺势验证「运行时的镜像删不掉」，也就是清理必须交给新版启动。
     #[test]
-    #[ignore]
-    fn apply_bat_ends_the_host_cmd_process() {
-        let dir = std::env::temp_dir().join("svn_manager_bat_k");
+    #[cfg(windows)]
+    fn swap_in_place_renames_a_running_exe() {
+        let dir = std::env::temp_dir().join("svn_manager_running_swap");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("fake_target.exe");
-        std::fs::copy(r"C:\Windows\System32\rundll32.exe", &target).unwrap();
-        std::fs::write(dir.join(STAGED_EXE), b"new-binary-bytes").unwrap();
-        let bat = dir.join("apply.bat");
-        std::fs::write(&bat, build_apply_bat().as_bytes()).unwrap();
-        // stdin 给空设备：万一脚本又只是返回，cmd 会读完输入直接退出而不是挂住等人按键
-        let mut command = std::process::Command::new("cmd");
-        command
-            .args(["/K", &bat.to_string_lossy()])
-            .stdin(std::process::Stdio::null());
-        apply_env(&mut command, &target);
-        let out = command.output().unwrap();
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        let exe = dir.join("svn_manager.exe");
+        std::fs::copy(r"C:\Windows\System32\ping.exe", &exe).expect("复制替身 exe");
+        let mut child = std::process::Command::new(&exe)
+            .args(["-n", "20", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("替身进程该能起来");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(child.try_wait().unwrap().is_none(), "替身进程这时该还在跑");
+
+        let staged = dir.join(STAGED_EXE);
+        std::fs::write(&staged, b"new-binary-bytes").unwrap();
+        let old = swap_in_place(&exe, &staged).expect("运行中的 exe 该能改名让路");
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            b"new-binary-bytes".to_vec(),
+            "新版本没顶上正式名字"
         );
+        assert!(old.exists(), "旧程序不在 .old.exe 下");
         assert!(
-            !text.contains("找不到批处理文件") && !text.to_lowercase().contains("batch file"),
-            "脚本自删后 cmd 又回去读已删除的脚本（结尾要用 exit 结束进程）：{text}"
+            std::fs::remove_file(&old).is_err(),
+            "还在跑的镜像居然删得掉？那清理就不必等新版启动了"
         );
-        assert!(!bat.exists(), "批处理文件没有自删");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(clean_leftovers(&exe), "有 .old.exe 就该算「更新后的第一次启动」");
+        assert!(!old.exists(), "旧进程退出后该删得掉");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1143,59 +1080,6 @@ mod tests {
         assert!(
             !plain.contains("TLS 握手失败"),
             "非 TLS 错误不应加 https 提示：{plain}"
-        );
-    }
-
-    #[test]
-    fn apply_bat_contains_the_whole_swap_flow() {
-        let bat = build_apply_bat();
-        // 覆盖目标、杀残留、重试、重启、自删
-        assert!(
-            bat.contains(r#"copy /y "%~dp0%SVN_MGR_STAGED%" "%~dp0%SVN_MGR_TARGET%""#),
-            "{bat}"
-        );
-        assert!(bat.contains(r#"taskkill /f /im "%SVN_MGR_TARGET%""#));
-        assert!(bat.contains("goto copy_retry"));
-        assert!(bat.contains(r#"start "" "%~dp0%SVN_MGR_TARGET%""#));
-        assert!(bat.contains(r#"del "%~f0""#));
-        // 下载与校验已在程序内完成，bat 里不应再出现
-        assert!(!bat.contains("curl"), "下载已在程序内完成");
-        assert!(!bat.contains("certutil"), "校验已在程序内完成");
-        // 脚本必须全 ASCII：中文目录与中文文件名一律走 %~dp0 与环境变量，
-        // 不经过控制台代码页，这是「更新器不支持中文目录」的解法
-        assert!(bat.is_ascii(), "bat 输出必须全 ASCII");
-        // 环境变量没设时退回默认名：手工重跑脚本也照样能覆盖
-        assert!(bat.contains(r#"if "%SVN_MGR_TARGET%"=="" set "SVN_MGR_TARGET=svn_manager.exe""#));
-        assert!(bat.contains(r#"if "%SVN_MGR_STAGED%"=="" set "SVN_MGR_STAGED=svn_manager_update.exe""#));
-    }
-
-    /// 中文目录曾让更新器直接失效：脚本里写着绝对路径，而 cmd 是按控制台代码页把 .bat
-    /// 当文本读的，中文一进脚本就乱码，「从哪覆盖到哪」全错。
-    /// 现在脚本内容与真实路径彻底解耦——目标名只从 apply_env 的环境变量来（UTF-16）。
-    #[test]
-    fn apply_bat_never_contains_the_target_path() {
-        let bat = build_apply_bat();
-        assert!(bat.is_ascii(), "{bat}");
-        assert!(!bat.contains("程序") && !bat.contains(r"D:\"), "路径不该进脚本：\n{bat}");
-        let mut command = std::process::Command::new("cmd");
-        apply_env(&mut command, Path::new(r"D:\程序\SVN 管理器\SVN管理器.exe"));
-        let vars: Vec<(String, String)> = command
-            .get_envs()
-            .filter(|(key, _)| *key == TARGET_ENV || *key == STAGED_ENV)
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.unwrap_or_default().to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
-        assert!(
-            vars.iter().any(|(key, value)| key == TARGET_ENV && value == "SVN管理器.exe"),
-            "目标文件名要原样带过去：{vars:?}"
-        );
-        assert!(
-            vars.iter().any(|(key, value)| key == STAGED_ENV && value == STAGED_EXE),
-            "暂存名是固定的 ASCII：{vars:?}"
         );
     }
 

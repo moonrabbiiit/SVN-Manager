@@ -104,6 +104,17 @@ impl SvnApp {
             ai_error: String::new(),
         };
         app.push(Level::Info, format!("{APP_TITLE} 已启动（配置：{}）", config::config_file().display()));
+        // 自更新的残局在这里收：上次换名留下的 `.old.exe`（旧进程刚退出才删得掉）、
+        // 以及下载完没走到换名的暂存文件
+        if let Ok(exe) = std::env::current_exe() {
+            if update::clean_leftovers(&exe) {
+                app.hint(format!("已更新到 V{APP_VERSION}，旧程序文件已清理"));
+                app.push(
+                    Level::Success,
+                    format!("本次是自更新后的第一次启动：V{APP_VERSION} 已就位"),
+                );
+            }
+        }
         if app.svn.available() {
             app.push(
                 Level::Success,
@@ -307,8 +318,8 @@ impl SvnApp {
                         self.hint(format!("下载新版本失败：{message}"));
                         self.push(Level::Error, format!("下载新版本失败：{message}"));
                     } else {
-                        // 下载与校验都已就绪：交给收尾 bat 覆盖重启（会退出本程序）
-                        self.launch_apply_bat();
+                        // 下载与校验都已就绪：把新版换到正式名字下并重启（会退出本程序）
+                        self.apply_downloaded_update();
                         let _ = bytes;
                     }
                 }
@@ -594,7 +605,7 @@ impl SvnApp {
         });
         let count = self.output.len();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("输出记录（{count} 行）")).strong().size(13.0));
+            ui.label(RichText::new(format!("输出运行（{count} 行）")).strong().size(13.0));
             if ui.button("清空").clicked() {
                 self.output.clear();
             }

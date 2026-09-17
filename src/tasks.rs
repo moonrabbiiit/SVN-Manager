@@ -110,7 +110,7 @@ impl SvnApp {
             });
     }
 
-    /// 确认对话框里点了「开始更新」：后台下载新版本并校验，结果回来后再覆盖。
+    /// 确认对话框里点了「开始更新」：后台下载新版本并校验，结果回来后再换上。
     pub fn begin_update(&mut self) {
         let Some(manifest) = self.update_info.clone() else {
             self.hint("还没有检查到新版本，请先「检查更新」");
@@ -190,70 +190,62 @@ impl SvnApp {
         );
     }
 
-    /// 下载校验完成后：生成收尾 bat（覆盖+重启+自删）并启动，随后退出本程序。
-    pub(crate) fn launch_apply_bat(&mut self) {
+    /// 下载校验完成后：把新版换到正式名字下（正在运行的旧程序改名让路），再拉起新版并退出。
+    ///
+    /// 全程在程序内完成，不生成任何脚本：换名只在本目录内做（同卷的原子改名），路径不经过
+    /// 控制台代码页，所以程序装在中文目录、exe 改成中文名都一样能更新。旧程序文件立刻删不掉
+    /// （镜像还映射着），留给新版启动时的 `update::clean_leftovers` 收。
+    pub(crate) fn apply_downloaded_update(&mut self) {
         let exe = match std::env::current_exe() {
             Ok(path) => path,
             Err(e) => {
-                self.hint(format!("无法确定程序自身路径：{e}"));
-                self.push(Level::Error, format!("无法确定程序自身路径：{e}"));
+                let message = format!("无法确定程序自身路径：{e}");
+                self.hint(message.clone());
+                self.push(Level::Error, message);
                 return;
             }
         };
-        // 新版 exe 先暂存到程序目录：收尾 bat 里只出现文件名 + `%~dp0`，
-        // 程序装在中文目录里也不会让 cmd 按代码页解码脚本时把路径读乱
+        // 新版先落到程序目录：换名要求同一个卷，%TEMP% 可能挂在别的盘上
         let downloaded = std::env::temp_dir().join(update::STAGED_EXE);
         let staged = exe.with_file_name(update::STAGED_EXE);
         if let Err(e) = std::fs::copy(&downloaded, &staged) {
             let message = format!(
-                "没法把新版 exe 暂存到程序目录（{}）：{e}；请手动下载新版本替换，或把它放到有写权限的目录再更新",
+                "没法把新版 exe 放到程序目录（{}）：{e}；请手动下载新版本替换，或把它放到有写权限的目录再更新",
                 staged.display()
             );
             self.hint(message.clone());
             self.push(Level::Error, message);
             return;
         }
-        let bat_text = update::build_apply_bat();
-        // bat 默认写到程序自身目录：杀软对 %TEMP% 里的 .bat 扫描最凶，
-        // 脚本跑到一半被查删就会报「找不到批处理文件」。
-        // 程序目录不可写（如 Program Files）时回退到 %TEMP%。
-        let mut bat: Option<std::path::PathBuf> = None;
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(dir) = exe.parent() {
-            if !dir.as_os_str().is_empty() {
-                candidates.push(dir.join("svn_manager_apply.bat"));
-            }
-        }
-        candidates.push(std::env::temp_dir().join("svn_manager_apply.bat"));
-        for cand in &candidates {
-            if std::fs::write(cand, bat_text.as_bytes()).is_ok() {
-                bat = Some(cand.clone());
-                break;
-            }
-        }
-        let bat = match bat {
-            Some(b) => b,
-            None => {
-                self.hint("生成更新脚本失败：程序目录与临时目录都不可写".to_owned());
-                self.push(Level::Error, "生成更新脚本失败：程序目录与临时目录都不可写".to_owned());
-                return;
-            }
-        };
-        self.push(
-            Level::Info,
-            format!("更新脚本已生成：{}（覆盖 {} 并重启）", bat.display(), exe.display()),
-        );
-        // 启动器本身用 CREATE_NO_WINDOW：不闪 cmd 黑框；
-        // `start` 会给 bat 另起一个控制台窗口，覆盖失败时的 pause 仍看得见。
-        match update::apply_launcher(&bat, &exe).spawn() {
-            Ok(_) => {
-                self.push(Level::Success, "程序即将退出，由更新脚本完成覆盖并自动重启…");
-                // 下载的临时 exe 只在本进程内持有路径，退出后 bat 直接接管
-                std::process::exit(0);
+        match update::swap_in_place(&exe, &staged) {
+            Ok(old) => {
+                self.push(
+                    Level::Info,
+                    format!(
+                        "→ 新版本已就位：{}（旧程序改名到 {}，下次启动时清理）",
+                        exe.display(),
+                        old.display()
+                    ),
+                );
+                match update::relaunch(&exe) {
+                    Ok(()) => {
+                        self.push(Level::Success, "程序即将退出，新版本会自动启动…");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        // 起不来就整个退回去：新文件收回暂存名、旧程序回到正式名，
+                        // 本进程照旧跑着，用户重试一次即可
+                        let _ = std::fs::rename(&exe, &staged);
+                        let _ = std::fs::rename(&old, &exe);
+                        self.hint(e.clone());
+                        self.push(Level::Error, e);
+                    }
+                }
             }
             Err(e) => {
-                self.hint(format!("启动更新脚本失败：{e}"));
-                self.push(Level::Error, format!("启动更新脚本失败：{e}"));
+                let _ = std::fs::remove_file(&staged);
+                self.hint(e.clone());
+                self.push(Level::Error, e);
             }
         }
     }

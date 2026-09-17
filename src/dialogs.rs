@@ -529,7 +529,7 @@ impl SvnApp {
                         ui.label(RichText::new("正在下载新版本并校验…").size(12.5));
                     });
                     ui.label(
-                        RichText::new("完成后程序会自动覆盖重启；进度详情见底部输出区。")
+                        RichText::new("完成后程序会自动换上并重启；进度详情见底部输出区。")
                             .weak()
                             .size(11.5),
                     );
@@ -542,7 +542,7 @@ impl SvnApp {
                 } else {
                     ui.label(
                         RichText::new(
-                            "点「开始更新」后下载新版本并自动校验，然后程序自动退出完成覆盖并重新启动。",
+                            "点「开始更新」后下载新版本并自动校验，然后程序自动退出、把新版本换上并重新启动。",
                         )
                         .weak()
                         .size(11.5),
