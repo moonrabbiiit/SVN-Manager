@@ -4,7 +4,7 @@ use egui::{Align, Button, Color32, FontId, Frame, Layout, RichText, ScrollArea, 
 
 use crate::jobs::{Data, Kind, Sink};
 use crate::svn::{blocked_count, Item, StatusEntry, Svn};
-use crate::{highlight, ink, Maintain, SvnApp};
+use crate::{highlight, ink, Level, Maintain, SvnApp};
 
 /// 「上传 / 提交」页面状态。
 ///
@@ -24,6 +24,8 @@ pub struct CommitPage {
     /// 当前这份差异是否忽略空白与换行（按正在看的那一项决定：XML 自动勾选，其余默认不勾）
     pub diff_ignore: bool,
     pub confirm_revert: bool,
+    /// 还没更新到最新时的第二下确认：第一下只把后果摆出来，再点一次才真的提交
+    pub confirm_outdated: bool,
 }
 
 impl CommitPage {
@@ -40,6 +42,7 @@ impl CommitPage {
             diff: String::new(),
             diff_ignore: false,
             confirm_revert: false,
+            confirm_outdated: false,
         }
     }
 
@@ -48,6 +51,8 @@ impl CommitPage {
         self.picked = usize::MAX;
         self.diff.clear();
         self.error.clear();
+        // 重新读过状态就把「没更新到最新」的确认撤掉：清单变了，之前那一下点的是旧清单
+        self.confirm_outdated = false;
     }
 
     /// 这次要提交的路径。未版本化(?) 与已丢失(!) 也算在内：提交前会先替它们补上
@@ -133,6 +138,21 @@ pub struct CommitPlan {
 }
 
 impl SvnApp {
+    /// 上传前「还没更新到最新」的提醒文案：最近一次检测读到服务器上还有没拉到本地的新改动
+    /// （`svn status -u` 的口径，见 `DirView::out_of_date`）时给一句，否则 `None`。
+    /// 还没读到（断网、刚启动还没检测）就不给——无从判断，宁可不说，也不能把「不知道」当「未更新」。
+    pub fn not_up_to_date_hint(&self, index: usize) -> Option<String> {
+        let view = self.dirs.get(index)?;
+        let pending = view.out_of_date.filter(|count| *count > 0)?;
+        let revision = match view.remote_rev.as_str() {
+            "" => String::new(),
+            rev => format!("，远端已是 r{rev}"),
+        };
+        Some(format!(
+            "未更新到最新版本{revision}：服务器还有 {pending} 项改动没拉到本地"
+        ))
+    }
+
     /// 提交。勾选里的未版本化 / 已丢失条目会先补上 svn add / svn delete，
     /// 再和修改项一起 svn commit；add / delete 只成一部分时那几条会被跳过并写明原因。
     pub fn spawn_commit(&mut self, index: usize, plan: CommitPlan, message: String) {
@@ -270,6 +290,32 @@ impl SvnApp {
                     .size(12.0)
                     .color(ink(ui, Color32::from_rgb(140, 205, 255))),
             );
+        }
+        // 上传前先亮出基线：服务器上还有没拉到本地的新改动时，这次提交是在旧基线上改出来的，
+        // 别人也动过同一处就会撞出冲突。点这一句直接跑该目录的 svn update；有写操作在执行时
+        // 不给点——避免更新和提交同时改一个工作副本。
+        if let Some(warning) = self.not_up_to_date_hint(page.dir) {
+            let hit = ui.add(
+                egui::Label::new(
+                    RichText::new(&warning)
+                        .size(12.5)
+                        .strong()
+                        .underline()
+                        .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if hit.clicked() && !writing {
+                // 去更新就等于放弃了「没更新也提交」的确认，回来要重新点两下
+                page.confirm_outdated = false;
+                self.hint(format!("{}：正在更新到最新 …", page.label));
+                self.spawn_update(page.dir);
+            }
+            hit.on_hover_text(if writing {
+                "服务器上还有没拉到本地的新改动；该目录正有 SVN 写操作在执行，等它结束再更新"
+            } else {
+                "服务器上还有没拉到本地的新改动，这次上传是在旧基线上做的；点这一句直接执行该目录的 svn update"
+            });
         }
         ui.separator();
 
@@ -426,37 +472,72 @@ impl SvnApp {
                 } else {
                     None
                 };
+                // 没更新到最新就拦一下：第一下只把后果摆出来，再点一次才真的提交
+                // （两步确认的写法同下面的「撤销全部修改」）
+                let outdated = self.not_up_to_date_hint(page.dir);
+                let armed = outdated.is_some() && page.confirm_outdated;
                 // egui 0.36 的按钮不会根据底色自动调整文字颜色，浅色主题下需要自己同时指定底色与字色
-                let (fill, text) = match (ui.visuals().dark_mode, blocked.is_none()) {
-                    (true, false) => (Color32::from_gray(70), Color32::from_gray(148)),
-                    (true, true) => (
-                        Color32::from_rgb(38, 112, 70),
-                        Color32::from_rgb(228, 245, 235),
-                    ),
-                    (false, false) => (Color32::from_gray(214), Color32::from_gray(120)),
-                    (false, true) => (
-                        Color32::from_rgb(23, 102, 61),
-                        Color32::from_rgb(255, 255, 255),
-                    ),
+                let (fill, text) = if armed && blocked.is_none() {
+                    (
+                        Color32::from_rgb(150, 60, 60),
+                        Color32::from_rgb(255, 240, 240),
+                    )
+                } else {
+                    match (ui.visuals().dark_mode, blocked.is_none()) {
+                        (true, false) => (Color32::from_gray(70), Color32::from_gray(148)),
+                        (true, true) => (
+                            Color32::from_rgb(38, 112, 70),
+                            Color32::from_rgb(228, 245, 235),
+                        ),
+                        (false, false) => (Color32::from_gray(214), Color32::from_gray(120)),
+                        (false, true) => (
+                            Color32::from_rgb(23, 102, 61),
+                            Color32::from_rgb(255, 255, 255),
+                        ),
+                    }
                 };
-                let button = egui::Button::new(
-                    RichText::new(format!("提交 {picked_count} 项"))
-                        .size(14.0)
-                        .strong()
-                        .color(text),
-                )
-                .fill(fill);
+                let caption = if armed {
+                    format!("仍要提交 {picked_count} 项？")
+                } else {
+                    format!("提交 {picked_count} 项")
+                };
+                let button =
+                    egui::Button::new(RichText::new(caption).size(14.0).strong().color(text))
+                        .fill(fill);
                 let response = ui.add_sized(Vec2::new(126.0, 60.0), button);
                 if response.clicked() {
                     match blocked {
                         Some(why) => self.hint(why),
+                        // 还没确认过就先拦住，只说明后果，不上传
+                        None if outdated.is_some() && !page.confirm_outdated => {
+                            page.confirm_outdated = true;
+                            self.hint(format!(
+                                "{}——再点一次「仍要提交」才会按本地版本上传，或点上面的提示条先更新到最新",
+                                outdated.unwrap_or_default()
+                            ));
+                        }
                         None => {
                             let staging = if adds.is_empty() && deletes.is_empty() {
                                 String::new()
                             } else {
                                 format!("，先 add {} 项、delete {} 项", adds.len(), deletes.len())
                             };
-                            self.hint(format!("正在提交 {picked_count} 项{staging} …"));
+                            // 没更新到最新还是让它传（用户可能就是要把手上这份传上去，而且已经确认过），
+                            // 但要说清基线，并往输出记录写一条——提示条马上被下一句覆盖，只有记录留得住
+                            match outdated.as_ref() {
+                                Some(warning) => {
+                                    self.push(
+                                        Level::Warning,
+                                        format!("{warning}，建议先「↓ 更新」再上传"),
+                                    );
+                                    self.hint(format!(
+                                        "{warning}；仍按本地当前版本提交 {picked_count} 项 …"
+                                    ));
+                                }
+                                None => self.hint(format!("正在提交 {picked_count} 项{staging} …")),
+                            }
+                            // 确认已经用掉了：下次进来要重新拦一遍（提交完的状态重读也会清掉它）
+                            page.confirm_outdated = false;
                             self.spawn_commit(
                                 page.dir,
                                 CommitPlan {
@@ -468,6 +549,23 @@ impl SvnApp {
                             );
                         }
                     }
+                }
+                if armed && blocked.is_none() {
+                    // 拦住的这一下要给退路：要么先更新到最新，要么明确放弃
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("先更新到最新")
+                            .on_hover_text("对该目录执行 svn update，再重新读一遍本地改动")
+                            .clicked()
+                        {
+                            page.confirm_outdated = false;
+                            self.hint(format!("{}：正在更新到最新 …", page.label));
+                            self.spawn_update(page.dir);
+                        }
+                        if ui.button("放弃提交").clicked() {
+                            page.confirm_outdated = false;
+                        }
+                    });
                 }
                 if !adds.is_empty() || !deletes.is_empty() {
                     ui.label(
@@ -948,6 +1046,170 @@ mod tests {
         assert_eq!(
             relative_to_root(r"D:\wc2\a.vue", Path::new(r"D:\wc")),
             r"D:\wc2\a.vue"
+        );
+    }
+
+    /// 上传前的提醒只在「读到服务器上确实还有没拉到本地的新改动」时给：
+    /// 没检测过（`None`，断网或刚启动）不猜，已是最新（`Some(0)`）也不说。
+    #[test]
+    fn not_up_to_date_hint_only_fires_on_known_pending_changes() {
+        let mut app = crate::testbed::stub_app(false);
+        // 测试台里 dir 0 = 服务器还有 5 项没拉下来，远端 r128
+        let hint = app.not_up_to_date_hint(0).expect("有可更新项就要提示");
+        assert!(hint.starts_with("未更新到最新版本"), "{hint}");
+        assert!(hint.contains("r128") && hint.contains('5'), "{hint}");
+
+        assert_eq!(app.not_up_to_date_hint(1), None, "已是最新就不提示");
+        assert_eq!(app.not_up_to_date_hint(2), None, "还没读到过就不猜");
+        assert_eq!(app.not_up_to_date_hint(99), None, "越界的目录不能 panic");
+
+        // 远端版本号没读到时不带那半句，其余照旧
+        app.dirs[0].remote_rev.clear();
+        let hint = app.not_up_to_date_hint(0).expect("有可更新项就要提示");
+        assert!(!hint.contains("远端已是"), "{hint}");
+    }
+
+    /// 提交页跑一帧，收下画出来的「文字 + 矩形」（同 testbed 里主页那套收法）。
+    fn commit_frame(ctx: &egui::Context, app: &mut SvnApp) -> Vec<(String, egui::Rect)> {
+        let out = ctx.run_ui(crate::testbed::base_input(), |ui| app.commit_page(ui));
+        commit_drawn(out)
+    }
+
+    /// 在提交页上点一下（位置由上一帧的矩形给），再收一帧。
+    fn commit_click(
+        ctx: &egui::Context,
+        app: &mut SvnApp,
+        pos: egui::Pos2,
+    ) -> Vec<(String, egui::Rect)> {
+        let press = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut input = crate::testbed::base_input();
+        input.events = vec![egui::Event::PointerMoved(pos), press(true), press(false)];
+        let out = ctx.run_ui(input, |ui| app.commit_page(ui));
+        commit_drawn(out)
+    }
+
+    fn commit_drawn(mut out: egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        // 测试里没有渲染器，字体增量不应用就得显式丢弃，否则 epaint 在 Drop 时 panic
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_string(),
+                    item.shape.visual_bounding_rect(),
+                )),
+                _ => None,
+            })
+            .filter(|(text, _)| !text.trim().is_empty())
+            .collect()
+    }
+
+    fn rect_of(drawn: &[(String, egui::Rect)], label: &str) -> egui::Rect {
+        drawn
+            .iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("页面上没画出「{label}」"))
+    }
+
+    fn has(drawn: &[(String, egui::Rect)], label: &str) -> bool {
+        drawn.iter().any(|(text, _)| text == label)
+    }
+
+    /// 这句要在提交页一直亮着（点它直接更新），不是只在按下提交那一瞬闪一下。
+    #[test]
+    fn commit_page_shows_the_not_up_to_date_warning() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install_cjk(&ctx);
+        let mut app = crate::testbed::stub_app(false);
+
+        app.commit = Some(page_of(vec![Item::Modified], &[Item::Modified]));
+        let drawn = commit_frame(&ctx, &mut app);
+        let warning = drawn
+            .iter()
+            .find(|(text, _)| text.starts_with("未更新到最新版本"))
+            .expect("服务器上还有 5 项没拉下来，提交页要亮这句");
+        assert!(warning.0.contains("5 项改动没拉到本地"), "{}", warning.0);
+
+        // 已是最新的目录（dir 1）页面上不该有这句
+        app.commit = Some(CommitPage::new(1, "测试".to_owned()));
+        if let Some(page) = app.commit.as_mut() {
+            page.set_entries(vec![entry(Item::Modified, true)]);
+        }
+        let drawn = commit_frame(&ctx, &mut app);
+        assert!(
+            !drawn
+                .iter()
+                .any(|(text, _)| text.starts_with("未更新到最新版本")),
+            "已是最新还提示就成了误报"
+        );
+    }
+
+    /// 没更新到最新时点提交要被拦住：第一下只说后果，第二下才真的进提交流程。
+    #[test]
+    fn commit_button_gates_when_not_up_to_date() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install_cjk(&ctx);
+        let mut app = crate::testbed::stub_app(false);
+        app.commit = Some(page_of(vec![Item::Modified], &[Item::Modified]));
+
+        // 第一下：只确认，不起提交任务
+        let drawn = commit_frame(&ctx, &mut app);
+        let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "提交 1 项").center());
+        assert!(app.commit.as_ref().unwrap().confirm_outdated, "第一下该只拦住");
+        assert!(!app.pool.has(Kind::Commit, 0), "拦住的这一下不能起提交任务");
+        assert!(app.hint.contains("再点一次"), "{}", app.hint);
+
+        // 按钮文案与退路按钮要再跑一帧才画得出来：这一帧的文案是帧首算好的
+        let drawn = commit_frame(&ctx, &mut app);
+        assert!(has(&drawn, "仍要提交 1 项？"), "按钮文案要换成确认口径");
+        assert!(has(&drawn, "先更新到最新") && has(&drawn, "放弃提交"), "要给出退路");
+
+        // 第二下：放行。测试台的 app 没有 svn.exe，所以走到的是「无法提交」那句——
+        // 正是它说明这一下已经越过拦截、进了 spawn_commit
+        let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "仍要提交 1 项？").center());
+        assert!(
+            app.output
+                .iter()
+                .any(|line| line.text.contains("未更新到最新版本")),
+            "放行时要往输出记录留痕：{:?}",
+            app.output.iter().map(|line| line.text.clone()).collect::<Vec<_>>()
+        );
+        assert!(app.hint.contains("无法提交"), "第二下该越过拦截：{}", app.hint);
+        assert!(!app.commit.as_ref().unwrap().confirm_outdated, "放行后确认态要清掉");
+    }
+
+    /// 拦住的那一下要能退出来：点「放弃提交」就松开，别第二次进来莫名其妙还是确认态。
+    #[test]
+    fn commit_gate_can_be_cancelled() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install_cjk(&ctx);
+        let mut app = crate::testbed::stub_app(false);
+        app.commit = Some(page_of(vec![Item::Modified], &[Item::Modified]));
+
+        let drawn = commit_frame(&ctx, &mut app);
+        let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "提交 1 项").center());
+        let drawn = commit_frame(&ctx, &mut app);
+        let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "放弃提交").center());
+        assert!(!app.commit.as_ref().unwrap().confirm_outdated, "放弃要真的松开");
+        assert!(!app.pool.has(Kind::Commit, 0));
+
+        // 松开之后按钮要回到普通文案，再点又能拦一次
+        let drawn = commit_frame(&ctx, &mut app);
+        let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "提交 1 项").center());
+        assert!(app.commit.as_ref().unwrap().confirm_outdated);
+        app.commit.as_mut().unwrap().set_entries(vec![entry(Item::Modified, true)]);
+        assert!(
+            !app.commit.as_ref().unwrap().confirm_outdated,
+            "重新读过清单就不能留着上一次的确认"
         );
     }
 }

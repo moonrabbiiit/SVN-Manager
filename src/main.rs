@@ -39,8 +39,8 @@ use crate::svn::{Svn, WcInfo};
 pub use ui::{highlight, highlight_with, ink, Search};
 
 pub const APP_TITLE: &str = "SVN 管理器";
-/// 程序版本号，取自 Cargo.toml；发布新版本时只改那里
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 程序版本号，由 build.rs 从根目录 version.txt 注入；发布新版本时只改那个文件
+pub const APP_VERSION: &str = env!("SVN_MANAGER_VERSION");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Level {

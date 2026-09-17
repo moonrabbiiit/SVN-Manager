@@ -142,7 +142,15 @@ impl SvnApp {
             })
             .collect();
         let total = rows.len();
+        // 每个目录「还没更新到最新」的提醒：行上标一下，确认上传时再写进输出记录
+        let outdated: Vec<Option<String>> =
+            (0..total).map(|index| self.not_up_to_date_hint(index)).collect();
         let picked = dialog.checked.iter().filter(|checked| **checked).count();
+        // 参与上传、又没更新到最新的目录：确认那一步要点名，别让人蒙着按下去
+        let outdated_checked: Vec<usize> = (0..total)
+            .filter(|index| dialog.checked.get(*index).copied().unwrap_or(false))
+            .filter(|index| outdated.get(*index).and_then(|item| item.as_ref()).is_some())
+            .collect();
         let busy = rows.iter().any(|(_, _, running)| *running);
         let mut open = true;
         let mut close = false;
@@ -237,6 +245,18 @@ impl SvnApp {
                                             .color(ink(ui, Color32::from_gray(130))),
                                     );
                                 }
+                                if outdated.get(index).and_then(|item| item.as_ref()).is_some() {
+                                    ui.label(
+                                        RichText::new("未更新")
+                                            .size(11.0)
+                                            .strong()
+                                            .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                                    )
+                                    .on_hover_text(
+                                        "该目录还没更新到最新版本：服务器上还有没拉到本地的新改动，\
+                                         这次上传是在旧基线上做的；可以勾掉它先回主页点「↓ 更新」",
+                                    );
+                                }
                                 if *running {
                                     ui.spinner();
                                     ui.label(RichText::new("该目录正在提交").weak().size(11.5));
@@ -246,20 +266,57 @@ impl SvnApp {
                     });
                 ui.separator();
                 ui.horizontal(|ui| {
+                    if !outdated_checked.is_empty() {
+                        // 拦截的第二下：点名哪几个目录没更新到最新，让人知道自己是拿旧基线在上传
+                        let names = outdated_checked
+                            .iter()
+                            .map(|index| rows[*index].0.clone())
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        ui.label(
+                            RichText::new(format!("未更新到最新：{names}"))
+                                .strong()
+                                .size(12.0)
+                                .color(ink(ui, Color32::from_rgb(240, 100, 100))),
+                        )
+                        .on_hover_text(
+                            "这些目录服务器上还有没拉到本地的新改动，这次上传是在旧基线上做的；\
+                             别人也动过同一处就会撞出冲突。要避开就取消、先更新它们再来。",
+                        );
+                    }
+                });
+                ui.horizontal(|ui| {
                     let ready = total > 0 && picked > 0 && !busy;
                     if dialog.confirm {
+                        let caption = if outdated_checked.is_empty() {
+                            format!("确认上传？{picked} 个目录的改动会立即进服务器")
+                        } else {
+                            format!(
+                                "确认上传？{picked} 个目录（{} 个未更新到最新）",
+                                outdated_checked.len()
+                            )
+                        };
                         let button = egui::Button::new(
-                            RichText::new(format!(
-                                "确认上传？{picked} 个目录的改动会立即进服务器"
-                            ))
-                            .strong()
-                            .color(Color32::from_rgb(255, 240, 240)),
+                            RichText::new(caption)
+                                .strong()
+                                .color(Color32::from_rgb(255, 240, 240)),
                         )
                         .fill(Color32::from_rgb(150, 60, 60));
                         if ui.add_enabled(ready, button).clicked() {
                             let message = dialog.message.clone();
                             for index in 0..total {
                                 if dialog.checked.get(index).copied().unwrap_or(false) {
+                                    // 没更新到最新也照样上传，但先往输出记录写一条：
+                                    // 窗口一关提示就没了，这条留在记录里能对上往后查
+                                    if let Some(warning) =
+                                        outdated.get(index).and_then(|item| item.clone())
+                                    {
+                                        let label = self.dir_label(index);
+                                        self.push(
+                                            Level::Warning,
+                                            format!("{label}：{warning}，建议先「↓ 更新」再上传"),
+                                        );
+                                    }
                                     self.spawn_upload_all(index, message.clone());
                                 }
                             }
