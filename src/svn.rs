@@ -251,8 +251,9 @@ pub fn parse_info(xml: &str) -> Option<WcInfo> {
 }
 
 /// `svn status -u --xml`：带 <repos-status> 子节点的 entry，就是服务器上已经变了、
-/// 本地还没更新的条目。光比 `svn info` 的工作副本 Revision 和仓库 HEAD 会误报——
-/// 提交只推进被提交路径的版本号，工作副本根目录还停在旧版本上，HEAD 一动就显示「可更新」。
+/// 本地还没更新的条目。这个数只能由 `-u` 给：光比 `svn info` 的工作副本 Revision 和仓库
+/// HEAD，在「不相等」的方向会误报——提交只推进被提交路径的版本号，工作副本根目录还停在
+/// 旧版本上，HEAD 一动就显示「可更新」。反方向（相等 ⇒ 没有可更新项）是成立的，见 [`wc_at_head`]。
 pub fn parse_out_of_date(xml: &str) -> usize {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
         return 0;
@@ -264,6 +265,17 @@ pub fn parse_out_of_date(xml: &str) -> usize {
                 .any(|child| child.has_tag_name("repos-status"))
         })
         .count()
+}
+
+/// 本地基线是不是就是仓库 HEAD。`svn info --xml` 的 `entry/@revision` 在工作副本上给出的是
+/// 本地 BASE、在仓库 URL 上给出的是 HEAD，相等时服务器上不可能还有比本地更新的版本，检测
+/// 就能只读本地状态，省掉 `svn status -u` 那半趟整树比较（七万文件的工作副本上 0.6~3.4 秒）。
+/// 只用于「相等就跳过 -u」这一个方向：不相等说明不了有东西可更新（见 [`parse_out_of_date`]），
+/// 任一侧没读到版本号也返回 false——「不知道」不能当成「已是最新」。
+/// 例外是混合版本的工作副本：子目录被单独 peg update / switch 到比根目录更旧的版本时，
+/// 根目录照样等于 HEAD，只有 `-u` 看得见它。
+pub fn wc_at_head(local_rev: &str, head_rev: &str) -> bool {
+    !local_rev.is_empty() && !head_rev.is_empty() && local_rev == head_rev
 }
 
 /// `svn status --xml`：entry 的 path 属性可能是绝对路径，也可能是相对路径。
@@ -1072,6 +1084,19 @@ mod tests {
 </status>"#;
         assert_eq!(parse_out_of_date(xml), 2, "只有带 repos-status 的条目算待更新");
         assert_eq!(parse_out_of_date("<status>"), 0, "输出残缺时不误报");
+    }
+
+    /// 短路只允许「本地基线 == HEAD 就不问服务器」这一个方向，且两个版本号缺一不可：
+    /// 读不到 HEAD（仓库断了）就照常走 `-u`，别把「不知道」报成「已是最新」。
+    #[test]
+    fn at_head_needs_both_revisions_and_exact_agreement() {
+        assert!(wc_at_head("6700", "6700"), "基线就是 HEAD，可以省掉 -u");
+        assert!(
+            !wc_at_head("6700", "6713"),
+            "落后于 HEAD 时必须走 -u 把可更新项数清楚"
+        );
+        assert!(!wc_at_head("", "6700"), "本地版本号没读到不算已是最新");
+        assert!(!wc_at_head("6700", ""), "HEAD 没读到（仓库连不上）同样不能短路");
     }
 
     /// 合并读取的前提：同一份 `svn status -u --xml` 输出要能同时给出「本地待提交数」

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use egui::{RichText, ScrollArea, TextEdit, Vec2};
 
-use crate::{autostart, bcompare, config};
+use crate::{autostart, bcompare, config, fonts};
 use crate::jobs::Kind;
 use crate::update;
 use crate::{APP_VERSION, Level, SvnApp};
@@ -303,6 +303,45 @@ impl SvnApp {
                                     self.cfg.theme = value.to_owned();
                                     self.persist();
                                 }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("字号");
+                            let mut changed = false;
+                            egui::ComboBox::from_id_salt("ui_scale")
+                                .selected_text(self.cfg.ui_scale.clone())
+                                .show_ui(ui, |ui| {
+                                    for (name, _) in fonts::SCALES {
+                                        if ui
+                                            .selectable_value(&mut self.cfg.ui_scale, name.to_string(), *name)
+                                            .changed()
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            if changed {
+                                self.persist();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("字体");
+                            let mut picked: Option<String> = None;
+                            egui::ComboBox::from_id_salt("ui_font")
+                                .selected_text(self.cfg.ui_font.clone())
+                                .show_ui(ui, |ui| {
+                                    for name in fonts::available() {
+                                        if ui
+                                            .selectable_value(&mut self.cfg.ui_font, name.clone(), name)
+                                            .changed()
+                                        {
+                                            picked = Some(self.cfg.ui_font.clone());
+                                        }
+                                    }
+                                });
+                            if let Some(family) = picked {
+                                self.font_note = fonts::note_for(&family, fonts::install(ctx, &family));
+                                self.persist();
                             }
                         });
                         if ui.button("保存常规设置").clicked() {

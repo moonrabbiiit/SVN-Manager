@@ -147,7 +147,7 @@ impl Stage {
         let ctx = egui::Context::default();
         // 颜色断言要确定：ink() 在浅色主题下会把强调色压暗，所以固定深色
         ctx.set_theme(ThemePreference::Dark);
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         Self { ctx, app: stub_app(compact) }
     }
 

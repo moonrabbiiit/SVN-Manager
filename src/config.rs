@@ -34,6 +34,10 @@ pub struct Config {
     pub auto_refresh: u64,
     /// 主题：system / light / dark
     pub theme: String,
+    /// 界面字体族：「自动」= 按本机现成的中文字体挑，其余是 `fonts::available()` 里的族名
+    pub ui_font: String,
+    /// 界面字号：小 / 标准 / 大 / 特大（整屏缩放，见 `fonts::SCALES`）
+    pub ui_scale: String,
     /// 打开「提交记录」页时默认只看本机登录人的记录（关掉就是默认看所有人的）
     pub history_only_mine: bool,
     /// 更新源：official = GitHub 仓库的最新发布，custom = 下面这个自建服务端地址
@@ -86,6 +90,8 @@ impl Default for Config {
             auto_start: false,
             // 默认详细样式：老用户升级后看到的列表跟以前一样，要卡片自己切过去
             home_compact: false,
+            ui_font: crate::fonts::AUTO.to_owned(),
+            ui_scale: crate::fonts::SCALE_STANDARD.to_owned(),
             // AI 日志的地址 / 密钥 / 模型都由用户自己提供，默认全空
             ai_url: String::new(),
             ai_key: String::new(),
@@ -177,5 +183,12 @@ mod tests {
         assert!(parsed.ai_key.is_empty());
         assert!(parsed.ai_model.is_empty());
         assert!(parsed.ai_tone.is_empty());
+        // 界面字体、字号是后加的设置：老配置没有也要按默认值（自动挑字体、标准字号）补齐
+        assert_eq!(parsed.ui_font, crate::fonts::AUTO);
+        assert_eq!(parsed.ui_scale, crate::fonts::SCALE_STANDARD);
+        let picked: Config =
+            serde_json::from_str(r#"{"ui_font":"微软雅黑","ui_scale":"大"}"#).unwrap();
+        assert_eq!(picked.ui_font, "微软雅黑");
+        assert_eq!(picked.ui_scale, "大");
     }
 }

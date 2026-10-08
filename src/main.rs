@@ -12,6 +12,7 @@ mod header;
 mod history;
 mod home;
 mod jobs;
+mod localdiff;
 mod settings;
 mod stats;
 mod svn;
@@ -118,6 +119,11 @@ pub struct DirView {
     pub out_of_date: Option<usize>,
     /// 需要人工处理的条目数（冲突 / 不完整）；`None` = 还没读到过，不显示
     pub conflicts: Option<usize>,
+    /// 本地端（「绑定对比对象」里那个不受版本控制的目录）与这个工作副本的差异；
+    /// `None` = 没绑定、目录读不到或还没测过——和 `changed` 一样，不显示，绝不显示成 0
+    pub local_diff: Option<crate::localdiff::Summary>,
+    /// 上面这个数落地的时间：本地端比对是独立任务，比 svn 检测晚几秒到
+    pub local_checked_at: String,
     pub checked_at: String,
 }
 

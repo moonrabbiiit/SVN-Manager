@@ -2214,7 +2214,7 @@ mod tests {
     #[test]
     fn calendar_survives_month_navigation_and_picks_a_day() {
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let today = date("2026-09-11");
         let mut text = "2026-09-04".to_owned();
         let id = Id::new("calendar_popup_test");
@@ -2342,7 +2342,7 @@ mod tests {
     /// 用系统中文字体跑一帧，返回画面上出现的所有图形
     fn paint(draw: impl FnMut(&mut Ui)) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -2478,7 +2478,7 @@ mod tests {
     #[test]
     fn tooltip_keeps_label_and_number_on_one_line() {
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let input = || egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0))),
             focused: true,
@@ -2530,7 +2530,7 @@ mod tests {
             heatmap_chart(ui, &heat);
         });
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         // 先空跑一帧，字体就绪后才查得到字形
         let mut warm = ctx.run_ui(egui::RawInput::default(), |_| {});
         warm.textures_delta.clear();

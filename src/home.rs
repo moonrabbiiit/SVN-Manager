@@ -37,6 +37,15 @@ fn card_text(ui: &mut Ui, rect: egui::Rect, text: RichText) -> egui::Response {
     child.add(egui::Label::new(text).truncate())
 }
 
+/// 计数标记上的数字：四位数起换「999+」，不然窄标记会被撑歪
+fn capped(count: usize) -> String {
+    if count > 999 {
+        "999+".to_owned()
+    } else {
+        count.to_string()
+    }
+}
+
 impl SvnApp {
     // ------------------------------------------------------------ 主页面
 
@@ -96,10 +105,11 @@ impl SvnApp {
                         .size(12.5)
                         .color(ui.visuals().weak_text_color()),
                 );
+                let changed_before = view.changed.is_some();
                 if let Some(changed) = view.changed {
                     if changed > 0 {
                         ui.label(
-                            RichText::new(format!("本地修改 {changed} 项"))
+                            RichText::new(format!("待提交 {changed} 项"))
                                 .size(12.0)
                                 .color(ink(ui, Color32::from_rgb(240, 190, 70))),
                         )
@@ -109,14 +119,15 @@ impl SvnApp {
                         );
                     } else {
                         ui.label(
-                            RichText::new("无本地修改")
+                            RichText::new("无待提交项")
                                 .size(12.0)
                                 .color(ink(ui, Color32::from_rgb(80, 200, 120))),
                         );
                     }
                 }
+                let conflict_before = view.conflicts.filter(|count| *count > 0).is_some();
                 if let Some(blocked) = view.conflicts.filter(|count| *count > 0) {
-                    // 冲突条目提交不了，所以不算进上面的「本地修改」；不单独标出来，
+                    // 冲突条目提交不了，所以不算进上面的「待提交」；不单独标出来，
                     // 用户就只能进了提交页才知道这个目录卡住了
                     let hit = ui.add(
                         egui::Label::new(
@@ -135,6 +146,30 @@ impl SvnApp {
                         "冲突、不完整这类必须人工处理的条目，解决之前这个目录提交不上去。\n\
                          点击打开该目录的提交页。",
                     );
+                }
+                // 本地端（「绑定对比对象」里那个不受版本控制的目录）与这个工作副本的逐文件
+                // 差异，界面上叫「本地差异」，一条都没有就叫「本地无差异」；
+                // 点一下选中本目录并打开 Beyond Compare。
+                if let Some(summary) = view.local_diff.as_ref() {
+                    if changed_before || conflict_before {
+                        ui.label(RichText::new("|").size(12.0).weak());
+                    }
+                    let color = if summary.is_clean() {
+                        ink(ui, Color32::from_rgb(80, 200, 120))
+                    } else {
+                        ink(ui, Color32::from_rgb(240, 190, 70))
+                    };
+                    let tip = self.local_diff_tip(index, summary, self.pool.comparing(index));
+                    let hit = ui
+                        .add(
+                            egui::Label::new(RichText::new(summary.label()).size(12.0).color(color))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(tip);
+                    if hit.clicked() {
+                        self.selected = Some(index);
+                        self.open_bcompare_matched();
+                    }
                 }
                 if busy {
                     ui.spinner();
@@ -270,6 +305,39 @@ impl SvnApp {
         });
     }
 
+    /// 「本地差异」那枚标记的悬停说明：差异多少、三类各多少、跟哪个目录比的、
+    /// 什么时候算的。详细行那枚和卡片上那枚共用一份，免得改了这处漏了那处。
+    fn local_diff_tip(&self, index: usize, s: &crate::localdiff::Summary, busy: bool) -> String {
+        let bound = self.cfg.dirs.get(index).map(|d| d.bc_target.clone()).unwrap_or_default();
+        let checked = self.dirs.get(index).map(|v| v.local_checked_at.clone()).unwrap_or_default();
+        let mut tip = format!("{}\n", s.label());
+        tip.push_str(&format!(
+            "内容不同 {} · 只在本地开发侧 {} · 只在服务器端 {} · 一致 {}\n",
+            s.differing,
+            s.only_local,
+            s.only_server,
+            s.same
+        ));
+        if s.unverified > 0 {
+            tip.push_str(&format!("未核对内容 {}\n", s.unverified));
+        }
+        if self.cfg.dirs.get(index).map(|d| d.bc_filter.trim()).unwrap_or_default().is_empty() {
+            tip.push_str("未设对比筛选条件（更多 → 设置对比筛选条件）\n");
+        }
+        if !s.samples.is_empty() {
+            tip.push_str("点击打开 Beyond Compare：\n");
+            for rel in s.samples.iter().take(8) {
+                tip.push_str(&format!("  {rel}\n"));
+            }
+        }
+        if busy {
+            tip.push_str("正在重新比对，显示的是上一次结果。");
+        } else {
+            tip.push_str(&format!("本地开发侧：{bound}{}", if checked.is_empty() { String::new() } else { format!(" · {checked}") }));
+        }
+        tip
+    }
+
     // ------------------------------------------------------------ 简约样式（正方形卡片）
 
     /// 「更多」菜单的内容。详细模式的目录行直接弹它，简约模式的「+」菜单把它当作二级菜单，
@@ -305,6 +373,8 @@ impl SvnApp {
                 self.cfg.dirs[index].bc_target = target.display().to_string();
                 self.persist();
                 self.hint(format!("已绑定对比对象：{}", self.cfg.dirs[index].bc_target));
+                // 立刻起一次比对，免得新绑定要等下一轮自动刷新（默认 120 秒）才出数
+                self.spawn_local_diff(index, false);
                 ui.close();
             }
         }
@@ -318,6 +388,8 @@ impl SvnApp {
                 self.cfg.dirs[index].bc_target.clear();
                 self.persist();
                 self.hint("已解除绑定，Beyond Compare 退回按对比记录匹配");
+                // 顺带把挂着的本地端差异数清掉
+                self.spawn_local_diff(index, false);
                 ui.close();
             }
         }
@@ -426,6 +498,8 @@ impl SvnApp {
                 if self.cfg.dirs[index].bc_filter != text {
                     self.cfg.dirs[index].bc_filter.clone_from(&text);
                     self.persist();
+                    // 筛选条件就是差异口径，改完立刻按新口径重算
+                    self.spawn_local_diff(index, false);
                 }
                 self.hint(if text.is_empty() {
                     "已清空对比筛选条件，将退回 Beyond Compare 记录里的值".to_owned()
@@ -685,8 +759,8 @@ impl SvnApp {
                 RichText::new(text).size(10.5).color(color),
             );
         }
-        // 右上角两枚计数标记：上=服务器可更新，下=本地待提交。
-        // 用右对齐的竖排子 Ui，标记宽度跟着数字走、右边缘始终贴着卡片内侧
+        // 右上角计数标记：↓=服务器可更新，↑=本地待提交，绑定过本地端再多一枚 ↔=本地端差异。
+        // ↓ 与 ↔ 并排在第一行：竖排三枚要 59px，而卡片只有 168 见方，第三枚会贴到居中的名称上
         let mut band = ui.new_child(
             egui::UiBuilder::new()
                 .id(egui::Id::new(("dir_card_band", index)))
@@ -698,23 +772,38 @@ impl SvnApp {
                 .sense(egui::Sense::hover()),
         );
         band.spacing_mut().item_spacing.y = 4.0;
-        let shown = |count: usize| {
-            if count > 999 {
-                "999+".to_owned()
-            } else {
-                count.to_string()
-            }
-        };
+        // 行宽给满、行高只给一枚标记：横排会把成员沿竖轴拉满，跟着 band 的 44 拉就是四枚高
+        let first_row = egui::Rect::from_min_size(inner.min, Vec2::new(inner.width(), MARK_H));
+        let mut row = band.new_child(
+            egui::UiBuilder::new()
+                .max_rect(first_row)
+                .layout(Layout::right_to_left(Align::Center)),
+        );
         // 两枚标记只靠箭头区分方向：↓ 是从服务器拉下来，↑ 是要传上去
         let update_clicked = self.count_badge(
-            &mut band,
-            &format!("↓{}", shown(pending)),
+            &mut row,
+            &format!("↓{}", capped(pending)),
             pending > 0,
             &format!("服务器上有 {pending} 项本地还没更新\n点击立即更新该目录"),
         );
+        let local_clicked = match view.local_diff.as_ref() {
+            Some(summary) => {
+                let tip = self.local_diff_tip(index, summary, self.pool.comparing(index));
+                self.count_badge(
+                    &mut row,
+                    &format!("↔{}", capped(summary.total())),
+                    !summary.is_clean(),
+                    &tip,
+                )
+            }
+            None => false,
+        };
+        drop(row);
+        // 子 Ui 不会替父级推进光标，这里自己把第一行的高度吃掉，↑ 才会落到第二行
+        band.advance_cursor_after_rect(first_row);
         let commit_clicked = self.count_badge(
             &mut band,
-            &format!("↑{}", shown(changed)),
+            &format!("↑{}", capped(changed)),
             changed > 0,
             &format!(
                 "本地有 {changed} 项待提交（口径同「全部上传」）\n点击打开该目录的提交页"
@@ -751,6 +840,9 @@ impl SvnApp {
         tip.push_str(&format!(
             "服务器可更新 {pending} 项 · 本地待提交 {changed} 项\n"
         ));
+        if let Some(summary) = view.local_diff.as_ref() {
+            tip.push_str(&format!("{}\n", summary.label()));
+        }
         if conflicts > 0 {
             tip.push_str(&format!("冲突 / 不完整 {conflicts} 项，必须先人工处理\n"));
         }
@@ -773,6 +865,10 @@ impl SvnApp {
         if commit_clicked {
             self.selected = Some(index);
             self.open_commit(index);
+        }
+        if local_clicked {
+            self.selected = Some(index);
+            self.open_bcompare_matched();
         }
         (hit.clicked(), hit.double_clicked())
     }
@@ -908,7 +1004,7 @@ impl SvnApp {
         ui.horizontal(|ui| {
             let count = self.cfg.dirs.len();
             let changes: usize = self.dirs.iter().filter_map(|d| d.changed).sum();
-            ui.label(RichText::new(format!("目录列表（{count} 个，本地修改合计 {changes} 项）")).strong());
+            ui.label(RichText::new(format!("目录列表（{count} 个，待提交合计 {changes} 项）")).strong());
             // 目录多的时候冲突标记要滚动才看得见，这里聚合一份：不用滚就知道有没有卡住
             let blocked: Vec<(usize, usize)> = self
                 .dirs
@@ -1420,6 +1516,120 @@ mod tests {
             Stage::rect_of(&texts, "▲ 上移").is_some(),
             "悬停「更多」应展开二级菜单，实际：{:?}",
             texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// 绑定过本地端的卡片多一枚 ↔ 标记：它跟 ↓ 并排在第一行，不能把第三行顶到名称上
+    #[test]
+    fn compact_card_gains_a_local_diff_pill() {
+        let mut stage = Stage::new(true);
+        stage.app.dirs[0].local_diff = Some(crate::localdiff::Summary {
+            differing: 5,
+            only_local: 2,
+            only_server: 1,
+            same: 300,
+            samples: vec!["src/A.java".to_owned()],
+            ..Default::default()
+        });
+        let texts = stage.step(None);
+        let local = Stage::rect_of(&texts, "↔8").expect("绑定过本地端就该画出差异那枚");
+        let update = Stage::rect_of(&texts, "↓5").expect("可更新那枚还得在");
+        assert!(
+            (local.center().y - update.center().y).abs() < 3.0,
+            "↔ 与 ↓ 要并排在同一行，另起一行会顶到居中的名称：{local:?} vs {update:?}"
+        );
+        assert!(local.max.x <= update.min.x + 0.5, "↔ 排在 ↓ 的左边");
+        let name = Stage::rect_of(&texts, "HRP").expect("卡片名称");
+        assert!(local.max.y < name.min.y, "标记整块要在名称之上：{local:?} vs {name:?}");
+        // 没绑定本地端的卡片不画这枚，更不能画一枚 ↔0 冒充「已经比过了」
+        assert!(Stage::rect_of(&texts, "↔0").is_none(), "没绑定本地端的卡片不该有这枚");
+        // 文字画出来了不代表有字形：字体缺这个字会是方块，galley 里照样是「↔」。
+        // 本机实测 msyh 只认 ↔，⇄ / ↕ / ⇅ 全画成方块，所以别随手换箭头。
+        assert!(
+            stage
+                .ctx
+                .fonts_mut(|fonts| fonts.has_glyph(&egui::FontId::proportional(MARK_FONT), '↔')),
+            "「↔」在装的字体里没有字形，会画成方块"
+        );
+    }
+
+    /// 详细行末尾那六个按钮在最小窗口宽度下只剩一百来像素余量，
+    /// 「本地差异 N 项」整句写开之后既不能压住按钮，也不能被挤出屏幕
+    #[test]
+    fn detailed_row_local_mark_survives_the_narrowest_window() {
+        let mut stage = Stage::new(false);
+        stage.app.dirs[0].local_diff = Some(crate::localdiff::Summary {
+            differing: 540,
+            only_local: 6,
+            ..Default::default()
+        });
+        let Stage { ctx, app } = &mut stage;
+        let mut input = base_input();
+        input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 800.0)));
+        let mut out = ctx.run_ui(input, |ui| app.main_page(ui));
+        out.textures_delta.clear();
+        let painted: Vec<(String, Rect)> = out
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_string(),
+                    item.shape.visual_bounding_rect(),
+                )),
+                _ => None,
+            })
+            .filter(|(text, _)| !text.trim().is_empty())
+            .collect();
+        let rect_of = |label: &str| {
+            painted
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("900 宽的一帧里没画出「{label}」"))
+        };
+        let local = rect_of("本地差异 546 项");
+        let upload = rect_of("↑ 上传");
+        assert!(
+            !local.intersects(upload),
+            "本地差异标记压到了行尾按钮：{local:?} vs {upload:?}"
+        );
+        assert!(local.max.x <= 900.0, "本地差异标记被挤出了屏幕：{local:?}");
+        // 整句写开之后还要确认它没被折到第二行去：别名和它在同一条水平线上
+        let alias = rect_of("HRP");
+        assert!(
+            local.min.y < alias.max.y && local.max.y > alias.min.y,
+            "本地差异标记掉到了第二行：{local:?} vs {alias:?}"
+        );
+    }
+
+    /// 详细行的计数措辞：工作副本侧是「待提交 N 项」/「无待提交项」，本地侧比完没有差异就是
+    /// 「本地无差异」，两组之间用一根竖线隔开。只有「未核对」没比完时不能报无差异——
+    /// 那样看着像已经确认过了
+    #[test]
+    fn detailed_row_counts_read_as_todo_and_local_difference() {
+        let mut stage = Stage::new(false);
+        stage.app.dirs[0].local_diff = Some(crate::localdiff::Summary {
+            same: 120,
+            ..Default::default()
+        });
+        stage.app.dirs[1].local_diff = Some(crate::localdiff::Summary::default());
+        let texts: Vec<String> = stage.step(None).into_iter().map(|(text, _)| text).collect();
+        let shows = |label: &str| texts.iter().any(|text| text == label);
+        assert!(shows("待提交 3 项"), "第一行没写待提交：{texts:?}");
+        assert!(shows("无待提交项"), "第二行没写无待提交项：{texts:?}");
+        assert!(shows("本地无差异"), "比完没差异要写本地无差异：{texts:?}");
+        assert!(shows("|"), "两组计数之间没有竖线：{texts:?}");
+        assert!(!shows("本地差异 0 项"), "{texts:?}");
+
+        // 只剩「没核对」的：总数是 0，但内容没读完就不能报无差异
+        stage.app.dirs[0].local_diff = Some(crate::localdiff::Summary {
+            unverified: 3,
+            ..Default::default()
+        });
+        let second: Vec<String> = stage.step(None).into_iter().map(|(text, _)| text).collect();
+        assert!(
+            second.iter().any(|text| text == "本地差异 0 项"),
+            "还有没核对的文件时不能报无差异：{second:?}"
         );
     }
 

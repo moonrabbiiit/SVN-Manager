@@ -8,6 +8,8 @@ pub enum Kind {
     DetectSvn,
     AuthUser,
     Refresh,
+    /// 本地端（绑定对比对象）与该目录工作副本的逐文件比对：跟随检测起，但不碰 svn
+    LocalDiff,
     Status,
     Log,
     /// 某次提交对单个文件 / 目录的逐行差异（双击历史页的涉及文件）
@@ -93,6 +95,9 @@ pub enum Data {
         /// 服务器上已变、本地还没更新的文件数（`svn status -u`）
         out_of_date: Option<usize>,
     },
+    /// 本地端 ↔ 服务器端工作副本的逐文件差异。失败原因由任务自己写进输出区，这里只回
+    /// 「成没成」：`ok=false` 时界面把 `DirView::local_diff` 清成 `None`，不显示数字。
+    LocalDiff { dir: usize, ok: bool, summary: crate::localdiff::Summary },
     Status {
         dir: usize,
         entries: Vec<StatusEntry>,
@@ -194,7 +199,16 @@ impl Pool {
     }
 
     pub fn is_busy(&self, dir: usize) -> bool {
-        self.tasks.iter().any(|task| task.dir == dir)
+        // 本地端比对不算「这个目录在忙」：它只是后台多读几秒树，按住了会把「移除」按钮、
+        // 卡片 ↓ 标记的点击、relocate 入口一起锁掉，还会把边框染成忙色
+        self.tasks
+            .iter()
+            .any(|task| task.dir == dir && task.kind != Kind::LocalDiff)
+    }
+
+    /// 该目录的本地端比对是否正在跑（只驱动「本地端差异」那一枚标记的转圈）。
+    pub fn comparing(&self, dir: usize) -> bool {
+        self.tasks.iter().any(|task| task.dir == dir && task.kind == Kind::LocalDiff)
     }
 
     /// 该目录是否有「会改动工作副本」的任务在跑。
