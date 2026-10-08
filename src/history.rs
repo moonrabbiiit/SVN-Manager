@@ -953,7 +953,7 @@ impl SvnApp {
                                 // 路径文字按剩余宽度截断、固定行高（悬停显示完整路径），
                                 // 行最右侧始终留出「查看提交记录」的按钮位——长路径也不会把它挤出可视区
                                 let color = action_color(ui, path.action);
-                                // 目录名用粗体（Name("bold") 由 fonts::install_cjk 保证已绑定）
+                                // 目录名用粗体（Name("bold") 由 fonts::install 保证已绑定）
                                 let font = if path.kind == "dir" {
                                     FontId {
                                         size: 12.0,
@@ -1669,7 +1669,7 @@ mod tests {
     #[test]
     fn search_box_and_chips_paint_as_one_element() {
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = crate::testbed::stub_app(false);
         app.page = crate::Page::History;
         app.history = Some(HistoryPage::new(
@@ -1837,7 +1837,7 @@ mod tests {
     fn search_box_never_overlaps_the_neighbouring_label() {
         for width in [1700.0_f32, 1526.0, 1400.0, 1272.0, 1150.0, 1000.0, 900.0] {
             let ctx = egui::Context::default();
-            crate::fonts::install_cjk(&ctx);
+            crate::fonts::install(&ctx, crate::fonts::AUTO);
             let mut app = crate::testbed::stub_app(false);
             app.page = crate::Page::History;
             // 照用户窗口的样子：左侧挂一条很长的真实路径，右侧还选着日期区间（标签变长）
@@ -1908,7 +1908,7 @@ mod tests {
     #[test]
     fn arrow_buttons_reach_hits_inside_the_file_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = crate::testbed::stub_app(false);
         app.page = crate::Page::History;
         let mut page = HistoryPage::new(0, "旧系统后端".to_owned(), 100, "zhangsan".to_owned(), false);
@@ -1955,7 +1955,7 @@ mod tests {
     #[test]
     fn arrow_buttons_walk_through_the_hits() {
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = crate::testbed::stub_app(false);
         app.page = crate::Page::History;
         let mut page = HistoryPage::new(0, "订单服务".to_owned(), 100, "zhangsan".to_owned(), false);
@@ -1997,7 +1997,7 @@ mod tests {
     #[test]
     fn bad_regex_floats_a_bubble_instead_of_taking_layout() {
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = crate::testbed::stub_app(false);
         app.page = crate::Page::History;
         let mut page = HistoryPage::new(0, "订单服务".to_owned(), 100, "zhangsan".to_owned(), false);
@@ -2035,7 +2035,7 @@ mod tests {
     #[test]
     fn chip_click_refreshes_the_result_in_the_same_frame() {
         let ctx = egui::Context::default();
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = crate::testbed::stub_app(false);
         app.page = crate::Page::History;
         let mut page = HistoryPage::new(0, "订单服务".to_owned(), 100, "zhangsan".to_owned(), false);

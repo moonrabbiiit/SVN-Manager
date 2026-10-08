@@ -15,17 +15,8 @@ use crate::svn::Svn;
 
 impl SvnApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let font_note = match fonts::install_cjk(&cc.egui_ctx) {
-            Some(path) => format!(
-                "中文字体：{}",
-                Path::new(&path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or(path)
-            ),
-            None => "警告：未找到系统中文字体，中文可能显示为方块".to_owned(),
-        };
         let cfg = Config::load();
+        let font_note = fonts::note_for(&cfg.ui_font, fonts::install(&cc.egui_ctx, &cfg.ui_font));
         for style_theme in [egui::Theme::Dark, egui::Theme::Light] {
             cc.egui_ctx
                 .style_mut_of(style_theme, |style| crate::ui::tune_style(style));
@@ -379,6 +370,17 @@ impl SvnApp {
                         self.spawn_refresh(index, quiet);
                     }
                 }
+                (Kind::LocalDiff, Data::LocalDiff { dir: index, ok, summary }) => {
+                    if let Some(view) = self.dirs.get_mut(index) {
+                        // 读失败同样清成 None：本地端比对慢几秒，拿上一次的数冒充现状最坏
+                        view.local_diff = ok.then_some(summary);
+                        view.local_checked_at = if ok {
+                            chrono::Local::now().format("%H:%M:%S").to_string()
+                        } else {
+                            String::new()
+                        };
+                    }
+                }
                 (Kind::Status, Data::Status { dir: index, entries, ok, message }) => {
                     // 先数完再把 entries 交给提交页（它拿走所有权）
                     let blocked = ok.then(|| crate::svn::blocked_count(&entries));
@@ -645,6 +647,12 @@ impl SvnApp {
 
 impl eframe::App for SvnApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 字号 = 整屏缩放：egui 的 zoom_factor 是「系统 DPI × 这个倍数」，文字和控件一起放大。
+        // 每帧对一次，设置页改完下一帧就生效，换显示器 / 改系统缩放也能跟上
+        let want = fonts::scale_factor(&self.cfg.ui_scale);
+        if ctx.zoom_factor() != want {
+            ctx.set_zoom_factor(want);
+        }
         self.tick(ctx);
     }
 
@@ -690,7 +698,7 @@ mod tests {
     fn hint_bar_stays_below_the_log() {
         let ctx = Context::default();
         ctx.set_theme(ThemePreference::Dark);
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = stub_app(false);
         app.output.push(OutLine { level: Level::Info, text: "svn status".to_owned() });
 

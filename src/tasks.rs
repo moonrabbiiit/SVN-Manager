@@ -3,7 +3,7 @@
 
 use crate::{Level, Maintain, Page, Relocate, SvnApp};
 use crate::{stats, svn, update};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use chrono::NaiveDate;
 use crate::commit::CommitPage;
@@ -283,9 +283,52 @@ impl SvnApp {
             });
     }
 
+    /// 本地开发侧（「更多 → 绑定对比对象」里绑的目录）与该目录工作副本的逐文件比对。
+    /// 由 `spawn_refresh` 顺带起，所以自动刷新与提交 / 更新后的补刷都会带上这个数。
+    pub fn spawn_local_diff(&mut self, index: usize, quiet: bool) {
+        let target = self
+            .cfg
+            .dirs
+            .get(index)
+            .map(|d| d.bc_target.trim_matches('"').trim_matches(['/', '\\']).to_owned())
+            .unwrap_or_default();
+        if target.is_empty() {
+            // 没绑定就没有「本地端」可谈：清掉可能残留的旧数，让主页什么都不显示
+            if let Some(view) = self.dirs.get_mut(index) {
+                view.local_diff = None;
+            }
+            return;
+        }
+        let (Some(server), label) = (self.dir_path(index), self.dir_label(index)) else { return };
+        if self.pool.has(Kind::LocalDiff, index) || self.pool.is_writing(index) {
+            // 正在 update / commit / 维护时工作副本树半新半旧，比出来的差异是假的。
+            // 这些任务收尾都会补跑一次检测，那时候再起就对了
+            return;
+        }
+        let filter = self.cfg.dirs[index].bc_filter.clone();
+        self.pool
+            .spawn(Kind::LocalDiff, index, format!("{label} 本地差异比对"), move |sink| {
+                let sink = if quiet { sink.muted() } else { sink };
+                match crate::localdiff::compare(Path::new(&target), &server, &filter) {
+                    Ok(summary) => {
+                        if !summary.is_clean() {
+                            sink.line(format!("[{label}] {}", summary.label()));
+                        }
+                        Data::LocalDiff { dir: index, ok: true, summary }
+                    }
+                    Err(message) => {
+                        sink.line(format!("[{label}] 本地差异比对失败：{message}"));
+                        Data::LocalDiff { dir: index, ok: false, summary: Default::default() }
+                    }
+                }
+            });
+    }
+
     /// `quiet` 为真时不在输出区打印执行日志（提交成功后的自动刷新用：那是程序
     /// 自己补的读操作，逐行 `$ svn …` 只会淹没提交结果；失败仍走结果消息报出来）。
     pub fn spawn_refresh(&mut self, index: usize, quiet: bool) {
+        // 本地端比对不依赖 svn，所以放在 svn 就绪判断之前：svn.exe 还没配好时这个数照样能给
+        self.spawn_local_diff(index, quiet);
         let Some(svn) = self.svn_or_none() else { return };
         let Some(path) = self.dir_path(index) else { return };
         if self.pool.has(Kind::Refresh, index) {
@@ -359,14 +402,21 @@ impl SvnApp {
                 // 服务器可达时一次走完整棵树就够：`svn status -u --xml` 的输出同时带
                 // 本地改动（wc-status）与服务器上已变更的条目（repos-status）。
                 // 早先分两条命令等于把树走两遍，七万文件的目录要多等三秒。
+                // 再省一层：本地基线已经就是 HEAD 时，`-u` 一路必然全空，那半趟走完整棵树
+                // 的服务器比较（同一个目录实测 0.6~3.4 秒）就不用问了，只读本地状态。
                 let (entries, out_of_date, status) = if remote == Some(true) {
-                    let (entries, pending, run) = svn.status_against_server(&path);
-                    if run.ok {
-                        (entries, pending, run)
-                    } else {
-                        // 带 -u 的这次没走通（服务器中途断了 / 认证问题）：退回只读本地
+                    if svn::wc_at_head(&info.revision, &remote_rev) {
                         let (local, local_run) = svn.status(&path);
-                        (local, None, local_run)
+                        (local, Some(0), local_run)
+                    } else {
+                        let (entries, pending, run) = svn.status_against_server(&path);
+                        if run.ok {
+                            (entries, pending, run)
+                        } else {
+                            // 带 -u 的这次没走通（服务器中途断了 / 认证问题）：退回只读本地
+                            let (local, local_run) = svn.status(&path);
+                            (local, None, local_run)
+                        }
                     }
                 } else {
                     // 连接已经判定不通，就别再让那条走网络的命令卡到超时

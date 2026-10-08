@@ -1126,7 +1126,7 @@ mod tests {
     fn commit_page_shows_the_not_up_to_date_warning() {
         let ctx = egui::Context::default();
         ctx.set_theme(egui::ThemePreference::Dark);
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = crate::testbed::stub_app(false);
 
         app.commit = Some(page_of(vec![Item::Modified], &[Item::Modified]));
@@ -1156,7 +1156,7 @@ mod tests {
     fn commit_button_gates_when_not_up_to_date() {
         let ctx = egui::Context::default();
         ctx.set_theme(egui::ThemePreference::Dark);
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = crate::testbed::stub_app(false);
         app.commit = Some(page_of(vec![Item::Modified], &[Item::Modified]));
 
@@ -1191,7 +1191,7 @@ mod tests {
     fn commit_gate_can_be_cancelled() {
         let ctx = egui::Context::default();
         ctx.set_theme(egui::ThemePreference::Dark);
-        crate::fonts::install_cjk(&ctx);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = crate::testbed::stub_app(false);
         app.commit = Some(page_of(vec![Item::Modified], &[Item::Modified]));
 
