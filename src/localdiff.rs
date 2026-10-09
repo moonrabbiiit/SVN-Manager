@@ -20,21 +20,22 @@ use regex::Regex;
 /// 差异明细里最多带出多少条相对路径（给 tooltip 用，全量清单交给 Beyond Compare）
 pub const SAMPLE_MAX: usize = 50;
 
-/// 内容核对的预算。本机实测：旧系统后端那对 2.9 万文件里要读内容的是 541 个（BOM、行尾、
-/// 时间戳变化那几批），整趟比对 1.2 秒；按这个上限，最坏情况也就多花几秒，
-/// 且超出部分明确标成未核对。
+/// 内容核对的预算：只按时间收口，60 秒跑不完的那部分才记成未核对。
+/// 不按文件数或字节数卡——本地端与工作副本的时间戳几乎处处不同（BC 合过的文件时间戳
+/// 按复制时刻重写），于是整棵树基本都要读内容，卡文件数会把没轮到的那批静默记成未核对，
+/// 主页的数就成了随手可漏的下界（实测易朋云 HRP.SR 一个真改了内容的 mapper xml 就这么漏掉）。
+/// 比对在后台线程跑、行上只有转圈标记，不占界面也不锁操作，跑得久只是这个数晚点到。
+/// `max_files` 是防失控的兜底（正常工程树到不了这个量级），不是工作上限。
 struct Limits {
     max_files: usize,
-    max_bytes: u64,
     max_time: Duration,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_files: 5000,
-            max_bytes: 300 * 1024 * 1024,
-            max_time: Duration::from_secs(8),
+            max_files: 200_000,
+            max_time: Duration::from_secs(60),
         }
     }
 }
@@ -186,7 +187,6 @@ fn compare_with(local: &Path, server: &Path, filter: &str, limits: &Limits) -> R
 
     let mut summary = Summary::default();
     let mut verified = 0usize;
-    let mut read_bytes = 0u64;
     let local_owned = local.to_owned();
     walk(local, local, &ex, 0, &mut |rel, size, modified| {
         let key = rel.to_ascii_lowercase();
@@ -204,15 +204,11 @@ fn compare_with(local: &Path, server: &Path, filter: &str, limits: &Limits) -> R
         }
         // 大小不同也不等于改了：BOM 是 3 字节、一行 CRLF 变 LF 是 1 字节，
         // 所以到这一步只有读内容才算数
-        if verified >= limits.max_files
-            || read_bytes + size.max(entry.size) * 2 > limits.max_bytes
-            || start.elapsed() > limits.max_time
-        {
+        if verified >= limits.max_files || start.elapsed() > limits.max_time {
             summary.unverified += 1;
             return;
         }
         verified += 1;
-        read_bytes += size.max(entry.size) * 2;
         match verify(&local_owned.join(rel), &server.join(&entry.rel)) {
             Content::Same => summary.same += 1,
             Content::Equivalent => summary.trivial += 1,
@@ -479,7 +475,7 @@ mod tests {
             put(&local, &format!("src/f{i}.txt"), b"hello", 1_700_000_500);
             put(&server, &format!("src/f{i}.txt"), b"hello", 1_700_000_100);
         }
-        let tight = Limits { max_files: 2, max_bytes: u64::MAX, max_time: Duration::from_secs(60) };
+        let tight = Limits { max_files: 2, max_time: Duration::from_secs(60) };
         let s = compare_with(&local, &server, "", &tight).unwrap();
         assert_eq!(s.same, 2, "预算内的照常核对");
         assert_eq!((s.unverified, s.differing, s.samples.len()), (4, 0, 0));
