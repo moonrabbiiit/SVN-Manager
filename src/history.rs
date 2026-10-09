@@ -918,9 +918,7 @@ impl SvnApp {
                                 if ui.button("复制说明").clicked() {
                                     ui.ctx().copy_text(entry.message.clone());
                                 }
-                            });
-                            // 回退入口就挂在选中的这条版本上：整目录回到 r{rev} 的样子，改动先落本地
-                            ui.horizontal(|ui| {
+                                // 回退入口就挂在选中的这条版本上：整目录回到 r{rev} 的样子，改动先落本地
                                 let back = ui
                                     .button("回退整个目录到此版本")
                                     .on_hover_text(format!(
@@ -960,13 +958,13 @@ impl SvnApp {
                                     .size(13.0),
                             );
                             ui.label(
-                                RichText::new("双击文件＝左右对比这一次提交对它的改动；鼠标停在文件上可点「查看提交记录」/「回退此文件」")
+                                RichText::new("双击文件＝左右对比这一次提交对它的改动；行末「操作」里可看这个文件的提交记录，或把它回退到这一版")
                                     .weak()
                                     .size(11.5),
                             );
                             for (path_index, path) in entry.paths.iter().enumerate() {
-                                // 路径文字按剩余宽度截断、固定行高（悬停显示完整路径），
-                                // 行最右侧始终留出「查看提交记录」的按钮位——长路径也不会把它挤出可视区
+                                // 路径文字按剩余宽度截断、固定行高（截断时 egui 自己会悬停浮出全文），
+                                // 行最右侧始终留出「操作」那枚按钮的位——长路径也不会把它挤出可视区
                                 let color = action_color(ui, path.action);
                                 // 目录名用粗体（Name("bold") 由 fonts::install 保证已绑定）
                                 let font = if path.kind == "dir" {
@@ -984,10 +982,7 @@ impl SvnApp {
                                             .monospace()
                                             .color(color),
                                     );
-                                    let full = path.path.clone();
-                                    // 文件行右侧要摆下两枚悬停按钮，目录行只有一枚
-                                    let reserve = if path.kind == "dir" { 118.0 } else { 202.0 };
-                                    let path_w = (ui.available_width() - reserve).max(120.0);
+                                    let path_w = (ui.available_width() - 68.0).max(120.0);
                                     // 不用 add_sized：它内部是居中布局，路径长短不一会显得没左对齐
                                     let text = ui
                                         .allocate_ui_with_layout(
@@ -1007,58 +1002,55 @@ impl SvnApp {
                                                 )
                                             },
                                         )
-                                        .inner
-                                        .on_hover_text(full);
-                                    // 把行撑满到面板右缘（右侧留 8px），悬停按钮据此贴在最右边
+                                        .inner;
+                                    // 把行撑满到面板右缘（右侧留 8px），「操作」据此贴在最右边
                                     let spare = ui.available_width() - 8.0;
                                     if spare > 0.0 {
                                         ui.add_space(spare);
                                     }
                                     text
                                 });
-                                let button_rect = egui::Rect::from_min_size(
+                                // 两枚按钮合成一枚「操作」。用 new_child 固定矩形挂上去，不用 put：
+                                // put 会推进外层光标，整列被顶得抖一下
+                                let menu_rect = egui::Rect::from_min_size(
                                     egui::pos2(
-                                        row.response.rect.max.x - 96.0,
+                                        row.response.rect.max.x - 62.0,
                                         row.response.rect.center().y - 9.0,
                                     ),
-                                    egui::vec2(90.0, 18.0),
+                                    egui::vec2(56.0, 18.0),
                                 );
-                                // 用整行矩形判断，不用 Response::hovered()：指针停在行内的路径文字上时，
-                                // 悬停会被那个标签独占，整行就永远不亮了（按钮也就永远点不出来）
-                                if ui.rect_contains_pointer(row.response.rect) {
-                                    // 必须用 place 不能用 put：put 会推进外层光标，按钮一出现
-                                    // 后面几行就被顶下去一点，悬停一变整列跟着抖
-                                    let button = ui.place(
-                                        button_rect,
-                                        egui::Button::new(RichText::new("查看提交记录").size(11.5))
-                                            .small(),
-                                    );
-                                    if button.clicked() {
+                                let mut menu = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .id(egui::Id::new(("history_row_menu", path_index)))
+                                        .max_rect(menu_rect)
+                                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                                );
+                                // 用 Popup::menu 不用 ComboBox：ComboBox 的 width 连按钮本体一起撑宽，
+                                // 菜单要装下七个字的项，这一行就摆不下了
+                                let button = menu
+                                    .add(egui::Button::new(RichText::new("操作").size(11.5)).small());
+                                egui::Popup::menu(&button).show(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            RichText::new("查看提交记录").size(12.0),
+                                        )
+                                        .clicked()
+                                    {
                                         self.open_file_log(page.dir, path);
                                     }
-                                    // 单个文件才给这一枚：只把这一个文件倒回 r{rev}
-                                    if path.kind != "dir" {
-                                        let back_rect = egui::Rect::from_min_size(
-                                            egui::pos2(
-                                                row.response.rect.max.x - 190.0,
-                                                row.response.rect.center().y - 9.0,
-                                            ),
-                                            egui::vec2(90.0, 18.0),
-                                        );
-                                        let back = ui.place(
-                                            back_rect,
-                                            egui::Button::new(RichText::new("回退此文件").size(11.5))
-                                                .small(),
-                                        )
-                                        .on_hover_text(format!(
-                                            "只把这一个文件回到 r{} 时的内容（{} 之后对它的改动撤掉）：\n改的是本地文件，主页「待提交」里核对后再上传。",
-                                            entry.revision, entry.revision
-                                        ));
-                                        if back.clicked() {
-                                            self.open_rollback(page.dir, &entry, Some(path));
-                                        }
+                                    // 单个文件才谈得上回退：只把这一个文件倒回 r{rev}
+                                    if path.kind != "dir"
+                                        && ui
+                                            .selectable_label(
+                                                false,
+                                                RichText::new("回退此文件").size(12.0),
+                                            )
+                                            .clicked()
+                                    {
+                                        self.open_rollback(page.dir, &entry, Some(path));
                                     }
-                                }
+                                });
                                 // 双击 -> 这一次提交对这个路径的左右逐行对比
                                 if row.inner.double_clicked() {
                                     self.open_file_diff(page.dir, &entry, path);
@@ -1829,30 +1821,7 @@ mod tests {
             .collect()
     }
 
-    /// 只把指针停在指定位置（不按下去）跑一帧：悬停才露出来的按钮要靠它拿矩形
-    fn hover_frame(
-        ctx: &egui::Context,
-        app: &mut crate::SvnApp,
-        pos: egui::Pos2,
-    ) -> Vec<(String, egui::Rect)> {
-        let mut input = crate::testbed::base_input();
-        input.events = vec![egui::Event::PointerMoved(pos)];
-        let mut out = ctx.run_ui(input, |ui| app.history_page(ui));
-        out.textures_delta.clear();
-        out.shapes
-            .iter()
-            .filter_map(|item| match &item.shape {
-                egui::Shape::Text(text) => Some((
-                    text.galley.text().to_string(),
-                    item.shape.visual_bounding_rect(),
-                )),
-                _ => None,
-            })
-            .filter(|(text, _)| !text.trim().is_empty())
-            .collect()
-    }
-
-    /// 回退的两个入口都挂在历史页上：详情里的「回退整个目录到此版本」、涉及文件行上的「回退此文件」。
+    /// 回退的两个入口都挂在历史页上：详情里的「回退整个目录到此版本」、涉及文件行末「操作」菜单里的「回退此文件」。
     /// 点下去只弹确认窗口，第一下绝不动工作副本；本地路径要当场换算对。
     #[test]
     fn rollback_entry_points_open_the_confirm_dialog() {
@@ -1892,31 +1861,87 @@ mod tests {
             frame.iter().find(|(text, _)| text == label).map(|(_, rect)| *rect)
         };
 
+        // 每行行末都有一枚「操作」，按「离哪一行文字最近」认领，别拿错上/下一行的
+        let menu_of = |frame: &[(String, egui::Rect)], at: egui::Pos2| {
+            frame
+                .iter()
+                .filter(|(text, _)| text == "操作")
+                .map(|(_, rect)| *rect)
+                .min_by(|a, b| {
+                    (a.center() - at)
+                        .length()
+                        .partial_cmp(&(b.center() - at).length())
+                        .unwrap()
+                })
+        };
+
+        // 点一下「操作」把菜单翻开：浮层是个 Area，要第二帧才画得出来
+        fn open_menu(
+            ctx: &egui::Context,
+            app: &mut crate::SvnApp,
+            at: egui::Pos2,
+        ) -> Vec<(String, egui::Rect)> {
+            // 先点一下别处收掉上一枚，再空跑一帧让它真的消失：菜单是往下长的，
+            // 正好盖住下一行的「操作」，不清干净这一点击就会被浮层吃掉
+            painted_frame(ctx, app, Some(egui::pos2(4.0, 4.0)));
+            painted_frame(ctx, app, None);
+            painted_frame(ctx, app, Some(at));
+            painted_frame(ctx, app, None)
+        }
+
         let idle = painted_frame(&ctx, &mut app, None);
         let back_all = rect_of(&idle, "回退整个目录到此版本").expect("详情面板该有整目录回退按钮");
-        assert!(rect_of(&idle, "回退此文件").is_none(), "没悬停不该画出单文件按钮");
-        assert!(rect_of(&idle, "查看提交记录").is_none(), "没悬停不该画出查看按钮");
+        // 复制说明和回退按钮挤在同一行：面板不该被这两行顶高，两枚也不能叠住
+        let copy = rect_of(&idle, "复制说明").expect("详情面板该有「复制说明」");
+        assert!(copy.max.x <= back_all.min.x, "两枚按钮左右顺序反了：{copy:?} / {back_all:?}");
+        assert!(
+            (copy.center().y - back_all.center().y).abs() < 2.0,
+            "两枚按钮要在同一行，不能各占一行：{copy:?} / {back_all:?}"
+        );
+        assert!(rect_of(&idle, "回退此文件").is_none(), "菜单没翻开不该画出菜单项");
+        assert!(rect_of(&idle, "查看提交记录").is_none(), "菜单没翻开不该画出菜单项");
 
-        // 指针停在文件那一行：两枚按钮同时亮，不叠在一起也不压住路径文字
+        // 文件行末那枚「操作」：贴在最右边，不能压住路径文字
         let path_text = rect_of(&idle, "/hrp/src/address.vue").expect("涉及文件要画出路径");
-        let hovered = hover_frame(&ctx, &mut app, path_text.center());
-        let view = rect_of(&hovered, "查看提交记录").expect("悬停该露出「查看提交记录」");
-        let file_back = rect_of(&hovered, "回退此文件").expect("悬停该露出「回退此文件」");
-        assert!(file_back.max.x < view.min.x, "两枚按钮叠在一起：{file_back:?} / {view:?}");
-        for (name, rect) in [("回退此文件", file_back), ("查看提交记录", view)] {
+        let menu = menu_of(&idle, path_text.center()).expect("文件行末该有「操作」");
+        assert!(
+            menu.min.x > path_text.max.x - 1.0,
+            "「操作」盖住了路径文字：{menu:?} vs {path_text:?}"
+        );
+        assert!(
+            (menu.center().y - path_text.center().y).abs() < 12.0,
+            "「操作」要跟这一行的文字齐平：{menu:?} vs {path_text:?}"
+        );
+
+        let opened = open_menu(&ctx, &mut app, menu.center());
+        let view = rect_of(&opened, "查看提交记录").expect("「操作」里该有查看提交记录");
+        let file_back = rect_of(&opened, "回退此文件").expect("文件行的「操作」里该有回退此文件");
+        assert!(
+            file_back.min.y >= view.min.y,
+            "菜单项要自上而下排：{view:?} / {file_back:?}"
+        );
+        // 「操作」贴在面板右缘，浮层得自己往左让，不能飘出屏幕右边（那就点不到了）
+        for (name, rect) in [("查看提交记录", view), ("回退此文件", file_back)] {
             assert!(
-                rect.min.x > path_text.max.x - 1.0,
-                "{name} 盖住了路径文字：{rect:?} vs {path_text:?}"
+                rect.max.x <= 1400.0 && rect.min.x >= 0.0,
+                "{name} 飞出屏幕了：{rect:?}"
             );
         }
-        // 目录行只有「查看提交记录」，不该多出回退那枚
+
+        // 目录行同样有「操作」，但里面只有查看提交记录，不该多出回退那项
         let dir_text = rect_of(&idle, "/hrp/src").expect("目录行也要画出路径");
-        let hovered_dir = hover_frame(&ctx, &mut app, dir_text.center());
-        assert!(rect_of(&hovered_dir, "查看提交记录").is_some(), "目录行照样能看提交记录");
-        assert!(rect_of(&hovered_dir, "回退此文件").is_none(), "目录行不给单文件回退");
+        let dir_menu = menu_of(&idle, dir_text.center()).expect("目录行末也该有「操作」");
+        let opened_dir = open_menu(&ctx, &mut app, dir_menu.center());
+        assert!(
+            rect_of(&opened_dir, "查看提交记录").is_some(),
+            "目录行照样能看提交记录"
+        );
+        assert!(
+            rect_of(&opened_dir, "回退此文件").is_none(),
+            "目录行不给单文件回退"
+        );
 
         // 点整目录那枚：只开确认窗口，版本号和目标路径都要对上
-        hover_frame(&ctx, &mut app, back_all.center());
         painted_frame(&ctx, &mut app, Some(back_all.center()));
         let dialog = app.rollback.clone().expect("点完该弹出确认窗口");
         assert_eq!(dialog.revision, "101");
@@ -1925,9 +1950,10 @@ mod tests {
         assert!(!dialog.confirm, "第一下只开窗口，不直接进入执行");
         assert!(!app.pool.is_writing(0), "窗口刚打开时不该已经起回退任务");
 
-        // 点文件行那枚：目标是换算出来的本地文件，名字用仓库里的相对路径
+        // 点菜单里那项：目标是换算出来的本地文件，名字用仓库里的相对路径
         app.rollback = None;
-        hover_frame(&ctx, &mut app, file_back.center());
+        let opened = open_menu(&ctx, &mut app, menu.center());
+        let file_back = rect_of(&opened, "回退此文件").expect("菜单又翻不开了");
         painted_frame(&ctx, &mut app, Some(file_back.center()));
         let dialog = app.rollback.clone().expect("「回退此文件」点了要开窗口");
         assert!(!dialog.is_dir, "这一枚只回退一个文件");
