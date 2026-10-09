@@ -541,6 +541,9 @@ impl SvnApp {
                             .strong()
                             .color(ink(ui, Color32::from_rgb(240, 190, 70))),
                     );
+                    if manifest.prerelease {
+                        ui.label(RichText::new("测试版").size(11.5).weak());
+                    }
                     if replaced {
                         ui.label(RichText::new("内容有更新（版本号没变）").size(11.5).weak());
                     }

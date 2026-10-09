@@ -5,6 +5,9 @@
 //! - **官方源**：GitHub 仓库的最新 Release（`OFFICIAL_API`）。版本号取 `tag_name`，
 //!   下载地址取资产里第一个 `.exe`，GitHub 同时给出资产的 `sha256` digest，
 //!   正好接进下面那条 certutil 校验链；`releases/latest` 本身已排除草稿与预发布。
+//! - **测试分支**：同一个仓库的 `releases` 列表（`OFFICIAL_TEST_API`），按时间倒序取最新
+//!   一条非草稿的发布，**预发布也在候选里**——把某次 Release 勾上「pre-release」就是发测试版，
+//!   只有选了这个源的客户端会拿到它，界面与日志上标「测试版」。
 //! - **自定义源**：局域网里自建的静态服务端，读 `{服务端地址}/latest.json`。
 //!
 //! ## 协议（服务端只需要静态文件）
@@ -66,15 +69,29 @@ use serde::{Deserialize, Serialize};
 pub const OFFICIAL_REPO: &str = "moonrabbiiit/SVN-Manager";
 /// 最新发布：`releases/latest` 自动排除草稿与预发布，也不按时间排序取，交给 GitHub 判
 pub const OFFICIAL_API: &str = "https://api.github.com/repos/moonrabbiiit/SVN-Manager/releases/latest";
+/// 测试分支：`releases` 列表按创建时间倒序返回，预发布也在里面，取最新一条非草稿的
+pub const OFFICIAL_TEST_API: &str = "https://api.github.com/repos/moonrabbiiit/SVN-Manager/releases?per_page=30";
 pub const OFFICIAL_PAGE: &str = "https://github.com/moonrabbiiit/SVN-Manager";
 
-/// 更新源（写在配置的 `update_source` 里）：官方 GitHub 发布 / 自建服务端 latest.json
+/// 更新源（写在配置的 `update_source` 里）：官方 GitHub 发布 / GitHub 预发布（测试分支）/
+/// 自建服务端 latest.json
 pub const SOURCE_OFFICIAL: &str = "official";
+pub const SOURCE_TEST: &str = "test";
 pub const SOURCE_CUSTOM: &str = "custom";
 
-/// 选的是不是官方源。老配置里没有这个字段（空串）按官方算：官方源不用用户填任何东西。
-pub fn is_official(source: &str) -> bool {
-    source.trim() != SOURCE_CUSTOM
+/// 选的是不是自建服务端源——三个源里只有它需要用户自己填地址。认不全的值（含老配置里
+/// 没这个字段的空串）都不算自建源，退回官方源，免得去查一个空地址。
+pub fn is_custom(source: &str) -> bool {
+    source.trim() == SOURCE_CUSTOM
+}
+
+/// 这个源在界面上叫什么（切换时的提示、检查更新的日志行共用）
+pub fn source_label(source: &str) -> &'static str {
+    match source.trim() {
+        SOURCE_CUSTOM => "自建服务端",
+        SOURCE_TEST => "GitHub 测试分支",
+        _ => "GitHub 最新发布",
+    }
 }
 
 /// 服务端 latest.json 的字段（缺省字段宽松处理，兼容以后扩展）。
@@ -93,6 +110,10 @@ pub struct UpdateManifest {
     /// 发布时间，界面展示用
     #[serde(default)]
     pub published_at: String,
+    /// 这条发布在 GitHub 上勾了「pre-release」，即测试分支取到的测试版。
+    /// 自建服务端不写这项就是 false；界面据此在版本号后标「测试版」，别让人把测试构建当正式版装上去
+    #[serde(default)]
+    pub prerelease: bool,
 }
 
 /// 把版本号拆成数字段："V1.2.10" -> [1, 2, 10]。
@@ -349,6 +370,12 @@ struct GitHubRelease {
     published_at: String,
     #[serde(default)]
     body: Option<String>,
+    /// 草稿只对登录的协作者可见，任何源都不该把它当可装的版本
+    #[serde(default)]
+    draft: bool,
+    /// 勾了 pre-release 的就是测试版
+    #[serde(default)]
+    prerelease: bool,
     #[serde(default)]
     assets: Vec<GitHubAsset>,
 }
@@ -442,11 +469,29 @@ pub fn plain_text(markdown: &str) -> String {
     out.trim().to_owned()
 }
 
-/// 解析 `releases/latest` 的响应：版本号取 tag（剥掉 `v` 前缀），下载地址取资产里第一个
-/// `.exe`，GitHub 给的 sha256 digest 直接当校验值（接上原有那条 certutil 校验链）。
+/// 解析 `releases/latest` 的响应（单个发布对象）。
 fn parse_release(text: &str) -> Result<UpdateManifest, String> {
     let release: GitHubRelease = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("解析 GitHub 发布信息失败：{e}"))?;
+    release_manifest(release)
+}
+
+/// 解析 `releases` 列表（测试分支）。GitHub 按创建时间倒序返回，预发布也在其中，
+/// 所以取第一条没勾草稿的就是「最新那版」——它是不是预发布交给 manifest.prerelease 标，
+/// 这里不按它过滤：测试分支上没发预发布时，最新一条正式版就是要给的答案。
+fn parse_release_list(text: &str) -> Result<UpdateManifest, String> {
+    let releases: Vec<GitHubRelease> =
+        serde_json::from_str(text.trim_start_matches('\u{feff}'))
+            .map_err(|e| format!("解析 GitHub 发布信息失败：{e}"))?;
+    releases
+        .into_iter()
+        .find(|release| !release.draft)
+        .map(release_manifest)
+        .unwrap_or_else(|| Err("GitHub 测试分支上还没有已发布的版本".to_owned()))
+}
+
+/// 一次 GitHub 发布 → 客户端要的下载地址、校验值与说明。
+fn release_manifest(release: GitHubRelease) -> Result<UpdateManifest, String> {
     // tag 普遍写成 `v1.2.0`，而界面各处都自己加「V」前缀，这里不剥掉就会显示成 Vv1.2.0
     let version = version_text(&release.tag_name);
     if version.is_empty() {
@@ -480,6 +525,7 @@ fn parse_release(text: &str) -> Result<UpdateManifest, String> {
             .next()
             .unwrap_or_default()
             .to_owned(),
+        prerelease: release.prerelease,
     })
 }
 
@@ -494,23 +540,33 @@ fn enrich_github_error(message: String) -> String {
     message
 }
 
-/// 从 GitHub 取最新发布。返回的 manifest.url 是资产的 `browser_download_url`（绝对地址）。
-pub fn check_github() -> Result<UpdateManifest, String> {
-    let dest = std::env::temp_dir().join("svn_manager_github_latest.json");
+/// 拉一份 GitHub 的 json 响应（落到临时文件再读回来，与自建源同一条 curl / PowerShell 链）。
+fn github_json(url: &str, temp_name: &str) -> Result<String, String> {
+    let dest = std::env::temp_dir().join(temp_name);
     let _ = std::fs::remove_file(&dest);
-    fetch(OFFICIAL_API, &dest).map_err(enrich_github_error)?;
+    fetch(url, &dest).map_err(enrich_github_error)?;
     let text = std::fs::read_to_string(&dest)
         .map_err(|e| format!("读取 GitHub 发布信息失败：{e}"))?;
     let _ = std::fs::remove_file(&dest);
-    parse_release(&text)
+    Ok(text)
 }
 
-/// 按配置选中的更新源检查一次；`server` 只在自定义源时用到。
+/// 从 GitHub 取最新发布。返回的 manifest.url 是资产的 `browser_download_url`（绝对地址）。
+pub fn check_github() -> Result<UpdateManifest, String> {
+    parse_release(&github_json(OFFICIAL_API, "svn_manager_github_latest.json")?)
+}
+
+/// 从 GitHub 取最新一条发布，含预发布（测试分支）。
+pub fn check_github_test() -> Result<UpdateManifest, String> {
+    parse_release_list(&github_json(OFFICIAL_TEST_API, "svn_manager_github_releases.json")?)
+}
+
+/// 按配置选中的更新源检查一次；`server` 只在自建服务端源时用到。
 pub fn check_from(source: &str, server: &str) -> Result<UpdateManifest, String> {
-    if is_official(source) {
-        check_github()
-    } else {
-        check(server)
+    match source.trim() {
+        SOURCE_CUSTOM => check(server),
+        SOURCE_TEST => check_github_test(),
+        _ => check_github(),
     }
 }
 
@@ -822,6 +878,27 @@ mod tests {
         println!("NOTES 开头：{}", info.notes.chars().take(160).collect::<String>());
     }
 
+    /// 测试分支冒烟：真的去读 GitHub 的 `releases` 列表（默认跳过）
+    /// `cargo test -- --ignored check_github_test_smoke`
+    #[test]
+    #[ignore]
+    fn check_github_test_smoke() {
+        let info =
+            check_github_test().unwrap_or_else(|e| panic!("读 GitHub releases 列表失败：{e}"));
+        assert!(!info.version.trim().is_empty(), "列表里挑出来的没有版本号");
+        assert!(
+            info.url.starts_with("https://github.com/") || info.url.contains("releases/download"),
+            "下载地址不像 GitHub 资产：{}",
+            info.url
+        );
+        // 仓库没发预发布时这一条与最新发布同号；发了测试版之后这里会比官方源新
+        println!(
+            "测试分支取到：V{}{}",
+            info.version,
+            if info.prerelease { "（测试版）" } else { "" }
+        );
+    }
+
     /// GitHub `releases/latest` 响应里真正会被读到的那几项（抓下来的真实数据）。
     /// 定界要用三层井号：正文里的 `"## 更新内容` 恰好等于 `r##"` 的终止符。
     const RELEASE_FIXTURE: &str = r###"{
@@ -927,13 +1004,35 @@ mod tests {
         assert_eq!(info.url, "https://x/y.EXE");
     }
 
+    /// 测试分支读的是 `releases` 列表（GitHub 按创建时间倒序给）：草稿跳过，预发布照取并标出来
+    #[test]
+    fn test_channel_picks_the_newest_published_release() {
+        let list = r#"[
+            {"tag_name":"v1.3.0","draft":true,"assets":[{"name":"wip.exe","browser_download_url":"https://x/wip.exe"}]},
+            {"tag_name":"v1.2.6","prerelease":true,"published_at":"2026-10-09T02:00:00Z","assets":[{"name":"a.exe","browser_download_url":"https://x/a.exe"}]},
+            {"tag_name":"v1.2.5","assets":[{"name":"b.exe","browser_download_url":"https://x/b.exe"}]}
+        ]"#;
+        let info = parse_release_list(list).expect("列表里该能挑出最新那条");
+        assert_eq!(info.version, "1.2.6", "草稿不算发布，取列表里第一条真发出去的");
+        assert!(info.prerelease, "勾了 pre-release 的要在界面上标成测试版");
+        assert_eq!(info.published_at, "2026-10-09");
+        // 最新一条是正式版时照取，只是不用标测试版
+        let official = r#"[{"tag_name":"v1.4.0","assets":[{"name":"a.exe","browser_download_url":"https://x/a.exe"}]}]"#;
+        assert!(!parse_release_list(official).unwrap().prerelease);
+        assert!(parse_release_list("[]").is_err(), "空列表要说清读不到，别报个空版本");
+    }
+
     #[test]
     fn source_choice_routes_the_check() {
-        // 官方源不依赖任何地址；只有自定义源仍然要求填地址
-        assert!(is_official(SOURCE_OFFICIAL));
-        assert!(is_official(""), "老配置里没有这个字段要按官方算");
-        assert!(is_official("别写错的值"), "认不全的值也退回官方源而不是查一个空地址");
-        assert!(!is_official(SOURCE_CUSTOM));
+        // 只有自建源需要地址；官方源与测试分支开箱可用，认不全的值退回官方源而不是查一个空地址
+        assert!(!is_custom(SOURCE_OFFICIAL));
+        assert!(!is_custom(SOURCE_TEST), "测试分支也是 GitHub 源，不用填地址");
+        assert!(!is_custom(""), "老配置里没有这个字段要按官方算");
+        assert!(!is_custom("别写错的值"));
+        assert!(is_custom(SOURCE_CUSTOM));
+        assert_eq!(source_label(SOURCE_TEST), "GitHub 测试分支");
+        assert_eq!(source_label(SOURCE_OFFICIAL), "GitHub 最新发布");
+        assert_eq!(source_label("别写错的值"), "GitHub 最新发布");
         assert!(check_from(SOURCE_CUSTOM, "  ").is_err());
     }
 
@@ -997,6 +1096,7 @@ mod tests {
             notes: String::new(),
             sha256: sha.to_owned(),
             published_at: String::new(),
+            prerelease: false,
         };
         // 本地 exe 的真实哈希：与源上一致就不算更新，哪怕源上的版本号写着 1.0.0
         let mine = sha256_of(&std::env::current_exe().expect("测试进程自己的 exe")).unwrap();

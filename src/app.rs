@@ -747,13 +747,16 @@ mod tests {
         );
     }
 
-    /// 官方源不用填任何地址；自定义源没地址就不算可用
+    /// 两个 GitHub 源（最新发布 / 测试分支）不用填任何地址；自建服务端源没地址就不算可用
     #[test]
     fn only_a_configured_source_is_ready() {
         let mut app = stub_app(false);
         app.cfg.update_source = update::SOURCE_OFFICIAL.to_owned();
         app.cfg.update_server.clear();
         assert!(app.update_source_ready(), "官方源总是可用");
+
+        app.cfg.update_source = update::SOURCE_TEST.to_owned();
+        assert!(app.update_source_ready(), "测试分支也是 GitHub 源，不用填地址");
 
         app.cfg.update_source = update::SOURCE_CUSTOM.to_owned();
         assert!(!app.update_source_ready(), "自定义源没填地址不该去查一个空地址");

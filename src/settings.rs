@@ -407,14 +407,18 @@ impl SvnApp {
                     });
                     ui.separator();
                     ui.collapsing("版本更新", |ui| {
-                        let official = update::is_official(&self.cfg.update_source);
                         ui.label(RichText::new("更新源").size(11.5).weak());
                         ui.horizontal(|ui| {
-                            // 两个都先求值再判断：`||` 短路会让没求值的那个 radio 某帧消失
+                            // 三个都先求值再判断：`||` 短路会让没求值的那个 radio 某帧消失
                             let pick_official = ui.radio_value(
                                 &mut self.cfg.update_source,
                                 update::SOURCE_OFFICIAL.to_owned(),
                                 "官方源（GitHub 最新发布）",
+                            );
+                            let pick_test = ui.radio_value(
+                                &mut self.cfg.update_source,
+                                update::SOURCE_TEST.to_owned(),
+                                "测试分支（含预发布）",
                             );
                             let pick_custom = ui.radio_value(
                                 &mut self.cfg.update_source,
@@ -426,16 +430,26 @@ impl SvnApp {
                                 "读取 {} 的最新 Release",
                                 update::OFFICIAL_PAGE
                             ));
-                            if pick_official.changed() || pick_custom.changed() {
+                            pick_test.clone().on_hover_text(format!(
+                                "读取 {} 的 Release 列表，预发布也在候选里：\n\
+                                 把某次 Release 勾上「pre-release」就是发测试版，\n\
+                                 只有选了这个源的客户端会拿到它。",
+                                update::OFFICIAL_PAGE
+                            ));
+                            if pick_official.changed() || pick_test.changed() || pick_custom.changed()
+                            {
                                 self.persist();
-                                self.hint(if update::is_official(&self.cfg.update_source) {
-                                    "更新源已改为官方 GitHub 发布"
+                                self.hint(if update::is_custom(&self.cfg.update_source) {
+                                    "更新源已改为自建服务端，在下面填服务根目录地址".to_owned()
                                 } else {
-                                    "更新源已改为自建服务端，在下面填服务根目录地址"
+                                    format!(
+                                        "更新源已改为{}",
+                                        update::source_label(&self.cfg.update_source)
+                                    )
                                 });
                             }
                         });
-                        if !official {
+                        if update::is_custom(&self.cfg.update_source) {
                             ui.label(
                                 RichText::new(
                                     "在下方填写服务端托管地址",
@@ -507,6 +521,9 @@ impl SvnApp {
                         ui.label(RichText::new(format!("当前版本：V{APP_VERSION}")).size(11.5).weak());
                         if let Some(m) = &self.update_info {
                             let mut line = format!("最新版本：V{}", m.version.trim());
+                            if m.prerelease {
+                                line.push_str("（测试版）");
+                            }
                             if !m.published_at.trim().is_empty() {
                                 line.push_str(&format!("（发布于 {}）", m.published_at.trim()));
                             }
@@ -516,7 +533,9 @@ impl SvnApp {
                                 ui.label(RichText::new("更新说明").strong().size(11.5));
                                 ui.label(RichText::new(m.notes.trim()).size(11.5).weak());
                             }
-                        } else if !official && self.cfg.update_server.trim().is_empty() {
+                        } else if update::is_custom(&self.cfg.update_source)
+                            && self.cfg.update_server.trim().is_empty()
+                        {
                             ui.label(RichText::new("未配置服务端地址，不会检查更新").size(11.5).weak());
                         }
                     });

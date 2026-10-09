@@ -51,17 +51,17 @@ impl SvnApp {
             });
     }
 
-    /// 当前选的更新源是否可用：官方源不需要任何配置，自定义源得填了服务根目录地址。
+    /// 当前选的更新源是否可用：两个 GitHub 源不需要任何配置，自建服务端源得填了服务根目录地址。
     pub fn update_source_ready(&self) -> bool {
-        update::is_official(&self.cfg.update_source) || !self.cfg.update_server.trim().is_empty()
+        !update::is_custom(&self.cfg.update_source) || !self.cfg.update_server.trim().is_empty()
     }
 
-    /// 后台检查一次版本更新（官方 GitHub 发布或自建服务端 latest.json，与目录无关的任务）。
-    /// 地址有改动时会顺带保存配置。`quiet` 给定时自动检查用：过程不写日志区，
+    /// 后台检查一次版本更新（GitHub 最新发布 / GitHub 测试分支 / 自建服务端 latest.json，
+    /// 与目录无关的任务）。地址有改动时会顺带保存配置。`quiet` 给定时自动检查用：过程不写日志区，
     /// 免得每 5 分钟刷两行、把真正的 svn 记录挤出输出区。
     pub fn spawn_update_check(&mut self, quiet: bool) {
-        let official = update::is_official(&self.cfg.update_source);
-        if !official && self.cfg.update_server.trim().is_empty() {
+        let custom = update::is_custom(&self.cfg.update_source);
+        if custom && self.cfg.update_server.trim().is_empty() {
             self.hint("未配置更新服务端地址，请在「设置 → 版本更新」里填写");
             return;
         }
@@ -71,18 +71,19 @@ impl SvnApp {
         }
         let source = self.cfg.update_source.clone();
         let server = self.cfg.update_server.clone();
-        let from = if official {
-            update::OFFICIAL_REPO.to_owned()
-        } else {
-            server.clone()
-        };
+        let from = if custom { server.clone() } else { update::OFFICIAL_REPO.to_owned() };
+        let channel = update::source_label(&source);
         self.pool
             .spawn(Kind::CheckUpdate, usize::MAX, "检查更新".into(), move |sink| {
                 let sink = if quiet { sink.muted() } else { sink };
-                sink.line(format!("$ 检查版本更新：{from}"));
+                sink.line(format!("$ 检查版本更新：{from}（{channel}）"));
                 match update::check_from(&source, &server) {
                     Ok(manifest) => {
-                        sink.line(format!("→ 最新版本：V{}", manifest.version.trim()));
+                        let test_tag = if manifest.prerelease { "（测试版）" } else { "" };
+                        sink.line(format!(
+                            "→ 最新版本：V{}{test_tag}",
+                            manifest.version.trim()
+                        ));
                         // 「有没有新版」按文件哈希判（要跑一次 certutil）：在后台这一趟算好，
                         // 界面那三处只读结论，别每帧重算
                         let ready = update::has_update(&manifest, crate::APP_VERSION);
