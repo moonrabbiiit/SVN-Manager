@@ -1,7 +1,7 @@
 //! 每个 svn 动作的发起点：起后台任务（检测 / 更新 / 提交 / 日志 / 维护 / relocate）、
 //! 目录的增删移，以及各页面之间的跳转。
 
-use crate::{Level, Maintain, Page, Relocate, SvnApp};
+use crate::{Level, Maintain, Page, Relocate, Rollback, SvnApp};
 use crate::{stats, svn, update};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -792,6 +792,112 @@ impl SvnApp {
                     reload: op != Maintain::Cleanup,
                 }
             });
+    }
+
+    /// 打开「回退到 r{版本}」确认窗口。`path` 不给 = 整个目录回到这一次提交的样子；
+    /// 给了就是历史页「涉及文件」里的那一个文件，只回退它。
+    /// 两种都只改本地工作副本，确认窗口里讲清楚后果才执行。
+    pub fn open_rollback(&mut self, index: usize, entry: &LogEntry, path: Option<&LogPath>) {
+        let (Some(info), Some(local)) = (
+            self.dirs.get(index).and_then(|view| view.info.clone()),
+            self.dir_path(index),
+        ) else {
+            self.hint("还没读到该目录的仓库地址，请先回主页「全部检测」");
+            return;
+        };
+        if self.pool.has(Kind::Rollback, index) {
+            self.hint("该目录的上一次回退还在执行，等它结束再点");
+            return;
+        }
+        // 有冲突没解决时，回退出来的只会是一团更乱的半成品，先把人挡回去
+        if let Some(count) = self
+            .dirs
+            .get(index)
+            .and_then(|view| view.conflicts)
+            .filter(|count| *count > 0)
+        {
+            self.hint(format!("该目录还有 {count} 项冲突没处理，先「解决冲突」或「撤销修改」再回退"));
+            return;
+        }
+        let (target, name, is_dir) = match path {
+            None => (local, self.dir_label(index), true),
+            Some(item) => {
+                // 日志里的路径相对仓库根，要先换算成本地这个目录下的真实文件
+                let Some(target) = svn::wc_target(&info.repos_root, &info.url, &local, &item.path)
+                else {
+                    self.hint(format!(
+                        "{} 不在本目录的本地工作副本里（那次提交还动了同一个仓库的别的路径），这里回退不了",
+                        item.path
+                    ));
+                    return;
+                };
+                if !target.is_file() {
+                    self.hint(format!(
+                        "本地没有这个文件：{}\n（没检出、已改名或已删除；回退只针对本地还在的文件）",
+                        target.display()
+                    ));
+                    return;
+                }
+                (target, item.path.clone(), false)
+            }
+        };
+        self.rollback = Some(Rollback {
+            dir: index,
+            revision: entry.revision.clone(),
+            target,
+            name,
+            is_dir,
+            confirm: false,
+            error: String::new(),
+        });
+        self.hint(format!("回退到 r{} 会改动本地文件，请在弹出窗口里确认", entry.revision));
+    }
+
+    /// 执行回退：`svn merge -r HEAD:<rev> --accept postpone <目标>`，产物是一批本地改动。
+    /// 完成后重读 status 与检测，回退出来的那些项立刻出现在「待提交」里，由他决定上传还是撤销。
+    pub fn spawn_rollback(
+        &mut self,
+        dir: usize,
+        revision: String,
+        target: PathBuf,
+        name: String,
+        is_dir: bool,
+    ) {
+        let Some(svn) = self.svn_or_none() else {
+            self.hint("没有可用的 svn.exe，无法回退");
+            return;
+        };
+        if self.pool.has(Kind::Rollback, dir) {
+            self.hint("上一次回退还在执行，等它结束再点");
+            return;
+        }
+        self.pool.spawn(
+            Kind::Rollback,
+            dir,
+            format!("{name} 回退 r{revision}"),
+            move |sink| {
+                sink.line(format!(
+                    "$ svn merge -r HEAD:{revision} --accept postpone \"{}\"",
+                    target.display()
+                ));
+                let run = svn.merge_back(&target, &revision, &|line| sink.line(line));
+                let scope = if is_dir { "整个目录" } else { "该文件" };
+                let message = if run.ok {
+                    format!(
+                        "{name}：已回到 r{revision}——{scope}的改动只落在本地，核对后再上传，不想要就「撤销修改」"
+                    )
+                } else {
+                    format!("{name}：回退到 r{revision} 失败——{}", run.summary())
+                };
+                // 收尾文案只交给回收端统一写进输出区，避免同一句显示两遍
+                Data::Run {
+                    dir,
+                    ok: run.ok,
+                    message,
+                    reload: true,
+                }
+            },
+        );
     }
 
     /// 打开「修改仓库地址」窗口：原前缀默认填仓库根地址，只需填新的根地址。

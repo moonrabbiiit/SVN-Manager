@@ -69,6 +69,7 @@ impl SvnApp {
             filter_focus: false,
             relocate: None,
             upload_all: None,
+            rollback: None,
             svn_user: String::new(),
             user_probed: false,
             show_settings: false,
@@ -475,6 +476,21 @@ impl SvnApp {
                         self.spawn_refresh(dir, false);
                     }
                 }
+                (Kind::Rollback, Data::Run { dir, ok, message, reload }) => {
+                    if ok {
+                        // 回退成了就关窗，改动已经在「待提交」里等着核对
+                        self.rollback = None;
+                        self.hint(message.clone());
+                    } else if let Some(dialog) = self.rollback.as_mut().filter(|d| d.dir == dir) {
+                        dialog.error = message.clone();
+                    }
+                    self.push(if ok { Level::Success } else { Level::Error }, message);
+                    // 失败也可能是 merge 做成一半，照样重读一遍才是真的状态
+                    if reload {
+                        self.spawn_status(dir, false);
+                        self.spawn_refresh(dir, false);
+                    }
+                }
                 (Kind::Relocate, Data::Run { dir, ok, message, .. }) => {
                     self.push(if ok { Level::Success } else { Level::Error }, message.clone());
                     if ok {
@@ -679,6 +695,7 @@ impl eframe::App for SvnApp {
         self.settings(&ctx);
         self.update_confirm_dialog(&ctx);
         self.relocate_dialog(&ctx);
+        self.rollback_dialog(&ctx);
         self.upload_all_dialog(&ctx);
         self.file_diff_window(&ctx);
         self.file_log_window(&ctx);

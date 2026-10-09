@@ -919,6 +919,21 @@ impl SvnApp {
                                     ui.ctx().copy_text(entry.message.clone());
                                 }
                             });
+                            // 回退入口就挂在选中的这条版本上：整目录回到 r{rev} 的样子，改动先落本地
+                            ui.horizontal(|ui| {
+                                let back = ui
+                                    .button("回退整个目录到此版本")
+                                    .on_hover_text(format!(
+                                        "把这个目录的本地工作副本倒回 r{}：\n\
+                                         r{} 之后的所有改动都会被撤掉（不是只撤这一次提交），\n\
+                                         结果是一批本地改动，主页「待提交」里核对后再上传，不想要就「撤销修改」还原。\n\
+                                         服务器上的东西一点没动。",
+                                        entry.revision, entry.revision
+                                    ));
+                                if back.clicked() {
+                                    self.open_rollback(page.dir, &entry, None);
+                                }
+                            });
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("作者").weak().size(12.0));
                                 ui.label(RichText::new(&entry.author).size(12.5));
@@ -945,7 +960,7 @@ impl SvnApp {
                                     .size(13.0),
                             );
                             ui.label(
-                                RichText::new("双击文件＝左右对比这一次提交对它的改动；鼠标停在文件上可点「查看提交记录」")
+                                RichText::new("双击文件＝左右对比这一次提交对它的改动；鼠标停在文件上可点「查看提交记录」/「回退此文件」")
                                     .weak()
                                     .size(11.5),
                             );
@@ -970,7 +985,9 @@ impl SvnApp {
                                             .color(color),
                                     );
                                     let full = path.path.clone();
-                                    let path_w = (ui.available_width() - 118.0).max(120.0);
+                                    // 文件行右侧要摆下两枚悬停按钮，目录行只有一枚
+                                    let reserve = if path.kind == "dir" { 118.0 } else { 202.0 };
+                                    let path_w = (ui.available_width() - reserve).max(120.0);
                                     // 不用 add_sized：它内部是居中布局，路径长短不一会显得没左对齐
                                     let text = ui
                                         .allocate_ui_with_layout(
@@ -1018,6 +1035,28 @@ impl SvnApp {
                                     );
                                     if button.clicked() {
                                         self.open_file_log(page.dir, path);
+                                    }
+                                    // 单个文件才给这一枚：只把这一个文件倒回 r{rev}
+                                    if path.kind != "dir" {
+                                        let back_rect = egui::Rect::from_min_size(
+                                            egui::pos2(
+                                                row.response.rect.max.x - 190.0,
+                                                row.response.rect.center().y - 9.0,
+                                            ),
+                                            egui::vec2(90.0, 18.0),
+                                        );
+                                        let back = ui.place(
+                                            back_rect,
+                                            egui::Button::new(RichText::new("回退此文件").size(11.5))
+                                                .small(),
+                                        )
+                                        .on_hover_text(format!(
+                                            "只把这一个文件回到 r{} 时的内容（{} 之后对它的改动撤掉）：\n改的是本地文件，主页「待提交」里核对后再上传。",
+                                            entry.revision, entry.revision
+                                        ));
+                                        if back.clicked() {
+                                            self.open_rollback(page.dir, &entry, Some(path));
+                                        }
                                     }
                                 }
                                 // 双击 -> 这一次提交对这个路径的左右逐行对比
@@ -1788,6 +1827,137 @@ mod tests {
             })
             .filter(|(text, _)| !text.trim().is_empty())
             .collect()
+    }
+
+    /// 只把指针停在指定位置（不按下去）跑一帧：悬停才露出来的按钮要靠它拿矩形
+    fn hover_frame(
+        ctx: &egui::Context,
+        app: &mut crate::SvnApp,
+        pos: egui::Pos2,
+    ) -> Vec<(String, egui::Rect)> {
+        let mut input = crate::testbed::base_input();
+        input.events = vec![egui::Event::PointerMoved(pos)];
+        let mut out = ctx.run_ui(input, |ui| app.history_page(ui));
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_string(),
+                    item.shape.visual_bounding_rect(),
+                )),
+                _ => None,
+            })
+            .filter(|(text, _)| !text.trim().is_empty())
+            .collect()
+    }
+
+    /// 回退的两个入口都挂在历史页上：详情里的「回退整个目录到此版本」、涉及文件行上的「回退此文件」。
+    /// 点下去只弹确认窗口，第一下绝不动工作副本；本地路径要当场换算对。
+    #[test]
+    fn rollback_entry_points_open_the_confirm_dialog() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        // 单文件回退要求本地文件真的在，所以拿临时目录当工作副本
+        let root = std::env::temp_dir().join("svn_manager_rollback_ui");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("建临时工作副本目录");
+        std::fs::write(root.join("src/address.vue"), "x").expect("建临时文件");
+
+        let mut app = crate::testbed::stub_app(false);
+        app.page = crate::Page::History;
+        app.cfg.dirs[0].path = root.display().to_string();
+        // 真实形态：仓库根是 .../svn，这个目录只是其中的 hrp 项目（地址相同时
+        // 「路径不在本目录下」那条分支永远走不到）
+        if let Some(info) = app.dirs[0].info.as_mut() {
+            info.repos_root = "https://192.168.1.251/svn".to_owned();
+            info.url = "https://192.168.1.251/svn/hrp".to_owned();
+        }
+        let mut page = HistoryPage::new(0, "订单服务".to_owned(), 100, "zhangsan".to_owned(), false);
+        let mut one = entry("101", "2026-09-01 10:00:00");
+        one.message = "vip 改造".to_owned();
+        one.paths = vec![
+            LogPath {
+                action: 'M',
+                kind: "file".to_owned(),
+                path: "/hrp/src/address.vue".to_owned(),
+            },
+            LogPath { action: 'M', kind: "dir".to_owned(), path: "/hrp/src".to_owned() },
+        ];
+        page.entries = vec![one];
+        page.picked = Some(0);
+        app.history = Some(page);
+
+        let rect_of = |frame: &[(String, egui::Rect)], label: &str| {
+            frame.iter().find(|(text, _)| text == label).map(|(_, rect)| *rect)
+        };
+
+        let idle = painted_frame(&ctx, &mut app, None);
+        let back_all = rect_of(&idle, "回退整个目录到此版本").expect("详情面板该有整目录回退按钮");
+        assert!(rect_of(&idle, "回退此文件").is_none(), "没悬停不该画出单文件按钮");
+        assert!(rect_of(&idle, "查看提交记录").is_none(), "没悬停不该画出查看按钮");
+
+        // 指针停在文件那一行：两枚按钮同时亮，不叠在一起也不压住路径文字
+        let path_text = rect_of(&idle, "/hrp/src/address.vue").expect("涉及文件要画出路径");
+        let hovered = hover_frame(&ctx, &mut app, path_text.center());
+        let view = rect_of(&hovered, "查看提交记录").expect("悬停该露出「查看提交记录」");
+        let file_back = rect_of(&hovered, "回退此文件").expect("悬停该露出「回退此文件」");
+        assert!(file_back.max.x < view.min.x, "两枚按钮叠在一起：{file_back:?} / {view:?}");
+        for (name, rect) in [("回退此文件", file_back), ("查看提交记录", view)] {
+            assert!(
+                rect.min.x > path_text.max.x - 1.0,
+                "{name} 盖住了路径文字：{rect:?} vs {path_text:?}"
+            );
+        }
+        // 目录行只有「查看提交记录」，不该多出回退那枚
+        let dir_text = rect_of(&idle, "/hrp/src").expect("目录行也要画出路径");
+        let hovered_dir = hover_frame(&ctx, &mut app, dir_text.center());
+        assert!(rect_of(&hovered_dir, "查看提交记录").is_some(), "目录行照样能看提交记录");
+        assert!(rect_of(&hovered_dir, "回退此文件").is_none(), "目录行不给单文件回退");
+
+        // 点整目录那枚：只开确认窗口，版本号和目标路径都要对上
+        hover_frame(&ctx, &mut app, back_all.center());
+        painted_frame(&ctx, &mut app, Some(back_all.center()));
+        let dialog = app.rollback.clone().expect("点完该弹出确认窗口");
+        assert_eq!(dialog.revision, "101");
+        assert!(dialog.is_dir, "这一枚回退的是整个目录");
+        assert_eq!(dialog.target, root.as_path());
+        assert!(!dialog.confirm, "第一下只开窗口，不直接进入执行");
+        assert!(!app.pool.is_writing(0), "窗口刚打开时不该已经起回退任务");
+
+        // 点文件行那枚：目标是换算出来的本地文件，名字用仓库里的相对路径
+        app.rollback = None;
+        hover_frame(&ctx, &mut app, file_back.center());
+        painted_frame(&ctx, &mut app, Some(file_back.center()));
+        let dialog = app.rollback.clone().expect("「回退此文件」点了要开窗口");
+        assert!(!dialog.is_dir, "这一枚只回退一个文件");
+        assert_eq!(dialog.target, root.join("src").join("address.vue"));
+        assert_eq!(dialog.name, "/hrp/src/address.vue");
+        assert_eq!(dialog.revision, "101");
+
+        // 本地没有的文件：挡回去，并说清为什么点不动
+        app.rollback = None;
+        let record = app.history.as_ref().expect("页面还在").entries[0].clone();
+        let gone = LogPath { action: 'M', kind: "file".to_owned(), path: "/hrp/src/gone.vue".to_owned() };
+        app.open_rollback(0, &record, Some(&gone));
+        assert!(app.rollback.is_none(), "本地没有这个文件不该开窗口");
+        assert!(app.hint.contains("本地没有这个文件"), "要说明原因：{}", app.hint);
+
+        // 同仓库别的项目（本地这个目录里没有）：同样不开窗口
+        app.hint.clear();
+        let outside = LogPath { action: 'M', kind: "file".to_owned(), path: "/crm/x.cs".to_owned() };
+        app.open_rollback(0, &record, Some(&outside));
+        assert!(app.rollback.is_none(), "拼不出本地路径不该开窗口");
+        assert!(app.hint.contains("不在本目录"), "要说清是路径不在本地：{}", app.hint);
+
+        // 还有冲突没解决：整目录回退也先挡回去
+        app.hint.clear();
+        app.dirs[0].conflicts = Some(1);
+        app.open_rollback(0, &record, None);
+        assert!(app.rollback.is_none(), "冲突没解决不该开始回退");
+        assert!(app.hint.contains("冲突"), "提示要指向「解决冲突」：{}", app.hint);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 落点列表的顺序 = 眼睛看到的顺序：列表自上而下，同一条记录里先说说明、再按文件自上而下

@@ -117,6 +117,132 @@ impl SvnApp {
         }
     }
 
+    // ------------------------------------------------------------ 「回退到某个版本」窗口
+
+    /// 回退确认窗口：这一步会改本地工作副本里的文件，所以第一下只把按钮换成「确认回退」，
+    /// 再点一次才真的执行。改动只落本地，不上服务器，所以不写「风险」而是把后果说清楚。
+    pub(crate) fn rollback_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.rollback.clone() else {
+            return;
+        };
+        let dir = dialog.dir;
+        let revision = dialog.revision.clone();
+        let name = dialog.name.clone();
+        let target_path = dialog.target.clone();
+        let is_dir = dialog.is_dir;
+        let shown = target_path.display().to_string();
+        let running = self.pool.has(Kind::Rollback, dir);
+        let label = self.dir_label(dir);
+        let wc_rev = self
+            .dirs
+            .get(dir)
+            .and_then(|view| view.info.clone())
+            .map(|info| info.revision)
+            .unwrap_or_default();
+        // 回退是在现有本地改动之上做合并，先报个已有的待提交数，别让人以为回退会把它们冲掉
+        let pending = self.dirs.get(dir).and_then(|view| view.changed).unwrap_or(0);
+        let scope = if is_dir { "整个目录" } else { "这个文件" };
+        let mut open = true;
+        egui::Window::new(format!("回退到 r{revision} · {label}"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .default_pos(egui::pos2(420.0, 240.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "把{scope}倒回 r{revision}：只改动本地工作副本，服务器上的东西一点没动。"
+                    ))
+                    .strong()
+                    .size(13.0),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "· 命令是 svn merge -r HEAD:{revision}，结果是 M / A / D 一批本地改动，不提交就不进仓库\n\
+                         · 回退完先核对（主页「待提交 X 项」里逐个看差异），确认无误再由你自己上传\n\
+                         · 不想回退了就用「撤销修改」整个还原，本地改动一并清掉\n\
+                         · 和本地已有改动撞上时不中断：冲突先留下 .merge-* 文件，之后用「解决冲突」或 BC 手工合"
+                    ))
+                    .weak()
+                    .size(11.5),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(if is_dir { "回退对象" } else { "回退文件" }).weak().size(12.0));
+                    ui.label(RichText::new(shown.as_str()).size(12.0).monospace());
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("本地当前版本").weak().size(12.0));
+                    ui.label(RichText::new(format!("r{wc_rev}")).size(12.0));
+                    ui.label(RichText::new("→").weak().size(12.0));
+                    ui.label(
+                        RichText::new(format!("r{revision}"))
+                            .strong()
+                            .size(12.5)
+                            .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                    );
+                });
+                if pending > 0 {
+                    ui.label(
+                        RichText::new(format!("该目录已有 {pending} 项待提交改动，回退会和它们合并"))
+                            .size(11.5)
+                            .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                    );
+                }
+                if !dialog.error.is_empty() {
+                    ui.label(
+                        RichText::new(dialog.error.clone())
+                            .size(12.0)
+                            .color(ink(ui, Color32::from_rgb(240, 100, 100))),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if dialog.confirm {
+                        let button = egui::Button::new(
+                            RichText::new(format!("确认回退到 r{revision}"))
+                                .strong()
+                                .color(Color32::from_rgb(255, 240, 240)),
+                        )
+                        .fill(Color32::from_rgb(150, 60, 60));
+                        if ui.add_enabled(!running, button).clicked() {
+                            self.spawn_rollback(
+                                dir,
+                                revision.clone(),
+                                target_path.clone(),
+                                name.clone(),
+                                is_dir,
+                            );
+                        }
+                        if ui.button("先不回退").clicked() {
+                            dialog.confirm = false;
+                        }
+                    } else if ui
+                        .add_enabled(
+                            !running,
+                            egui::Button::new(RichText::new(format!("回退到 r{revision}")).strong()),
+                        )
+                        .clicked()
+                    {
+                        dialog.confirm = true;
+                        self.hint(format!(
+                            "回退会改动{scope}的本地文件：核对上面的路径后，再点一次「确认回退」"
+                        ));
+                    }
+                    if running {
+                        ui.spinner();
+                        ui.label(RichText::new("正在回退 …").weak().size(11.5));
+                    }
+                });
+            });
+        if open {
+            self.rollback = Some(dialog);
+        } else {
+            self.rollback = None;
+        }
+    }
+
     // ------------------------------------------------------------ 「全部上传」窗口
 
     /// 所有目录用同一条说明各起一个提交任务。会改动服务器，所以第一下只亮出确认按钮。

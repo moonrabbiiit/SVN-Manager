@@ -99,6 +99,7 @@ pub fn stub_app(compact: bool) -> SvnApp {
         filter_focus: false,
         relocate: None,
         upload_all: None,
+        rollback: None,
         show_settings: false,
         hint: String::new(),
         confirm_remove: None,

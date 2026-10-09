@@ -384,6 +384,41 @@ fn trim_fractional(raw: &str) -> String {
     format!("{}{}", &raw[..dot + 6], &raw[tail..])
 }
 
+/// 把 `svn log` 里的路径（相对**仓库根**，如 `/code/HRP.FA/...`）换算成本地工作副本里的路径。
+/// `repos_root` / `wc_url` 取自该目录的 `svn info`，`local` 是它的本地路径。
+/// 反过来说清楚就是：`wc_url` 去掉仓库根剩下一段前缀，日志路径带着这段前缀时，
+/// 后面的部分拼到 `local` 上就是本地文件。前缀对不上返回 `None`——那次提交动的是
+/// 同一个仓库里的别的项目，本地这个目录里没有它。
+pub fn wc_target(repos_root: &str, wc_url: &str, local: &Path, repo_path: &str) -> Option<PathBuf> {
+    let root = repos_root.trim_end_matches('/');
+    let url = wc_url.trim_end_matches('/');
+    if root.is_empty() || url.is_empty() || local.as_os_str().is_empty() {
+        return None;
+    }
+    if url.len() < root.len() || !url[..root.len()].eq_ignore_ascii_case(root) {
+        return None;
+    }
+    // 本目录在仓库里的位置（相对仓库根，不带首斜杠）
+    let here = url[root.len()..].trim_start_matches('/');
+    let want = repo_path.trim_start_matches('/');
+    let rest = if here.is_empty() {
+        want
+    } else if want.eq_ignore_ascii_case(here) {
+        ""
+    } else if want.len() > here.len()
+        && want[..here.len()].eq_ignore_ascii_case(here)
+        && want.as_bytes()[here.len()] == b'/'
+    {
+        &want[here.len() + 1..]
+    } else {
+        return None;
+    };
+    if rest.is_empty() {
+        return Some(local.to_path_buf());
+    }
+    Some(local.join(rest.replace('/', std::path::MAIN_SEPARATOR_STR)))
+}
+
 // ------------------------------------------------------------------------ svn 客户端
 
 #[derive(Clone, Debug, Default)]
@@ -712,6 +747,24 @@ impl Svn {
     pub fn revert_all(&self, dir: &Path, on_line: &dyn Fn(&str)) -> Run {
         self.call_stream(
             &["revert", "--recursive", &dir.to_string_lossy()],
+            None,
+            on_line,
+        )
+    }
+
+    /// 版本回退：把 `target`（一个目录或单个文件）倒回 `revision` 那个版本的样子。
+    /// 产物是一批**本地改动**（M / A / D），不提交就不动服务器，不想要了用「撤销修改」还原。
+    /// 锚点写 `HEAD` 而不是 `BASE`：svn 把范围收拢到目标当前所在的那个版本，所以工作副本
+    /// 落后于服务器时也一样正好回到 `revision`（拿临时仓库实测：本地停在 r2、仓库 HEAD 是 r3，
+    /// `merge -r HEAD:1` 报的是「Reverse-merging r2」）。
+    /// `--accept postpone`：这一趟没给它终端，冲突不能让 svn 停下来等键盘；留下
+    /// `.merge-left / .merge-right / .working` 三件套，交给「解决冲突」或 BC 手工合。
+    /// 同一路径自己往回合不会留下 `svn:mergeinfo`（svn 记完就 elide 掉了），属性不会被带脏。
+    pub fn merge_back(&self, target: &Path, revision: &str, on_line: &dyn Fn(&str)) -> Run {
+        let range = format!("HEAD:{revision}");
+        let path = target.to_string_lossy();
+        self.call_stream(
+            &["merge", "-r", &range, "--accept", "postpone", &path],
             None,
             on_line,
         )
@@ -1167,5 +1220,34 @@ mod tests {
         );
         assert_eq!(diff_flags(true), " -x \"-w --ignore-eol-style\"");
         assert!(diff_flags(false).is_empty());
+    }
+
+    /// 单文件回退要靠它把日志里的仓库相对路径找回到本地文件上。
+    #[test]
+    fn log_paths_resolve_to_working_copy_files() {
+        let root = "https://192.168.1.251/svn/java";
+        let url = "https://192.168.1.251/svn/java/code/HRP.FA";
+        let local = Path::new(r"D:\svn\code\HRP.FA");
+        assert_eq!(
+            wc_target(root, url, local, "/code/HRP.FA/HRP.FA.Bll/Sc/a.xml"),
+            Some(PathBuf::from(r"D:\svn\code\HRP.FA\HRP.FA.Bll\Sc\a.xml"))
+        );
+        // 路径正好指到这个目录本身：回退目标就是本地目录
+        assert_eq!(
+            wc_target(root, url, local, "/code/HRP.FA"),
+            Some(local.to_path_buf())
+        );
+        // 仓库根被整个检出时（本目录 = 仓库根）相对路径整段拼上去
+        assert_eq!(
+            wc_target(root, root, local, "/code/HRP.FA/a.cs"),
+            Some(PathBuf::from(r"D:\svn\code\HRP.FA\code\HRP.FA\a.cs"))
+        );
+        // 那次提交还动了同仓库里的别的项目：本地这个目录里没有它，别乱拼
+        assert_eq!(wc_target(root, url, local, "/code/HRP.His/a.cs"), None);
+        assert_eq!(wc_target(root, url, local, "/code/HRP.FA.xml"), None);
+        // 地址或本地路径没读到，同样拼不出来
+        assert_eq!(wc_target("", url, local, "/code/HRP.FA/a.cs"), None);
+        assert_eq!(wc_target(root, "", local, "/code/HRP.FA/a.cs"), None);
+        assert_eq!(wc_target(root, url, Path::new(""), "/code/HRP.FA/a.cs"), None);
     }
 }

@@ -30,6 +30,9 @@ pub enum Kind {
     Update,
     Commit,
     Maintain,
+    /// 版本回退：`svn merge -r HEAD:<rev>` 把整个目录或单个文件倒回某个版本，
+    /// 结果是一批本地改动，要他确认后自己上传
+    Rollback,
     Relocate,
     Diff,
 }
@@ -218,7 +221,7 @@ impl Pool {
             task.dir == dir
                 && matches!(
                     task.kind,
-                    Kind::Update | Kind::Commit | Kind::Maintain | Kind::Relocate
+                    Kind::Update | Kind::Commit | Kind::Maintain | Kind::Rollback | Kind::Relocate
                 )
         })
     }
@@ -299,6 +302,9 @@ mod tests {
         assert!(pool.is_writing(3));
         assert!(pool.is_writing(3), "重复调用结果应一致");
         assert!(!pool.is_writing(4), "别的目录不受影响");
+        // 回退改的是工作副本里的文件，和提交一样要按住其他写操作
+        pool.spawn(Kind::Rollback, 5, "回退".into(), |_| data());
+        assert!(pool.is_writing(5), "回退算写操作");
     }
 
     /// 后台线程 panic 时通道会断开：必须回报，否则页面标志位再也清不掉（点了没反应）。

@@ -94,6 +94,25 @@ pub struct UploadAll {
     pub detail: Option<usize>,
 }
 
+/// 「回退到某个版本」确认窗口：把整个目录或单个文件倒回所选版本，改动先落在本地。
+#[derive(Clone)]
+pub struct Rollback {
+    /// 目录行（也是任务池里的 dir）
+    pub dir: usize,
+    /// 要回到的版本号（不带 r，直接给 svn merge 用）
+    pub revision: String,
+    /// 真正执行 `svn merge` 的本地路径
+    pub target: PathBuf,
+    /// 窗口标题与收尾文案里的对象名（目录别名 / 仓库相对路径）
+    pub name: String,
+    /// true = 整个目录，false = 单个文件
+    pub is_dir: bool,
+    /// 第一下只把按钮换成「确认回退」，再点一次才真的动工作副本
+    pub confirm: bool,
+    /// 上一次执行的失败原因
+    pub error: String,
+}
+
 #[derive(Clone)]
 pub struct OutLine {
     pub level: Level,
@@ -197,6 +216,8 @@ pub struct SvnApp {
     pub relocate: Option<Relocate>,
     /// 正在批量上传的目录清单（None = 窗口关闭）
     pub upload_all: Option<UploadAll>,
+    /// 正在确认的版本回退（None = 窗口关闭）
+    pub rollback: Option<Rollback>,
     pub show_settings: bool,
     pub hint: String,
     pub confirm_remove: Option<usize>,
