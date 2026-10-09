@@ -920,7 +920,13 @@ impl SvnApp {
                                 }
                                 // 回退入口就挂在选中的这条版本上：整目录回到 r{rev} 的样子，改动先落本地
                                 let back = ui
-                                    .button("回退整个目录到此版本")
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("回退整个目录到此版本")
+                                                .color(Color32::from_rgb(255, 240, 240)),
+                                        )
+                                        .fill(Color32::from_rgb(150, 60, 60)),
+                                    )
                                     .on_hover_text(format!(
                                         "把这个目录的本地工作副本倒回 r{}：\n\
                                          r{} 之后的所有改动都会被撤掉（不是只撤这一次提交），\n\
@@ -1053,7 +1059,9 @@ impl SvnApp {
                                         && ui
                                             .selectable_label(
                                                 false,
-                                                RichText::new("回退此文件").size(12.0),
+                                                RichText::new("回退此文件")
+                                                    .size(12.0)
+                                                    .color(ink(ui, Color32::from_rgb(240, 100, 100))),
                                             )
                                             .clicked()
                                     {

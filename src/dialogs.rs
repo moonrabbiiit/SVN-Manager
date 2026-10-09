@@ -194,7 +194,12 @@ impl SvnApp {
                     } else if ui
                         .add_enabled(
                             !running,
-                            egui::Button::new(RichText::new(format!("回退到 r{revision}")).strong()),
+                            egui::Button::new(
+                                RichText::new(format!("回退到 r{revision}"))
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 240, 240)),
+                            )
+                            .fill(Color32::from_rgb(150, 60, 60)),
                         )
                         .clicked()
                     {
