@@ -1013,7 +1013,11 @@ impl SvnApp {
                                 // 两枚按钮合成一枚「操作」，只在指针停在这一行时现身。用 new_child 固定
                                 // 矩形挂上去、不画 ≠ 不分配：控件每帧都要占住这个位，指针往下移进菜单时
                                 // 锚点才不会消失、浮层不会被自己关掉（put 会推进外层光标，整列跟着抖）
-                                let on_row = ui.rect_contains_pointer(row.response.rect);
+                                let popup_id = egui::Id::new(("history_row_popup", path_index));
+                                // 指针从行里移进菜单，这一行就不算被悬停了；菜单还开着就得把按钮留着，
+                                // 不然浮层会挂在一片空白上
+                                let on_row = ui.rect_contains_pointer(row.response.rect)
+                                    || egui::Popup::is_id_open(ui.ctx(), popup_id);
                                 let menu_rect = egui::Rect::from_min_size(
                                     egui::pos2(
                                         row.response.rect.max.x - 62.0,
@@ -1034,7 +1038,7 @@ impl SvnApp {
                                 // 菜单要装下七个字的项，这一行就摆不下了
                                 let button = menu
                                     .add(egui::Button::new(RichText::new("操作").size(11.5)).small());
-                                egui::Popup::menu(&button).show(|ui| {
+                                egui::Popup::menu(&button).id(popup_id).show(|ui| {
                                     if ui
                                         .selectable_label(
                                             false,
@@ -1973,6 +1977,14 @@ mod tests {
                 "{name} 飞出屏幕了：{rect:?}"
             );
         }
+
+        // 指针从行里移进菜单，这一行就不再是被悬停的一行：锚点那枚「操作」得继续画着，
+        // 不然浮层就挂在一片空白上
+        let in_menu = hover_frame(&ctx, &mut app, view.center());
+        assert!(
+            menu_of(&in_menu, path_text.center()).is_some(),
+            "指针移到菜单里之后「操作」跟着没了，浮层挂在空处"
+        );
 
         // 目录行同样有「操作」，但里面只有查看提交记录，不该多出回退那项
         let dir_text = rect_of(&idle, "/hrp/src").expect("目录行也要画出路径");
