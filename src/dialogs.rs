@@ -120,7 +120,7 @@ impl SvnApp {
     // ------------------------------------------------------------ 「回退到某个版本」窗口
 
     /// 回退确认窗口：这一步会改本地工作副本里的文件，所以第一下只把按钮换成「确认回退」，
-    /// 再点一次才真的执行。窗口里不写操作手册，只留一句后果和目标路径。
+    /// 再点一次才真的执行。窗口里不写操作手册，只问一句从哪版回退到哪版、目标是哪个路径。
     pub(crate) fn rollback_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.rollback.clone() else {
             return;
@@ -151,11 +151,9 @@ impl SvnApp {
             .default_pos(egui::pos2(420.0, 240.0))
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new(format!(
-                        "把{scope}倒回 r{revision}（本地 r{wc_rev} → r{revision}），只改本地工作副本，服务器不动。"
-                    ))
-                    .strong()
-                    .size(13.0),
+                    RichText::new(format!("确定要把{scope}从 r{wc_rev} 回退到 r{revision}？"))
+                        .strong()
+                        .size(13.0),
                 );
                 ui.label(RichText::new(shown.as_str()).size(12.0).monospace());
                 if pending > 0 {
