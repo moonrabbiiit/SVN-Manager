@@ -120,7 +120,7 @@ impl SvnApp {
     // ------------------------------------------------------------ 「回退到某个版本」窗口
 
     /// 回退确认窗口：这一步会改本地工作副本里的文件，所以第一下只把按钮换成「确认回退」，
-    /// 再点一次才真的执行。改动只落本地，不上服务器，所以不写「风险」而是把后果说清楚。
+    /// 再点一次才真的执行。窗口里不写操作手册，只留一句后果和目标路径。
     pub(crate) fn rollback_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.rollback.clone() else {
             return;
@@ -147,42 +147,17 @@ impl SvnApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(520.0)
+            .default_width(460.0)
             .default_pos(egui::pos2(420.0, 240.0))
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(format!(
-                        "把{scope}倒回 r{revision}：只改动本地工作副本，服务器上的东西一点没动。"
+                        "把{scope}倒回 r{revision}（本地 r{wc_rev} → r{revision}），只改本地工作副本，服务器不动。"
                     ))
                     .strong()
                     .size(13.0),
                 );
-                ui.label(
-                    RichText::new(format!(
-                        "· 命令是 svn merge -r HEAD:{revision}，结果是 M / A / D 一批本地改动，不提交就不进仓库\n\
-                         · 回退完先核对（主页「待提交 X 项」里逐个看差异），确认无误再由你自己上传\n\
-                         · 不想回退了就用「撤销修改」整个还原，本地改动一并清掉\n\
-                         · 和本地已有改动撞上时不中断：冲突先留下 .merge-* 文件，之后用「解决冲突」或 BC 手工合"
-                    ))
-                    .weak()
-                    .size(11.5),
-                );
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(if is_dir { "回退对象" } else { "回退文件" }).weak().size(12.0));
-                    ui.label(RichText::new(shown.as_str()).size(12.0).monospace());
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("本地当前版本").weak().size(12.0));
-                    ui.label(RichText::new(format!("r{wc_rev}")).size(12.0));
-                    ui.label(RichText::new("→").weak().size(12.0));
-                    ui.label(
-                        RichText::new(format!("r{revision}"))
-                            .strong()
-                            .size(12.5)
-                            .color(ink(ui, Color32::from_rgb(240, 190, 70))),
-                    );
-                });
+                ui.label(RichText::new(shown.as_str()).size(12.0).monospace());
                 if pending > 0 {
                     ui.label(
                         RichText::new(format!("该目录已有 {pending} 项待提交改动，回退会和它们合并"))

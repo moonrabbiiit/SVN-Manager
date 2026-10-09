@@ -958,7 +958,7 @@ impl SvnApp {
                                     .size(13.0),
                             );
                             ui.label(
-                                RichText::new("双击文件＝左右对比这一次提交对它的改动；行末「操作」里可看这个文件的提交记录，或把它回退到这一版")
+                                RichText::new("双击文件＝左右对比这一次提交对它的改动；指针停在文件行上，行末「操作」里可看这个文件的提交记录，或把它回退到这一版")
                                     .weak()
                                     .size(11.5),
                             );
@@ -1010,8 +1010,10 @@ impl SvnApp {
                                     }
                                     text
                                 });
-                                // 两枚按钮合成一枚「操作」。用 new_child 固定矩形挂上去，不用 put：
-                                // put 会推进外层光标，整列被顶得抖一下
+                                // 两枚按钮合成一枚「操作」，只在指针停在这一行时现身。用 new_child 固定
+                                // 矩形挂上去、不画 ≠ 不分配：控件每帧都要占住这个位，指针往下移进菜单时
+                                // 锚点才不会消失、浮层不会被自己关掉（put 会推进外层光标，整列跟着抖）
+                                let on_row = ui.rect_contains_pointer(row.response.rect);
                                 let menu_rect = egui::Rect::from_min_size(
                                     egui::pos2(
                                         row.response.rect.max.x - 62.0,
@@ -1019,12 +1021,15 @@ impl SvnApp {
                                     ),
                                     egui::vec2(56.0, 18.0),
                                 );
-                                let mut menu = ui.new_child(
-                                    egui::UiBuilder::new()
-                                        .id(egui::Id::new(("history_row_menu", path_index)))
-                                        .max_rect(menu_rect)
-                                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                                );
+                                let mut builder = egui::UiBuilder::new()
+                                    .id(egui::Id::new(("history_row_menu", path_index)))
+                                    .max_rect(menu_rect)
+                                    .layout(egui::Layout::right_to_left(egui::Align::Center))
+                                    .sense(egui::Sense::hover());
+                                if !on_row {
+                                    builder = builder.invisible();
+                                }
+                                let mut menu = ui.new_child(builder);
                                 // 用 Popup::menu 不用 ComboBox：ComboBox 的 width 连按钮本体一起撑宽，
                                 // 菜单要装下七个字的项，这一行就摆不下了
                                 let button = menu
@@ -1786,7 +1791,7 @@ mod tests {
         ))
     }
 
-    /// 临时探针用：跑一帧历史页，返回画出来的「文字 + 矩形」
+    /// 跑一帧历史页，返回画出来的「文字 + 矩形」；给了 click 就在这一帧按下鼠标左键
     fn painted_frame(
         ctx: &egui::Context,
         app: &mut crate::SvnApp,
@@ -1806,6 +1811,29 @@ mod tests {
         }
         let mut input = crate::testbed::base_input();
         input.events = events;
+        let mut out = ctx.run_ui(input, |ui| app.history_page(ui));
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_string(),
+                    item.shape.visual_bounding_rect(),
+                )),
+                _ => None,
+            })
+            .filter(|(text, _)| !text.trim().is_empty())
+            .collect()
+    }
+
+    /// 只把指针停在指定位置（不按下去）跑一帧：悬停才露出来的控件要靠它拿矩形
+    fn hover_frame(
+        ctx: &egui::Context,
+        app: &mut crate::SvnApp,
+        pos: egui::Pos2,
+    ) -> Vec<(String, egui::Rect)> {
+        let mut input = crate::testbed::base_input();
+        input.events = vec![egui::Event::PointerMoved(pos)];
         let mut out = ctx.run_ui(input, |ui| app.history_page(ui));
         out.textures_delta.clear();
         out.shapes
@@ -1861,30 +1889,37 @@ mod tests {
             frame.iter().find(|(text, _)| text == label).map(|(_, rect)| *rect)
         };
 
-        // 每行行末都有一枚「操作」，按「离哪一行文字最近」认领，别拿错上/下一行的
+        // 每行行末都有一枚「操作」，按「竖轴上离这行最近」认领：按钮贴在面板右缘，
+        // 横向差着六百多像素，用总距离比根本分不出上下两行
         let menu_of = |frame: &[(String, egui::Rect)], at: egui::Pos2| {
             frame
                 .iter()
                 .filter(|(text, _)| text == "操作")
                 .map(|(_, rect)| *rect)
                 .min_by(|a, b| {
-                    (a.center() - at)
-                        .length()
-                        .partial_cmp(&(b.center() - at).length())
+                    (a.center().y - at.y)
+                        .abs()
+                        .partial_cmp(&(b.center().y - at.y).abs())
                         .unwrap()
                 })
         };
 
-        // 点一下「操作」把菜单翻开：浮层是个 Area，要第二帧才画得出来
+        // 翻开某一行的「操作」并返回那一帧。五帧一个都不能省：
+        // 1 点别处关掉上一枚浮层；
+        // 2 关掉要晚一帧才见得到画面上：这一帧浮层还画着，它往下长正好盖住下面那行，
+        //   于是那一行这帧仍然不算被悬停，按钮画不出来；
+        // 3 再悬停一次，按钮这一帧才现身；
+        // 4 按下。egui 判定「这一下按在谁身上」用的是上一帧的控件表，所以按钮必须先
+        //   在上一帧画出来，悬停才现身的控件尤其吃这一条；
+        // 5 浮层是 Area，要再空跑一帧才画得出来。
         fn open_menu(
             ctx: &egui::Context,
             app: &mut crate::SvnApp,
             at: egui::Pos2,
         ) -> Vec<(String, egui::Rect)> {
-            // 先点一下别处收掉上一枚，再空跑一帧让它真的消失：菜单是往下长的，
-            // 正好盖住下一行的「操作」，不清干净这一点击就会被浮层吃掉
             painted_frame(ctx, app, Some(egui::pos2(4.0, 4.0)));
-            painted_frame(ctx, app, None);
+            hover_frame(ctx, app, at);
+            hover_frame(ctx, app, at);
             painted_frame(ctx, app, Some(at));
             painted_frame(ctx, app, None)
         }
@@ -1901,9 +1936,14 @@ mod tests {
         assert!(rect_of(&idle, "回退此文件").is_none(), "菜单没翻开不该画出菜单项");
         assert!(rect_of(&idle, "查看提交记录").is_none(), "菜单没翻开不该画出菜单项");
 
-        // 文件行末那枚「操作」：贴在最右边，不能压住路径文字
+        // 文件行末那枚「操作」只在指针停在这一行时才现身，且不能压住路径文字
         let path_text = rect_of(&idle, "/hrp/src/address.vue").expect("涉及文件要画出路径");
-        let menu = menu_of(&idle, path_text.center()).expect("文件行末该有「操作」");
+        assert!(
+            rect_of(&idle, "操作").is_none(),
+            "指针不在文件行上，不该画出「操作」"
+        );
+        let hovered = hover_frame(&ctx, &mut app, path_text.center());
+        let menu = menu_of(&hovered, path_text.center()).expect("悬停该露出「操作」");
         assert!(
             menu.min.x > path_text.max.x - 1.0,
             "「操作」盖住了路径文字：{menu:?} vs {path_text:?}"
@@ -1911,6 +1951,12 @@ mod tests {
         assert!(
             (menu.center().y - path_text.center().y).abs() < 12.0,
             "「操作」要跟这一行的文字齐平：{menu:?} vs {path_text:?}"
+        );
+        // 那一格是常驻占位的：现身不该把路径文字挤动半个像素
+        assert_eq!(
+            rect_of(&hovered, "/hrp/src/address.vue").expect("悬停后路径还在"),
+            path_text,
+            "悬停前后路径文字的位置变了，整列会跟着抖"
         );
 
         let opened = open_menu(&ctx, &mut app, menu.center());
@@ -1930,7 +1976,8 @@ mod tests {
 
         // 目录行同样有「操作」，但里面只有查看提交记录，不该多出回退那项
         let dir_text = rect_of(&idle, "/hrp/src").expect("目录行也要画出路径");
-        let dir_menu = menu_of(&idle, dir_text.center()).expect("目录行末也该有「操作」");
+        let hovered_dir = hover_frame(&ctx, &mut app, dir_text.center());
+        let dir_menu = menu_of(&hovered_dir, dir_text.center()).expect("悬停目录行该露出「操作」");
         let opened_dir = open_menu(&ctx, &mut app, dir_menu.center());
         assert!(
             rect_of(&opened_dir, "查看提交记录").is_some(),
