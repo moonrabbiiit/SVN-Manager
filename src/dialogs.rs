@@ -7,6 +7,18 @@ use crate::jobs::Kind;
 use crate::repo::fmt_rev;
 use crate::{update, APP_VERSION, Level, SvnApp, UploadAll, ink};
 
+/// 地址前缀改写：把 `current` 开头的 `from` 换成 `to`。两边都先掐掉尾部斜杠；
+/// from 是 current 的开头且 to 非空才改写，否则给 None（没有可显示的新地址）。
+/// 单目录与批量两个改地址窗口共用这一份口径
+pub(crate) fn rewrite_url(current: &str, from: &str, to: &str) -> Option<String> {
+    let from = from.trim().trim_end_matches('/');
+    let to = to.trim().trim_end_matches('/');
+    if from.is_empty() || to.is_empty() || !current.starts_with(from) {
+        return None;
+    }
+    Some(current.replacen(from, to, 1))
+}
+
 impl SvnApp {
     // ------------------------------------------------------------ 「修改仓库地址」窗口
 
@@ -52,11 +64,7 @@ impl SvnApp {
                 }
                 let from = dialog.from.trim().trim_end_matches('/');
                 let to = dialog.to.trim().trim_end_matches('/');
-                let new_url = if from.is_empty() || to.is_empty() || !current.starts_with(from) {
-                    String::new()
-                } else {
-                    current.replacen(from, to, 1)
-                };
+                let new_url = rewrite_url(&current, &dialog.from, &dialog.to).unwrap_or_default();
                 ui.add_space(5.0);
                 if new_url.is_empty() {
                     let tip = if to.is_empty() {
@@ -115,6 +123,227 @@ impl SvnApp {
             self.relocate = Some(dialog);
         } else {
             self.relocate = None;
+        }
+    }
+
+    // ------------------------------------------------------------ 「批量改地址」窗口
+
+    /// 服务器搬家时一次给多个目录改地址：共用一对地址前缀，每个目录各起一个
+    /// relocate 任务（同目录的并发约束由 spawn_relocate 把关，有任务在跑的跳过并计数）。
+    /// 会改写工作副本记录，所以第一下只把按钮换成确认
+    pub(crate) fn batch_relocate_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.batch_relocate.clone() else {
+            return;
+        };
+        // 窗口开着时目录列表可能增删：勾选状态跟着对齐，新出现的目录默认不勾
+        dialog.checked.resize(self.cfg.dirs.len(), false);
+        dialog.checked.truncate(self.cfg.dirs.len());
+        // from 变了就按新前缀重算一遍默认勾选：地址能对上的才勾
+        let from_now = dialog.from.trim().trim_end_matches('/').to_owned();
+        if from_now != dialog.last_from {
+            for (index, checked) in dialog.checked.iter_mut().enumerate() {
+                let url = self
+                    .dirs
+                    .get(index)
+                    .and_then(|view| view.info.as_ref())
+                    .map(|info| info.url.clone())
+                    .unwrap_or_default();
+                *checked = !from_now.is_empty() && url.starts_with(&from_now);
+            }
+            dialog.last_from = from_now;
+        }
+        // 每行一份快照：目录名、当前地址、改写结果（None = 改不动），Git 目录不参与
+        let rows: Vec<(String, String, Option<String>, bool)> = (0..self.cfg.dirs.len())
+            .map(|index| {
+                let url = self
+                    .dirs
+                    .get(index)
+                    .and_then(|view| view.info.clone())
+                    .map(|info| info.url)
+                    .unwrap_or_default();
+                let git = self.dir_kind(index) == crate::repo::RepoKind::Git;
+                let new_url = rewrite_url(&url, &dialog.from, &dialog.to);
+                (
+                    self.dir_label(index),
+                    url,
+                    new_url,
+                    git,
+                )
+            })
+            .collect();
+        let picked = rows
+            .iter()
+            .zip(dialog.checked.iter())
+            .filter(|((_, _, new_url, git), checked)| !*git && new_url.is_some() && **checked)
+            .count();
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("批量改地址")
+            .open(&mut open)
+            .default_width(760.0)
+            .default_pos(egui::pos2(380.0, 160.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "给勾选的目录逐个执行「修改仓库地址」：只改写工作副本记录的仓库地址，不会更新、也不会改动任何本地文件。",
+                    )
+                    .weak()
+                    .size(11.5),
+                );
+                ui.add_space(5.0);
+                ui.label(RichText::new("原地址前缀").strong().size(12.5));
+                let from_field = ui.add_sized(
+                    Vec2::new(560.0, 22.0),
+                    TextEdit::singleline(&mut dialog.from)
+                        .hint_text("要替换掉的地址开头，例如 http://192.168.1.251:8080/svn"),
+                );
+                if dialog.focus {
+                    from_field.request_focus();
+                    dialog.focus = false;
+                }
+                ui.label(RichText::new("新地址前缀").strong().size(12.5));
+                ui.add_sized(
+                    Vec2::new(560.0, 22.0),
+                    TextEdit::singleline(&mut dialog.to)
+                        .hint_text("新前缀，例如 https://svn.example.com/repo"),
+                );
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("参与改地址的目录").strong().size(12.5));
+                    if ui.button("全选").clicked() {
+                        for (index, checked) in dialog.checked.iter_mut().enumerate() {
+                            *checked = rows
+                                .get(index)
+                                .is_some_and(|(_, _, new_url, git)| new_url.is_some() && !*git);
+                        }
+                    }
+                    if ui.button("全不选").clicked() {
+                        dialog.checked.iter_mut().for_each(|checked| *checked = false);
+                    }
+                    if picked == 0 {
+                        ui.label(RichText::new("没有可改写的目录").weak().size(11.5));
+                    }
+                });
+                ScrollArea::vertical()
+                    .id_salt("batch_relocate_dirs")
+                    .max_height(220.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, (label, url, new_url, git)) in rows.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let can = !git && new_url.is_some();
+                                let mut checked = dialog.checked.get(index).copied().unwrap_or(false);
+                                if ui
+                                    .add_enabled(can, egui::Checkbox::new(&mut checked, ""))
+                                    .on_hover_text("勾选参与本次批量改地址")
+                                    .changed()
+                                {
+                                    dialog.checked[index] = checked;
+                                }
+                                ui.label(RichText::new(label).size(12.5).strong());
+                                match (*git, new_url) {
+                                    (true, _) => {
+                                        ui.label(
+                                            RichText::new("Git 目录不支持")
+                                                .size(11.5)
+                                                .color(ink(ui, Color32::from_gray(130))),
+                                        );
+                                    }
+                                    (false, Some(new)) => {
+                                        ui.label(RichText::new(url).size(11.5).monospace().weak());
+                                        ui.label(RichText::new("→").size(11.5).weak());
+                                        ui.label(
+                                            RichText::new(new)
+                                                .size(11.5)
+                                                .monospace()
+                                                .color(ink(ui, Color32::from_rgb(80, 200, 120))),
+                                        );
+                                    }
+                                    (false, None) if url.is_empty() => {
+                                        ui.label(
+                                            RichText::new("未检测，没有地址")
+                                                .size(11.5)
+                                                .color(ink(ui, Color32::from_gray(130))),
+                                        );
+                                    }
+                                    (false, None) => {
+                                        ui.label(RichText::new(url).size(11.5).monospace().weak());
+                                        ui.label(
+                                            RichText::new("前缀不匹配")
+                                                .size(11.5)
+                                                .color(ink(ui, Color32::from_rgb(240, 100, 100))),
+                                        );
+                                    }
+                                }
+                                if self.pool.is_busy(index) {
+                                    ui.spinner();
+                                    ui.label(RichText::new("有任务在跑，本次跳过").weak().size(11.5));
+                                }
+                            });
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let ready = picked > 0;
+                    if dialog.confirm {
+                        let button = egui::Button::new(
+                            RichText::new(format!("确认改地址？{picked} 个目录"))
+                                .strong()
+                                .color(Color32::from_rgb(255, 240, 240)),
+                        )
+                        .fill(Color32::from_rgb(150, 60, 60));
+                        if ui.add_enabled(ready, button).clicked() {
+                            let from = dialog.from.trim().trim_end_matches('/').to_owned();
+                            let to = dialog.to.trim().trim_end_matches('/').to_owned();
+                            let mut done = 0;
+                            let mut skipped = 0;
+                            for (index, (_, _, new_url, git)) in rows.iter().enumerate() {
+                                let Some(new_url) = new_url else {
+                                    continue;
+                                };
+                                if *git || !dialog.checked.get(index).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                if self.pool.is_busy(index) {
+                                    skipped += 1;
+                                    continue;
+                                }
+                                self.spawn_relocate(index, from.clone(), to.clone(), new_url.clone());
+                                done += 1;
+                            }
+                            let mut text = format!("批量改地址：已为 {done} 个目录发起改地址");
+                            if skipped > 0 {
+                                text.push_str(&format!("，{skipped} 个因有任务在跑被跳过"));
+                            }
+                            self.push(Level::Info, text);
+                            close = true;
+                        }
+                        if ui.button("先不改").clicked() {
+                            dialog.confirm = false;
+                        }
+                    } else if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(RichText::new(format!("改地址（{picked} 个目录）")).strong()),
+                        )
+                        .clicked()
+                    {
+                        dialog.confirm = true;
+                        self.hint("每个目录会单独执行一次改地址：核对上面的预览后，再点一次「确认改地址」");
+                    }
+                    if picked == 0 && !rows.is_empty() {
+                        ui.label(
+                            RichText::new("填好一对前缀，把地址以「原地址前缀」开头的目录勾上")
+                                .weak()
+                                .size(11.5),
+                        );
+                    }
+                });
+            });
+        if open && !close {
+            self.batch_relocate = Some(dialog);
+        } else {
+            self.batch_relocate = None;
         }
     }
 
@@ -743,5 +972,47 @@ impl SvnApp {
         // 关窗口这件事统一在这里收口：在按钮里改 self.show_update_confirm 会被下面这行
         // 按旧的 open 覆盖回去，窗口关不掉（点「稍后再说」等于没点）
         self.show_update_confirm = open && !later;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 正常改写：只有以 from 开头的地址才换前缀，剩下的尾巴原样保留
+    #[test]
+    fn rewrite_url_swaps_only_the_prefix() {
+        assert_eq!(
+            rewrite_url(
+                "http://192.168.1.251:8080/svn/hrp",
+                "http://192.168.1.251:8080/svn",
+                "https://svn.example.com/repo",
+            )
+            .as_deref(),
+            Some("https://svn.example.com/repo/hrp")
+        );
+    }
+
+    /// 两头多打的斜杠不该算进前缀
+    #[test]
+    fn rewrite_url_trims_trailing_slashes() {
+        assert_eq!(
+            rewrite_url("http://old/svn/hrp", "http://old/svn/", "https://new/repo/").as_deref(),
+            Some("https://new/repo/hrp")
+        );
+    }
+
+    /// 改不动的三种情况：前缀不是开头、新前缀为空、旧前缀为空；
+    /// 中段出现同样不算前缀
+    #[test]
+    fn rewrite_url_rejects_bad_input() {
+        assert_eq!(
+            rewrite_url("http://old/hrp", "http://other", "https://new"),
+            None,
+            "前缀不是当前地址的开头"
+        );
+        assert_eq!(rewrite_url("http://old/hrp", "http://old", ""), None, "新前缀为空");
+        assert_eq!(rewrite_url("http://old/hrp", "", "https://new"), None, "旧前缀为空");
+        assert_eq!(rewrite_url("http://a/b", "b", "c"), None, "中段出现不算前缀");
     }
 }

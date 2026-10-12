@@ -79,8 +79,15 @@ impl SvnApp {
             edit_filter: None,
             filter_buf: String::new(),
             filter_focus: false,
+            edit_group: None,
+            group_buf: String::new(),
+            group_focus: false,
+            edit_tag: None,
+            tag_buf: String::new(),
+            tag_focus: false,
             relocate: None,
             upload_all: None,
+            batch_relocate: None,
             rollback: None,
             svn_user: String::new(),
             user_probed: false,
@@ -761,6 +768,7 @@ impl eframe::App for SvnApp {
         self.settings(&ctx);
         self.update_confirm_dialog(&ctx);
         self.relocate_dialog(&ctx);
+        self.batch_relocate_dialog(&ctx);
         self.rollback_dialog(&ctx);
         self.upload_all_dialog(&ctx);
         self.file_diff_window(&ctx);

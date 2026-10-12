@@ -1510,7 +1510,9 @@ impl SvnApp {
             return;
         }
         let label = std::mem::take(&mut self.new_label);
-        self.cfg.dirs.push(DirConfig { path: clean.clone(), label, bc_target: String::new(), bc_filter: String::new() });
+        self.cfg
+            .dirs
+            .push(DirConfig { path: clean.clone(), label, ..Default::default() });
         self.sync_views();
         self.selected = Some(self.cfg.dirs.len() - 1);
         self.new_path.clear();
@@ -1522,6 +1524,8 @@ impl SvnApp {
     pub fn remove_directory(&mut self, index: usize) {
         self.edit_label = None;
         self.edit_filter = None;
+        self.edit_group = None;
+        self.edit_tag = None;
         if index >= self.cfg.dirs.len() {
             return;
         }
@@ -1556,6 +1560,8 @@ impl SvnApp {
         self.selected = Some(target);
         self.edit_label = None;
         self.edit_filter = None;
+        self.edit_group = None;
+        self.edit_tag = None;
         self.persist();
     }
 

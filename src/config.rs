@@ -14,6 +14,12 @@ pub struct DirConfig {
     /// 文件夹对比的名称筛选（如 `-*.iml;-*.classpath`），由本程序自己保存，
     /// 不再依赖本机 Beyond Compare 的对比记录，换台机器、换个人也能一致地带出
     pub bc_filter: String,
+    /// 手动分组名，空 = 未分组（列表里不画组标题）
+    pub group: String,
+    /// 目录标记的文字，空 = 无标记
+    pub tag: String,
+    /// 标记颜色，形如 "#RRGGBB"；空或解析失败时按默认蓝 #5AA0F0 显示
+    pub tag_color: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -64,6 +70,8 @@ pub struct Config {
     pub ai_model: String,
     /// AI 生成工作日志：口吻说明（生成窗口打开时预填进输入框，随改随存）
     pub ai_tone: String,
+    /// 主页里收起的分组名列表（按名字记，组删了残留也无害）
+    pub collapsed_groups: Vec<String>,
 }
 
 impl Default for Config {
@@ -101,6 +109,8 @@ impl Default for Config {
             ai_key: String::new(),
             ai_model: String::new(),
             ai_tone: String::new(),
+            // 分组默认全展开：组名一个都不在折叠列表里
+            collapsed_groups: Vec::new(),
         }
     }
 }
@@ -196,5 +206,28 @@ mod tests {
             serde_json::from_str(r#"{"ui_font":"微软雅黑","ui_scale":"大"}"#).unwrap();
         assert_eq!(picked.ui_font, "微软雅黑");
         assert_eq!(picked.ui_scale, "大");
+        // 分组 / 标记是后加的目录属性：老配置没有要按空值补齐（未分组、无标记）
+        assert!(parsed.dirs[0].group.is_empty());
+        assert!(parsed.dirs[0].tag.is_empty());
+        assert!(parsed.dirs[0].tag_color.is_empty());
+        // 分组折叠列表是后加的全局设置：老配置没有要按空列表补齐
+        assert!(parsed.collapsed_groups.is_empty());
+    }
+
+    /// 分组 / 标记字段要能原样写回再读出（往返不丢）。
+    #[test]
+    fn group_and_tag_fields_roundtrip() {
+        let text = r##"{"svn_exe":"svn","collapsed_groups":["生产","测试"],"dirs":[
+            {"path":"D:\\a","label":"A","group":"生产","tag":"冻结","tag_color":"#FF8040"},
+            {"path":"D:\\b","label":"B"}
+        ]}"##;
+        let parsed: Config = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed.dirs[0].group, "生产");
+        assert_eq!(parsed.dirs[0].tag, "冻结");
+        assert_eq!(parsed.dirs[0].tag_color, "#FF8040");
+        assert!(parsed.dirs[1].group.is_empty());
+        assert_eq!(parsed.collapsed_groups, vec!["生产".to_owned(), "测试".to_owned()]);
+        let back: Config = serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back, parsed);
     }
 }

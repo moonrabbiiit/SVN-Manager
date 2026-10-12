@@ -41,7 +41,7 @@ use crate::svn::{Svn, WcInfo};
 // 通用绘制工具搬到 ui.rs，这里转出一层，history / commit / stats 里的 crate::ink 照旧可用
 pub use ui::{highlight, highlight_with, ink, Search};
 
-pub const APP_TITLE: &str = "SVN 管理器";
+pub const APP_TITLE: &str = "仓库管理器";
 /// 程序版本号，由 build.rs 从根目录 version.txt 注入；发布新版本时只改那个文件
 pub const APP_VERSION: &str = env!("SVN_MANAGER_VERSION");
 
@@ -94,6 +94,23 @@ pub struct UploadAll {
     pub checked: Vec<bool>,
     /// 正在查看「待提交明细」的目录（None = 明细窗口关着）
     pub detail: Option<usize>,
+}
+
+/// 「批量改地址」窗口状态：多个目录共用一对前缀，各自起一个改地址任务。
+#[derive(Clone, Default)]
+pub struct BatchRelocate {
+    /// 要替换掉的旧地址前缀
+    pub from: String,
+    /// 新地址前缀
+    pub to: String,
+    /// 每个目录是否参与本次批量改地址（与 cfg.dirs 对齐）
+    pub checked: Vec<bool>,
+    /// from 上一次的值：变了就按新前缀重算一遍默认勾选
+    pub last_from: String,
+    /// 打开时抢一下 from 输入框的焦点
+    pub focus: bool,
+    /// 第一下只是把按钮变成「确认」，再点一次才真的发任务
+    pub confirm: bool,
 }
 
 /// 「回退到某个版本」确认窗口：把整个目录或单个文件倒回所选版本，改动先落在本地。
@@ -221,10 +238,20 @@ pub struct SvnApp {
     pub edit_filter: Option<usize>,
     pub filter_buf: String,
     pub filter_focus: bool,
+    /// 正在修改分组的目录行
+    pub edit_group: Option<usize>,
+    pub group_buf: String,
+    pub group_focus: bool,
+    /// 正在修改标记的目录行
+    pub edit_tag: Option<usize>,
+    pub tag_buf: String,
+    pub tag_focus: bool,
     /// 正在修改仓库地址的目录（None = 窗口关闭）
     pub relocate: Option<Relocate>,
     /// 正在批量上传的目录清单（None = 窗口关闭）
     pub upload_all: Option<UploadAll>,
+    /// 「批量改地址」窗口（None = 窗口关闭）
+    pub batch_relocate: Option<BatchRelocate>,
     /// 正在确认的版本回退（None = 窗口关闭）
     pub rollback: Option<Rollback>,
     pub show_settings: bool,

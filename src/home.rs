@@ -46,6 +46,47 @@ fn capped(count: usize) -> String {
     }
 }
 
+/// 标记胶囊的默认颜色：配置里没存颜色或颜色读不出来时用它
+const DEFAULT_TAG: Color32 = Color32::from_rgb(90, 160, 240);
+
+/// 配置里的 "#RRGGBB" → 颜色；空或解析失败回退默认蓝
+pub fn parse_tag_color(hex: &str) -> Color32 {
+    let text = hex.trim().trim_start_matches('#');
+    if text.len() == 6 {
+        if let Ok(value) = u32::from_str_radix(text, 16) {
+            return Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8);
+        }
+    }
+    DEFAULT_TAG
+}
+
+/// 目录标记胶囊的颜色：按配置里的 tag_color 解析，读不出来就是默认蓝
+pub fn tag_color(dir: &crate::config::DirConfig) -> Color32 {
+    parse_tag_color(&dir.tag_color)
+}
+
+/// 取色器要的 [r, g, b]（0..255，同 egui 的 color_edit_button_srgb）
+pub fn tag_color_rgb(hex: &str) -> [u8; 3] {
+    let [r, g, b, _] = parse_tag_color(hex).to_array();
+    [r, g, b]
+}
+
+/// 取色器吐出的 [r, g, b] 写回配置里的 "#RRGGBB"
+pub fn tag_color_hex(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+/// 标记胶囊：描边与文字同色，颜色在「修改标记」的取色器里选
+fn tag_pill(ui: &mut Ui, text: &str, color: Color32) {
+    Frame::new()
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(9.0)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(11.5).color(color));
+        });
+}
+
 impl SvnApp {
     // ------------------------------------------------------------ 主页面
 
@@ -105,6 +146,16 @@ impl SvnApp {
                         .size(12.5)
                         .color(ui.visuals().weak_text_color()),
                 );
+                // 分组编辑器画在路径后面（「更多 → 设置分组」打开）
+                if self.edit_group == Some(index) {
+                    self.group_editor(ui, index);
+                }
+                // 目录标记胶囊：路径后面、待提交计数之前；正在编辑时换成编辑行
+                if self.edit_tag == Some(index) {
+                    self.tag_editor(ui, index);
+                } else if !dir.tag.is_empty() {
+                    tag_pill(ui, &dir.tag, ink(ui, tag_color(&dir)));
+                }
                 let changed_before = view.changed.is_some();
                 if let Some(changed) = view.changed {
                     if changed > 0 {
@@ -362,6 +413,34 @@ impl SvnApp {
             self.label_focus = true;
             ui.close();
         }
+        if ui
+            .button(if self.cfg.dirs[index].group.is_empty() {
+                "设置分组"
+            } else {
+                "修改分组"
+            })
+            .on_hover_text("给目录归个堆：同名分组的目录在列表里共用一个可折叠的标题（留空取消分组）")
+            .clicked()
+        {
+            self.edit_group = Some(index);
+            self.group_buf = self.cfg.dirs[index].group.clone();
+            self.group_focus = true;
+            ui.close();
+        }
+        if ui
+            .button(if self.cfg.dirs[index].tag.is_empty() {
+                "设置标记"
+            } else {
+                "修改标记"
+            })
+            .on_hover_text("给目录挂一个自己认得的记号：一段文字加一个自选颜色（文字留空即清除标记）")
+            .clicked()
+        {
+            self.edit_tag = Some(index);
+            self.tag_buf = self.cfg.dirs[index].tag.clone();
+            self.tag_focus = true;
+            ui.close();
+        }
         // 仓库地址 / 清理 / 解决冲突是 SVN 工作副本的概念，Git 目录没有对应操作，直接不出现
         if !git
             && ui
@@ -528,6 +607,86 @@ impl SvnApp {
         });
     }
 
+    /// 分组输入框：详细模式画在目录行的路径后面，简约模式画在列表上方那一行。
+    /// Enter 或点别处提交，Esc 取消，留空取消分组（交互同别名编辑）
+    fn group_editor(&mut self, ui: &mut Ui, index: usize) {
+        let field = ui.add(
+            TextEdit::singleline(&mut self.group_buf)
+                .id_salt(("dir_group", index))
+                .desired_width(160.0)
+                .hint_text("分组，留空取消分组"),
+        );
+        if self.group_focus {
+            field.request_focus();
+            self.group_focus = false;
+        }
+        let enter = field.has_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        let esc = field.has_focus() && ui.input(|i| i.key_pressed(Key::Escape));
+        if esc {
+            self.edit_group = None;
+            self.hint("已取消修改分组");
+        } else if enter || field.lost_focus() {
+            let text = self.group_buf.trim().to_owned();
+            self.edit_group = None;
+            if self.cfg.dirs[index].group != text {
+                self.cfg.dirs[index].group.clone_from(&text);
+                self.persist();
+                let label = self.dir_label(index);
+                self.hint(if text.is_empty() {
+                    format!("已取消 {label} 的分组")
+                } else {
+                    format!("{label} 已归入分组：{text}")
+                });
+            }
+        }
+    }
+
+    /// 标记编辑行：一段文字 + 一枚 RGB 取色按钮（egui 自带的取色弹层：RGB / HSV 滑块与
+    /// hex 输入）。位置同分组编辑器；文字清空时把颜色一起清掉，下次设置标记从头选
+    fn tag_editor(&mut self, ui: &mut Ui, index: usize) {
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                TextEdit::singleline(&mut self.tag_buf)
+                    .id_salt(("dir_tag", index))
+                    .desired_width(140.0)
+                    .hint_text("留空清除"),
+            );
+            // 取色按钮只在有标记文字时才写回配置：没有文字的标记不显示，颜色存着也是死数据
+            let current = self.cfg.dirs[index].tag_color.clone();
+            let mut rgb = tag_color_rgb(&current);
+            let picked = ui.color_edit_button_srgb(&mut rgb);
+            if picked.changed() && !self.cfg.dirs[index].tag.trim().is_empty() {
+                self.cfg.dirs[index].tag_color = tag_color_hex(rgb);
+                self.persist();
+            }
+            if self.tag_focus {
+                field.request_focus();
+                self.tag_focus = false;
+            }
+            let enter = field.has_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let esc = field.has_focus() && ui.input(|i| i.key_pressed(Key::Escape));
+            if esc {
+                self.edit_tag = None;
+                self.hint("已取消修改标记");
+            } else if enter || field.lost_focus() {
+                let text = self.tag_buf.trim().to_owned();
+                self.edit_tag = None;
+                if self.cfg.dirs[index].tag != text {
+                    self.cfg.dirs[index].tag.clone_from(&text);
+                    if text.is_empty() {
+                        self.cfg.dirs[index].tag_color.clear();
+                    }
+                    self.persist();
+                }
+                self.hint(if text.is_empty() {
+                    "已清除标记".to_owned()
+                } else {
+                    format!("标记已改为：{text}")
+                });
+            }
+        });
+    }
+
     /// 主页最右侧的样式切换器：两个选项同在一只圆角长方形里，当前那项被一个框圈住。
     /// 这个 egui 分支既没有 Switch 也没有 SelectableLabel，整只手画。
     fn compact_switch(&mut self, ui: &mut Ui) {
@@ -627,9 +786,39 @@ impl SvnApp {
                 });
             ui.add_space(4.0);
         }
+        if let Some(index) = self.edit_group.filter(|i| *i < total) {
+            let label = self.dir_label(index);
+            Frame::new()
+                .inner_margin(6.0)
+                .corner_radius(6.0)
+                .fill(fill)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("修改分组 · {label}：")).size(12.0));
+                        self.group_editor(ui, index);
+                    });
+                });
+            ui.add_space(4.0);
+        }
+        if let Some(index) = self.edit_tag.filter(|i| *i < total) {
+            let label = self.dir_label(index);
+            Frame::new()
+                .inner_margin(6.0)
+                .corner_radius(6.0)
+                .fill(fill)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("修改标记 · {label}：")).size(12.0));
+                        self.tag_editor(ui, index);
+                    });
+                });
+            ui.add_space(4.0);
+        }
     }
 
-    /// 简约形态的网格：列数按可用宽度算，一横行一横行地摆正方形卡片
+    /// 简约形态的网格：列数按可用宽度算，一横行一横行地摆正方形卡片。
+    /// 分组标题独占一整行：先把目录摆成「标题 / 卡片」的可见序列（收起的组整段跳过），
+    /// 再按列数流式铺开
     fn dir_cards(&mut self, ui: &mut Ui) {
         let gap = 10.0;
         let cols = (((ui.available_width() + gap) / (CARD_SIZE + gap)).floor() as usize).max(1);
@@ -637,33 +826,94 @@ impl SvnApp {
             .id_salt("dir_cards")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let total = self.cfg.dirs.len();
-                let mut start = 0;
-                while start < total {
-                    ui.horizontal(|ui| {
-                        for offset in 0..cols {
-                            let index = start + offset;
-                            // 行内「移除」会当场缩短 cfg.dirs，每格都重新比一次上界
-                            if index >= total {
-                                break;
+                ui.spacing_mut().item_spacing.y = gap;
+                let mut index = 0;
+                let mut row: Vec<usize> = Vec::new();
+                while index < self.cfg.dirs.len() {
+                    let group = self.cfg.dirs[index].group.trim().to_owned();
+                    if !group.is_empty() {
+                        let prev = if index == 0 {
+                            String::new()
+                        } else {
+                            self.cfg.dirs[index - 1].group.trim().to_owned()
+                        };
+                        if group != prev {
+                            // 标题独占一整行：先收掉手里没铺满的横行
+                            if !row.is_empty() {
+                                self.card_row(ui, &row, gap);
+                                row.clear();
                             }
-                            let (clicked, double_clicked) = self.dir_card(ui, index);
-                            if clicked {
-                                self.selected = Some(index);
-                                self.confirm_remove = None;
-                            }
-                            if double_clicked {
-                                self.open_folder(index);
-                            }
-                            if offset + 1 < cols && index + 1 < total {
-                                ui.add_space(gap);
+                            let count = self.cfg.dirs[index..]
+                                .iter()
+                                .take_while(|d| d.group.trim() == group)
+                                .count();
+                            if self.group_header(ui, &group, count) {
+                                index += count;
+                                continue;
                             }
                         }
-                    });
-                    ui.add_space(gap);
-                    start += cols;
+                    }
+                    row.push(index);
+                    if row.len() == cols {
+                        self.card_row(ui, &row, gap);
+                        row.clear();
+                    }
+                    index += 1;
+                }
+                if !row.is_empty() {
+                    self.card_row(ui, &row, gap);
                 }
             });
+    }
+
+    /// 摆一横行卡片。行内「移除」会当场缩短 cfg.dirs，每格都重新比一次上界
+    fn card_row(&mut self, ui: &mut Ui, row: &[usize], gap: f32) {
+        ui.horizontal(|ui| {
+            for (offset, &index) in row.iter().enumerate() {
+                if index >= self.cfg.dirs.len() {
+                    break;
+                }
+                let (clicked, double_clicked) = self.dir_card(ui, index);
+                if clicked {
+                    self.selected = Some(index);
+                    self.confirm_remove = None;
+                }
+                if double_clicked {
+                    self.open_folder(index);
+                }
+                if offset + 1 < row.len() && index + 1 < self.cfg.dirs.len() {
+                    ui.add_space(gap);
+                }
+            }
+        });
+    }
+
+    /// 目录列表里的分组标题：`▼ 组名（n）`，点一下收起 / 展开（收起状态记进配置）。
+    /// 返回 true = 该组当前收着，调用方应跳过整段目录行
+    fn group_header(&mut self, ui: &mut Ui, group: &str, count: usize) -> bool {
+        let collapsed = self.cfg.collapsed_groups.iter().any(|g| g == group);
+        let title = format!("{} {group}（{count}）", if collapsed { "▶" } else { "▼" });
+        let hit = ui
+            .add(
+                egui::Label::new(
+                    RichText::new(&title)
+                        .strong()
+                        .size(13.0)
+                        .color(ink(ui, Color32::from_rgb(140, 205, 255))),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text(if collapsed { "点击展开这一组" } else { "点击收起这一组" })
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if hit.clicked() {
+            if collapsed {
+                self.cfg.collapsed_groups.retain(|g| g != group);
+            } else {
+                self.cfg.collapsed_groups.push(group.to_owned());
+            }
+            self.persist();
+        }
+        collapsed
     }
 
     /// 简约形态下的一张卡片：圆角正方形，检测状态灯在左上、目录名称在正中、
@@ -730,6 +980,28 @@ impl SvnApp {
             egui::Rect::from_center_size(rect.center(), Vec2::new(inner.width() - 8.0, 26.0)),
             egui::Label::new(RichText::new(&label).strong().size(13.5)).truncate(),
         );
+        // 标记胶囊画在名称正下方：不占右上角徽标带，免得和忙碌转圈抢位
+        let tag = self.cfg.dirs[index].tag.clone();
+        if !tag.is_empty() {
+            let color = ink(ui, tag_color(&self.cfg.dirs[index]));
+            let pill_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.center().y + 17.0),
+                Vec2::new(inner.width() - 16.0, 18.0),
+            );
+            let mut pill = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(pill_rect)
+                    .layout(Layout::top_down(Align::Center))
+                    .sense(egui::Sense::hover()),
+            );
+            Frame::new()
+                .stroke(egui::Stroke::new(1.0, color))
+                .corner_radius(9.0)
+                .inner_margin(egui::Margin::symmetric(5, 1))
+                .show(&mut pill, |ui| {
+                    ui.label(RichText::new(&tag).size(11.5).color(color));
+                });
+        }
         if busy {
             // 加载只留一枚转圈：卡片地方小，任务文字挤在名称上面不好看，进度看边框颜色就够了。
             // 颜色显式给：跟着主题走的话浅色底上那圈几乎看不见
@@ -1089,6 +1361,17 @@ impl SvnApp {
                     detail: None,
                 });
             }
+            if ui
+                .button("批量改地址")
+                .on_hover_text("服务器搬家时，一次把多个目录的仓库地址前缀一起换掉（每个目录单独起任务，需再点一次确认）")
+                .clicked()
+            {
+                self.batch_relocate = Some(crate::BatchRelocate {
+                    focus: true,
+                    checked: vec![false; self.cfg.dirs.len()],
+                    ..Default::default()
+                });
+            }
             // 子布局从右往左排，切换器才能顶在这一行的最右侧
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.compact_switch(ui);
@@ -1112,9 +1395,28 @@ impl SvnApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 5.0;
-                // 行内「移除」会当场修改 cfg.dirs，因此每轮都重新取长度，避免越界
+                // 分组标题按连续段插：与上一行的组名不同的非空组名 → 先画一枚标题，
+                // 收起的组整段跳过。不重排——上移 / 下移仍是顺序的唯一权威
                 let mut index = 0;
                 while index < self.cfg.dirs.len() {
+                    let group = self.cfg.dirs[index].group.trim().to_owned();
+                    if !group.is_empty() {
+                        let prev = if index == 0 {
+                            String::new()
+                        } else {
+                            self.cfg.dirs[index - 1].group.trim().to_owned()
+                        };
+                        if group != prev {
+                            let count = self.cfg.dirs[index..]
+                                .iter()
+                                .take_while(|d| d.group.trim() == group)
+                                .count();
+                            if self.group_header(ui, &group, count) {
+                                index += count;
+                                continue;
+                            }
+                        }
+                    }
                     // 整行可点选中：scope 的点击感应区注册在行内所有控件之下，
                     // 因此行内按钮、菜单依旧优先命中，不会被抢走；
                     // 用固定 id 保证这一行的感应区每帧都是同一个控件（目录顺序变化也不影响）
@@ -1748,5 +2050,126 @@ mod tests {
                 assert!(jumps.is_empty(), "{theme:?}：鼠标停在{name}上时尺寸变了 {jumps:?}");
             }
         }
+    }
+
+    /// 标记颜色的解析：合法 hex 原样取色，没存 / 坏值 / 长度不对都回退默认蓝；
+    /// 取色器的往返是 u8 进、"#RRGGBB" 出
+    #[test]
+    fn tag_color_parsing_falls_back_to_default_blue() {
+        let mut dir = config::DirConfig::default();
+        assert_eq!(tag_color(&dir), Color32::from_rgb(90, 160, 240), "没存颜色按默认蓝");
+        dir.tag_color = "#FF8040".to_owned();
+        assert_eq!(tag_color(&dir), Color32::from_rgb(0xFF, 0x80, 0x40));
+        dir.tag_color = "bad!!".to_owned();
+        assert_eq!(tag_color(&dir), Color32::from_rgb(90, 160, 240), "坏值也按默认蓝");
+        dir.tag_color = "#12345".to_owned();
+        assert_eq!(tag_color(&dir), Color32::from_rgb(90, 160, 240), "长度不对也算坏值");
+        dir.tag_color = "  #5AA0F0  ".to_owned();
+        assert_eq!(tag_color(&dir), Color32::from_rgb(90, 160, 240), "两侧空白与 # 都要能容忍");
+        assert_eq!(tag_color_hex([0x12, 0x34, 0xAB]), "#1234AB");
+        assert_eq!(tag_color_rgb("#1234AB"), [0x12, 0x34, 0xAB]);
+    }
+
+    /// 详细模式：连续同组名共享一枚可折叠标题，收起后整段目录行都不画，
+    /// 未分组的行不受影响
+    #[test]
+    fn group_header_renders_and_collapses_detailed_rows() {
+        let mut stage = Stage::new(false);
+        stage.app.cfg.dirs[0].group = "生产".to_owned();
+        stage.app.cfg.dirs[1].group = "生产".to_owned();
+        let texts = stage.step(None);
+        assert!(
+            Stage::rect_of(&texts, "▼ 生产（2）").is_some(),
+            "展开状态该画「▼ 生产（2）」，实际有：{:?}",
+            texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        assert!(Stage::rect_of(&texts, "HRP").is_some(), "组里的行照常画");
+        assert!(Stage::rect_of(&texts, "empty").is_some(), "未分组的行不受影响");
+
+        stage.app.cfg.collapsed_groups = vec!["生产".to_owned()];
+        let texts = stage.step(None);
+        assert!(Stage::rect_of(&texts, "▶ 生产（2）").is_some(), "收起状态标题还在");
+        assert!(Stage::rect_of(&texts, "HRP").is_none(), "收起的组整段不画");
+        assert!(Stage::rect_of(&texts, "CRM").is_none(), "同组第二行也不画");
+        assert!(Stage::rect_of(&texts, "empty").is_some(), "未分组的行照常画");
+    }
+
+    /// 点一下标题就收起、再点一下就展开，收起状态写进配置文件
+    #[test]
+    fn clicking_group_header_toggles_and_persists() {
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("svn_manager_group_toggle_test"),
+        );
+        let mut stage = Stage::new(false);
+        stage.app.cfg.dirs[0].group = "生产".to_owned();
+        stage.app.cfg.dirs[1].group = "生产".to_owned();
+        let texts = stage.step(None);
+        let header = Stage::rect_of(&texts, "▼ 生产（2）").expect("先画出展开的标题");
+        stage.step(Some(header.center()));
+        assert!(
+            stage
+                .app
+                .cfg
+                .collapsed_groups
+                .iter()
+                .any(|group| group == "生产"),
+            "点一下该记进折叠列表"
+        );
+        let saved = std::fs::read_to_string(config::config_file()).unwrap_or_default();
+        assert!(saved.contains("collapsed_groups"), "折叠状态要写进配置文件");
+        let texts = stage.step(None);
+        assert!(Stage::rect_of(&texts, "▶ 生产（2）").is_some(), "收起后标题换成 ▶");
+        assert!(Stage::rect_of(&texts, "HRP").is_none(), "收起后行不画");
+
+        let header = Stage::rect_of(&texts, "▶ 生产（2）").expect("收起状态的标题");
+        stage.step(Some(header.center()));
+        assert!(
+            stage.app.cfg.collapsed_groups.is_empty(),
+            "再点一下该从折叠列表里移除"
+        );
+        let texts = stage.step(None);
+        assert!(Stage::rect_of(&texts, "HRP").is_some(), "展开后行回来了");
+    }
+
+    /// 标记胶囊：详细行画在路径后面，简约卡片画在名称正下方
+    #[test]
+    fn tag_pill_shows_in_detailed_row_and_compact_card() {
+        let mut detailed = Stage::new(false);
+        detailed.app.cfg.dirs[0].tag = "冻结".to_owned();
+        let texts = detailed.step(None);
+        assert!(
+            Stage::rect_of(&texts, "冻结").is_some(),
+            "详细行该画得出标记胶囊，实际有：{:?}",
+            texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+
+        let mut compact = Stage::new(true);
+        compact.app.cfg.dirs[0].tag = "冻结".to_owned();
+        let texts = compact.step(None);
+        assert!(
+            Stage::rect_of(&texts, "冻结").is_some(),
+            "卡片上该画得出标记胶囊，实际有：{:?}",
+            texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// 简约形态：分组标题独占一整行，收起的组整段跳过
+    #[test]
+    fn compact_grid_gives_group_headers_their_own_row() {
+        let mut stage = Stage::new(true);
+        stage.app.cfg.dirs[0].group = "生产".to_owned();
+        stage.app.cfg.dirs[1].group = "生产".to_owned();
+        let texts = stage.step(None);
+        assert!(
+            Stage::rect_of(&texts, "▼ 生产（2）").is_some(),
+            "卡片网格里也要有组标题，实际有：{:?}",
+            texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        stage.app.cfg.collapsed_groups = vec!["生产".to_owned()];
+        let texts = stage.step(None);
+        assert!(Stage::rect_of(&texts, "▶ 生产（2）").is_some());
+        assert!(Stage::rect_of(&texts, "HRP").is_none(), "收起的组卡片不画");
+        assert!(Stage::rect_of(&texts, "empty").is_some(), "未分组的卡片照常画");
     }
 }
