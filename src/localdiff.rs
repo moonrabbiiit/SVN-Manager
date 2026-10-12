@@ -103,9 +103,10 @@ impl Excludes {
     /// 而 BC 那边包含条件是记在会话里的，我们只有这份排除串。
     pub fn parse(raw: &str) -> Self {
         let mut out = Self::default();
-        // 工作副本的元数据目录永远不参与比较：它只存在于服务器端，算进去会把整个
-        // 工作副本的文件数都当成「本地端缺失」
+        // 工作副本的元数据目录永远不参与比较：svn 的 .svn 只在服务器端、git 的 .git 只在
+        // 本地端，算进去会把整个工作副本的文件数都当成单侧缺失
         out.dirs.push(".svn".to_owned());
+        out.dirs.push(".git".to_owned());
         for item in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             let Some(pattern) = item.strip_prefix('-') else { continue };
             let pattern = pattern.trim();

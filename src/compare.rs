@@ -223,9 +223,11 @@ impl SvnApp {
         self.open_bcompare(&[PathBuf::from(&left), PathBuf::from(&right)], &switches);
     }
 
-    /// 用 Beyond Compare 对比单个文件的「BASE 版本 ↔ 本地版本」。
+    /// 用 Beyond Compare 对比单个文件的「基线版本 ↔ 本地版本」：
+    /// svn 取 BASE 版本，git 取 HEAD 版本（工作副本基线提交）。
     pub fn open_bcompare_file(&mut self, index: usize, path: String) {
-        let (Some(svn), Some(root)) = (self.svn_or_none(), self.dir_path(index)) else {
+        let kind = self.dir_kind(index);
+        let Some(root) = self.dir_path(index) else {
             return;
         };
         let target = PathBuf::from(&path);
@@ -242,15 +244,33 @@ impl SvnApp {
         if let Some(parent) = mirror.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match svn.cat_base(&target, &mirror) {
+        let fetched = match kind {
+            crate::repo::RepoKind::Git => {
+                let Some(git) = self.git_or_none() else {
+                    return;
+                };
+                git.cat_base(&target, &mirror)
+            }
+            crate::repo::RepoKind::Svn => {
+                let Some(svn) = self.svn_or_none() else {
+                    return;
+                };
+                svn.cat_base(&target, &mirror)
+            }
+        };
+        match fetched {
             Ok(()) => {
-                // 服务器端（BASE 版本）放哪一侧由设置决定，默认在左
+                // 基线版本放哪一侧由设置决定，默认在左
                 let (left, right) = bcompare::order_sides(&mirror, &target, &self.cfg.bc_server_side);
                 self.open_bcompare(&[left, right], &[]);
             }
             Err(e) => {
-                // 新增 / 未版本化的条目没有 BASE 版本，直接在 BC 里打开本地文件
-                self.push(Level::Warning, format!("$ svn cat -r BASE \"{path}\" 失败：{e}"));
+                // 新增 / 未版本化的条目没有基线版本，直接在 BC 里打开本地文件
+                let cmd = match kind {
+                    crate::repo::RepoKind::Git => "$ git show HEAD",
+                    crate::repo::RepoKind::Svn => "$ svn cat -r BASE",
+                };
+                self.push(Level::Warning, format!("{cmd} \"{path}\" 失败：{e}"));
                 self.open_bcompare(&[target], &[]);
             }
         }

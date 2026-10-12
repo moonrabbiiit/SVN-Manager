@@ -1,5 +1,6 @@
 //! 顶部状态栏：仓库连接状态、页面切换、主题与设置入口，以及有新版本时的那个按钮。
 
+use crate::repo::RepoKind;
 use crate::{APP_TITLE, DirView, Page, SvnApp, ink};
 use egui::{Align, Color32, Layout, RichText, Ui};
 use crate::jobs::Kind;
@@ -35,8 +36,15 @@ impl SvnApp {
             return (gray, "等待检测".into(), "尚未完成连接检测".into());
         }
         let ok = checked.iter().filter(|d| d.remote == Some(true)).count();
+        // 后端字样：列表里只有一种仓库时带名字（SVN / Git），混着就不细分
+        let git = checked.iter().filter(|d| d.kind == RepoKind::Git).count();
+        let backend = match (git, checked.len() - git) {
+            (0, _) => " SVN",
+            (_, 0) => " Git",
+            _ => "",
+        };
         if ok == total {
-            (green, format!("已连接 SVN（{ok}/{total}）"), "全部目录均可访问仓库".into())
+            (green, format!("已连接{backend}（{ok}/{total}）"), "全部目录均可访问仓库".into())
         } else if ok == 0 {
             let reason = checked
                 .iter()
@@ -44,7 +52,7 @@ impl SvnApp {
                 .find(|m| !m.is_empty())
                 .unwrap_or("无法访问仓库")
                 .to_owned();
-            (red, format!("未连接 SVN（0/{total}）"), reason)
+            (red, format!("未连接{backend}（0/{total}）"), reason)
         } else {
             (amber, format!("部分连接（{ok}/{total}）"), "存在无法访问的目录".into())
         }
@@ -197,6 +205,12 @@ impl SvnApp {
         ui.horizontal(|ui| {
             let exe = if self.cfg.svn_exe.is_empty() { "未设置".to_owned() } else { self.cfg.svn_exe.clone() };
             ui.label(RichText::new(format!("svn.exe：{exe}")).weak().size(12.0));
+            let git = if self.git.exe.as_os_str().is_empty() {
+                "未设置".to_owned()
+            } else {
+                self.git.exe.display().to_string()
+            };
+            ui.label(RichText::new(format!("git.exe：{git}")).weak().size(12.0));
         });
     }
 }

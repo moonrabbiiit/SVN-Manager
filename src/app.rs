@@ -41,6 +41,16 @@ impl SvnApp {
         } else {
             bcompare::detect().unwrap_or_default()
         };
+        // git.exe：配置里有路径就用，留空则按 PATH / 注册表 / 标准安装位置现找。
+        // 探测很快（几次 --version），启动时同步做，不像 svn 那样要进任务池
+        let mut git_exe = PathBuf::from(&cfg.git_exe);
+        if git_exe.as_os_str().is_empty() {
+            if let Some((found, _)) = crate::git::detect(crate::git::candidates()) {
+                git_exe = found;
+            }
+        }
+        let git = crate::git::Git { exe: git_exe };
+        let git_version = git.version();
         let mut app = Self {
             dirs: vec![DirView::default(); cfg.dirs.len()],
             probing: false,
@@ -49,6 +59,8 @@ impl SvnApp {
             candidates: Vec::new(),
             cfg,
             svn,
+            git,
+            git_version,
             bc,
             pool: Pool::default(),
             output: Vec::new(),
@@ -121,6 +133,18 @@ impl SvnApp {
         } else {
             app.spawn_detect();
         }
+        if app.git.available() {
+            app.push(
+                Level::Info,
+                format!(
+                    "git.exe = {}（版本 {}）",
+                    app.git.exe.display(),
+                    app.git_version.clone().unwrap_or_default()
+                ),
+            );
+        }
+        // 每个目录先按磁盘上的 .git / .svn 定后端，不等第一轮检测
+        app.sync_views();
         app
     }
 
@@ -169,6 +193,14 @@ impl SvnApp {
     pub(crate) fn sync_views(&mut self) {
         self.dirs.resize(self.cfg.dirs.len(), DirView::default());
         self.dirs.truncate(self.cfg.dirs.len());
+        // 后端类型跟着磁盘走：目录里有 .git 就是 Git，有 .svn 就是 SVN
+        for (index, dir) in self.cfg.dirs.iter().enumerate() {
+            if let Some(view) = self.dirs.get_mut(index) {
+                if let Some(kind) = crate::repo::detect(Path::new(&dir.path)) {
+                    view.kind = kind;
+                }
+            }
+        }
         if self.selected.is_some_and(|i| i >= self.cfg.dirs.len()) {
             self.selected = None;
         }
@@ -183,11 +215,36 @@ impl SvnApp {
         self.persist();
     }
 
+    pub fn apply_git_exe(&mut self, exe: &str) {
+        self.cfg.git_exe = exe.trim().trim_matches('"').to_owned();
+        self.git.exe = PathBuf::from(&self.cfg.git_exe);
+        self.git_version = self.git.version();
+        self.persist();
+    }
+
     pub fn svn_or_none(&mut self) -> Option<Svn> {
         if self.svn.available() {
             Some(self.svn.clone())
         } else {
             self.hint("未找到可用的 svn.exe，请在「设置」中指定路径或重新自动寻找");
+            self.show_settings = true;
+            None
+        }
+    }
+
+    /// 该目录的后端类型。还没检测过时按 SVN 算（列表里躺着的老目录绝大多数是 SVN）。
+    pub(crate) fn dir_kind(&self, index: usize) -> crate::repo::RepoKind {
+        self.dirs
+            .get(index)
+            .map(|view| view.kind)
+            .unwrap_or(crate::repo::RepoKind::Svn)
+    }
+
+    pub(crate) fn git_or_none(&mut self) -> Option<crate::git::Git> {
+        if self.git.available() {
+            Some(self.git.clone())
+        } else {
+            self.hint("未找到可用的 git.exe，请在「设置 → git.exe 路径」中指定");
             self.show_settings = true;
             None
         }
@@ -206,9 +263,18 @@ impl SvnApp {
         for line in polled.lines {
             let level = if line.starts_with('$') || line.starts_with('→') {
                 Level::Command
-            } else if line.contains("失败") || line.contains("Error") || line.contains("svn: E") {
+            } else if line.contains("失败")
+                || line.contains("Error")
+                || line.contains("svn: E")
+                || line.contains("fatal:")
+                || line.contains("error:")
+            {
                 Level::Error
-            } else if line.contains("Warning") || line.contains("警告") || line.contains("冲突") {
+            } else if line.contains("Warning")
+                || line.contains("警告")
+                || line.contains("冲突")
+                || line.contains("warning:")
+            {
                 Level::Warning
             } else if line.contains("完成") || line.starts_with('A') || line.starts_with('D') {
                 Level::Success
@@ -748,7 +814,7 @@ mod tests {
         let _ = frame(&mut app);
         let texts = frame(&mut app);
         let hint = Stage::rect_of(&texts, "已添加目录：C:\\Test").expect("提示条要画出来");
-        let title = Stage::rect_of(&texts, "输出记录（1 行）").expect("日志标题");
+        let title = Stage::rect_of(&texts, "输出运行（1 行）").expect("日志标题");
         let line = Stage::rect_of(&texts, "svn status").expect("日志正文");
 
         assert!(hint.min.y > title.max.y, "提示条要在日志标题下面：{hint:?} / {title:?}");

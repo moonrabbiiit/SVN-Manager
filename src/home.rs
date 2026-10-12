@@ -243,10 +243,15 @@ impl SvnApp {
                         // 改动，根目录的版本号因为混合版本停在旧值，不代表内容还是旧的
                         let up_to_date =
                             view.out_of_date == Some(0) && !view.remote_rev.is_empty();
+                        let local_rev = if up_to_date {
+                            view.remote_rev.clone()
+                        } else {
+                            info.revision.clone()
+                        };
                         ui.label(
                             RichText::new(format!(
-                                "本地 r{}",
-                                if up_to_date { &view.remote_rev } else { &info.revision }
+                                "本地 {}",
+                                crate::repo::fmt_rev(view.kind, &local_rev)
                             ))
                             .size(12.0)
                             .weak(),
@@ -260,10 +265,16 @@ impl SvnApp {
                         } else if let Some(pending) =
                             view.out_of_date.filter(|count| *count > 0)
                         {
+                            // git 的可更新数是提交个数，svn 是待更新条目数，单位跟着后端走
+                            let unit = if view.kind == crate::repo::RepoKind::Git {
+                                "个提交"
+                            } else {
+                                "项"
+                            };
                             ui.label(
                                 RichText::new(format!(
-                                    "远端 r{}（可更新 {} 项）",
-                                    view.remote_rev, pending
+                                    "远端 {}（可更新 {pending} {unit}）",
+                                    crate::repo::fmt_rev(view.kind, &view.remote_rev)
                                 ))
                                 .size(12.0)
                                 .color(ink(ui, Color32::from_rgb(240, 190, 70))),
@@ -280,8 +291,9 @@ impl SvnApp {
                         if !last_date.is_empty() {
                             ui.label(
                                 RichText::new(format!(
-                                    "{}最后提交 r{last_rev} · {last_author} · {last_date}",
-                                    if from_server { "服务器" } else { "本地" }
+                                    "{}最后提交 {} · {last_author} · {last_date}",
+                                    if from_server { "服务器" } else { "本地" },
+                                    crate::repo::fmt_rev(view.kind, &last_rev)
                                 ))
                                 .size(12.0)
                                 .weak(),
@@ -343,16 +355,19 @@ impl SvnApp {
     /// 「更多」菜单的内容。详细模式的目录行直接弹它，简约模式的「+」菜单把它当作二级菜单，
     /// 两边共用一份，免得改了这处漏了那处
     fn more_menu(&mut self, ui: &mut Ui, index: usize, busy: bool, view: &DirView) {
+        let git = view.kind == crate::repo::RepoKind::Git;
         if ui.button("修改别名").clicked() {
             self.edit_label = Some(index);
             self.label_buf = self.cfg.dirs[index].label.clone();
             self.label_focus = true;
             ui.close();
         }
-        if ui
-            .button("修改仓库地址")
-            .on_hover_text("服务器换地址 / 换端口后，把工作副本指到新的仓库地址，只改元数据不动文件")
-            .clicked()
+        // 仓库地址 / 清理 / 解决冲突是 SVN 工作副本的概念，Git 目录没有对应操作，直接不出现
+        if !git
+            && ui
+                .button("修改仓库地址")
+                .on_hover_text("服务器换地址 / 换端口后，把工作副本指到新的仓库地址，只改元数据不动文件")
+                .clicked()
         {
             self.open_relocate(index);
             ui.close();
@@ -412,6 +427,9 @@ impl SvnApp {
         }
         ui.separator();
         ui.add_enabled_ui(!busy, |ui| {
+            if git {
+                return;
+            }
             if ui.button(Maintain::Cleanup.label()).clicked() {
                 self.spawn_maintain(index, Maintain::Cleanup);
                 ui.close();
@@ -729,16 +747,16 @@ impl SvnApp {
         // 左下两行：当前版本 / 远端版本，口径与详细模式一致
         let up_to_date = view.out_of_date == Some(0) && !view.remote_rev.is_empty();
         let local = match &view.info {
-            Some(info) => format!(
-                "本地 r{}",
-                if up_to_date { &view.remote_rev } else { &info.revision }
-            ),
+            Some(info) => {
+                let rev = if up_to_date { &view.remote_rev } else { &info.revision };
+                format!("本地 {}", crate::repo::fmt_rev(view.kind, rev))
+            }
             None => "本地 —".to_owned(),
         };
         let remote = if view.remote_rev.is_empty() {
             "远端 —".to_owned()
         } else {
-            format!("远端 r{}", view.remote_rev)
+            format!("远端 {}", crate::repo::fmt_rev(view.kind, &view.remote_rev))
         };
         // 远端有更新时，远端那行用详细模式里「远端 rX（可更新 N 项）」的黄色
         let remote_color = if pending > 0 {
@@ -1169,6 +1187,47 @@ mod tests {
         let cursor = out.platform_output.cursor_icon;
         out.textures_delta.clear();
         assert_eq!(cursor, egui::CursorIcon::PointingHand, "停在切换器上应该是手型指针");
+    }
+
+    /// Git 目录的详细行按 sha 口径显示：本地 / 远端都是 8 位短 sha，可更新按「个提交」计
+    #[test]
+    fn git_row_shows_sha_and_commit_unit() {
+        let mut stage = Stage::new(false);
+        stage.app.cfg.dirs.push(config::DirConfig {
+            path: r"C:\wc\gitrepo".to_owned(),
+            label: "GIT".to_owned(),
+            ..Default::default()
+        });
+        stage.app.dirs.push(DirView {
+            kind: crate::repo::RepoKind::Git,
+            info: Some(crate::svn::WcInfo {
+                is_wc: true,
+                url: "https://github.com/demo/demo.git".to_owned(),
+                repos_root: "https://github.com/demo/demo.git".to_owned(),
+                revision: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_owned(),
+                node_kind: "dir".to_owned(),
+                last_rev: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_owned(),
+                last_author: "dev".to_owned(),
+                last_date: "2026-10-10 18:00".to_owned(),
+            }),
+            remote: Some(true),
+            remote_rev: "f0e1d2c3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9".to_owned(),
+            out_of_date: Some(2),
+            changed: Some(1),
+            ..Default::default()
+        });
+        let texts = stage.step(None);
+        for label in [
+            "本地 a1b2c3d4",
+            "远端 f0e1d2c3（可更新 2 个提交）",
+            "待提交 1 项",
+        ] {
+            assert!(
+                Stage::rect_of(&texts, label).is_some(),
+                "Git 目录行上应该画得出「{label}」，实际有：{:?}",
+                texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// 卡片是手摆的四角布局，只有跑一帧才知道文字有没有叠在一起、计数有没有真画出来

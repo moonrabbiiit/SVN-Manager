@@ -123,6 +123,8 @@ pub fn stub_app(compact: bool) -> SvnApp {
         ai_error: String::new(),
         cfg,
         svn: Svn::default(),
+        git: crate::git::Git::default(),
+        git_version: None,
         dirs,
     }
 }

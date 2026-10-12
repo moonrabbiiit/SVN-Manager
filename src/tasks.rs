@@ -10,6 +10,7 @@ use crate::commit::CommitPage;
 use crate::config::DirConfig;
 use crate::history::{FileDiff, FileLog, HistoryPage, Zoom};
 use crate::jobs::{Data, Kind};
+use crate::repo::RepoKind;
 use crate::svn::{LogEntry, LogPath};
 
 impl SvnApp {
@@ -330,6 +331,11 @@ impl SvnApp {
     pub fn spawn_refresh(&mut self, index: usize, quiet: bool) {
         // 本地端比对不依赖 svn，所以放在 svn 就绪判断之前：svn.exe 还没配好时这个数照样能给
         self.spawn_local_diff(index, quiet);
+        // Git 目录不需要 svn.exe（只装 git 的机器也要能用），所以先按后端分叉再查工具
+        if self.dir_kind(index) == RepoKind::Git {
+            self.spawn_refresh_git(index, quiet);
+            return;
+        }
         let Some(svn) = self.svn_or_none() else { return };
         let Some(path) = self.dir_path(index) else { return };
         if self.pool.has(Kind::Refresh, index) {
@@ -464,10 +470,153 @@ impl SvnApp {
         }
     }
 
-    pub fn spawn_update(&mut self, index: usize) {
-        let (Some(svn), Some(path)) = (self.svn_or_none(), self.dir_path(index)) else {
+    /// Git 目录的检测：读本地状态，fetch 后比出落后远端几个提交。
+    /// 口径与 svn 的检测一致——fetch 失败时可更新数给 None（不能宣称「已是最新」），
+    /// 没配远端 / 分支还没推过则按落后 0 个提交算；上游 tip 的最后提交当「服务器最后提交」。
+    fn spawn_refresh_git(&mut self, index: usize, quiet: bool) {
+        let Some(git) = self.git_or_none() else { return };
+        let Some(path) = self.dir_path(index) else { return };
+        if self.pool.has(Kind::Refresh, index) {
+            // 同 svn：正在跑的那一次读的是提交前的旧数据，落地后补跑一次
+            if !self
+                .pending_refresh
+                .iter()
+                .any(|(item, _)| *item == index)
+            {
+                self.pending_refresh.push((index, quiet));
+            }
             return;
-        };
+        }
+        if !path.is_dir() {
+            if let Some(view) = self.dirs.get_mut(index) {
+                view.info = None;
+                view.remote = Some(false);
+                view.remote_msg = "目录不存在（可能已被移动或删除）".to_owned();
+            }
+            return;
+        }
+        let label = self.dir_label(index);
+        self.pool
+            .spawn(Kind::Refresh, index, format!("{label} 检测"), move |sink| {
+                let sink = if quiet { sink.muted() } else { sink };
+                let (info, info_run) = git.info(&path);
+                let Some(info) = info else {
+                    sink.line(format!("[{label}] 不是 Git 仓库：{}", info_run.summary()));
+                    return Data::Wc {
+                        dir: index,
+                        info: None,
+                        remote: Some(false),
+                        remote_msg: "不是 Git 仓库".to_owned(),
+                        remote_rev: String::new(),
+                        last_rev: String::new(),
+                        last_author: String::new(),
+                        last_date: String::new(),
+                        changed: None,
+                        changes: Vec::new(),
+                        conflicts: None,
+                        out_of_date: None,
+                    };
+                };
+                sink.line(format!(
+                    "$ git status --porcelain=v2 --untracked-files=all \"{}\"",
+                    path.display()
+                ));
+                let (entries, out_of_date, tip, probe_run) = git.status_against_server(&path);
+                let mut remote = Some(true);
+                let mut remote_msg = "已连接到仓库".to_owned();
+                if !probe_run.ok {
+                    remote = Some(false);
+                    remote_msg = probe_run.summary();
+                } else if tip.is_empty() {
+                    // fetch 没报错但没有上游：没配远端（或分支还没推过），只看本地
+                    remote_msg = "未配置远端（或分支还没建立上游）".to_owned();
+                } else {
+                    sink.line("$ git fetch --quiet && git rev-list --count HEAD..@{upstream}");
+                }
+                // 远端这趟没走通时本地状态未必也挂了（多半是 fetch 断网）：照 svn 的口径
+                // 退回只读本地，待提交 / 冲突数以本地这一次为准，不因为断网就清零
+                let (entries, status_ok) = if probe_run.ok {
+                    (entries, true)
+                } else {
+                    let (local, local_run) = git.status(&path);
+                    (if local_run.ok { local } else { entries }, local_run.ok)
+                };
+                match out_of_date {
+                    Some(0) => {}
+                    Some(pending) => {
+                        sink.line(format!("[{label}] 远端比本地多 {pending} 个提交，点「更新」拉下来"));
+                    }
+                    None => {}
+                }
+                // 「服务器最后提交」取上游 tip 的；没有远端时退回本地 HEAD 的
+                let (mut last_rev, mut last_author, mut last_date) = (
+                    info.last_rev.clone(),
+                    info.last_author.clone(),
+                    info.last_date.clone(),
+                );
+                if !tip.is_empty() {
+                    let (tip_rev, tip_author, tip_date) = git.tip_meta(&path, &tip);
+                    if !tip_rev.is_empty() {
+                        last_rev = tip_rev;
+                        last_author = tip_author;
+                        last_date = tip_date;
+                    }
+                }
+                // 统计口径与「全部上传」一致：? 会在提交时自动 add、! 自动 delete
+                let changes: Vec<crate::svn::StatusEntry> = entries
+                    .iter()
+                    .filter(|entry| entry.item.uploadable())
+                    .cloned()
+                    .collect();
+                let changed = status_ok.then(|| changes.len());
+                // 冲突数在未过滤的 entries 上数：changes 里已经没有冲突条目了。
+                // status 读失败只能给 None——给 0 会把「没读到」显示成「没有冲突」
+                let conflicts = status_ok.then(|| crate::svn::blocked_count(&entries));
+                if remote != Some(true) {
+                    sink.line(format!("[{label}] 连接异常：{remote_msg}"));
+                }
+                Data::Wc {
+                    dir: index,
+                    info: Some(info),
+                    remote,
+                    remote_msg,
+                    remote_rev: tip,
+                    last_rev,
+                    last_author,
+                    last_date,
+                    changed,
+                    changes,
+                    conflicts,
+                    out_of_date,
+                }
+            });
+    }
+
+    pub fn spawn_update(&mut self, index: usize) {
+        let Some(path) = self.dir_path(index) else { return };
+        if self.dir_kind(index) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            let label = self.dir_label(index);
+            self.pool
+                .spawn(Kind::Update, index, format!("{label} 更新"), move |sink| {
+                    sink.line(format!("$ git pull --ff-only \"{}\"", path.display()));
+                    let run = git.update(&path, &|line| sink.line(line));
+                    let message = if run.ok {
+                        format!("{label}：更新完成")
+                    } else {
+                        format!("{label}：更新失败——{}", run.summary())
+                    };
+                    // 收尾文案只交给任务回收端统一写进输出区，避免同一句显示两遍
+                    Data::Run {
+                        dir: index,
+                        ok: run.ok,
+                        message,
+                        reload: true,
+                    }
+                });
+            return;
+        }
+        let Some(svn) = self.svn_or_none() else { return };
         let label = self.dir_label(index);
         self.pool
             .spawn(Kind::Update, index, format!("{label} 更新"), move |sink| {
@@ -489,9 +638,33 @@ impl SvnApp {
     }
 
     pub fn spawn_status(&mut self, index: usize, quiet: bool) {
-        let (Some(svn), Some(path)) = (self.svn_or_none(), self.dir_path(index)) else {
+        let Some(path) = self.dir_path(index) else { return };
+        if self.dir_kind(index) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            if self.pool.has(Kind::Status, index) {
+                return;
+            }
+            let label = self.dir_label(index);
+            self.pool
+                .spawn(Kind::Status, index, format!("{label} 读取修改"), move |sink| {
+                    // 静音时丢弃执行日志，读失败仍通过 Data::Status 的 message 报给界面
+                    let sink = if quiet { sink.muted() } else { sink };
+                    sink.line(format!(
+                        "$ git status --porcelain=v2 --untracked-files=all \"{}\"",
+                        path.display()
+                    ));
+                    let (entries, run) = git.status(&path);
+                    sink.line(format!("→ 共 {} 项改动", entries.len()));
+                    Data::Status {
+                        dir: index,
+                        entries,
+                        ok: run.ok,
+                        message: if run.ok { String::new() } else { run.summary() },
+                    }
+                });
             return;
-        };
+        }
+        let Some(svn) = self.svn_or_none() else { return };
         if self.pool.has(Kind::Status, index) {
             return;
         }
@@ -524,6 +697,67 @@ impl SvnApp {
         unlimited: bool,
         range: Option<(NaiveDate, NaiveDate)>,
     ) {
+        let Some(path) = self.dir_path(index) else { return };
+        if self.dir_kind(index) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            if self.pool.has(Kind::Log, index) {
+                return;
+            }
+            // 区间模式下条数没有意义（要的是那几天，不是最近 N 条）
+            let limit = match range {
+                Some(_) => 0,
+                None if unlimited => 0,
+                None => self.cfg.log_limit.clamp(1, 2000),
+            };
+            let (since, until) = match range {
+                Some((from, to)) => (
+                    from.format("%Y-%m-%d").to_string(),
+                    // git 的 --until 停在那天零点之前，加一天才把结束当天整天包进来
+                    to.succ_opt().unwrap_or(to).format("%Y-%m-%d").to_string(),
+                ),
+                None => (String::new(), String::new()),
+            };
+            let label = self.dir_label(index);
+            self.pool
+                .spawn(Kind::Log, index, format!("{label} 提交记录"), move |sink| {
+                    // git 没有 svn auth：提交人取仓库配置的 user.name，取不到就不筛人
+                    let author = if mine {
+                        git.auth_user(&path).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let limit_part = if limit > 0 {
+                        format!(" -n {limit}")
+                    } else if range.is_none() {
+                        "（不限条数）".to_owned()
+                    } else {
+                        String::new()
+                    };
+                    let range_part = if since.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" --since={since} --until={until}")
+                    };
+                    let author_part = if author.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" --author={author}")
+                    };
+                    sink.line(format!(
+                        "$ git log --name-status{limit_part}{range_part}{author_part} \"{path_display}\"",
+                        path_display = path.display()
+                    ));
+                    let (entries, run) = git.log_in(&path, &since, &until, limit, &author);
+                    sink.line(format!("→ 共 {} 条提交记录", entries.len()));
+                    Data::Log {
+                        dir: index,
+                        entries,
+                        ok: run.ok,
+                        message: if run.ok { String::new() } else { run.summary() },
+                    }
+                });
+            return;
+        }
         let (Some(svn), Some(path)) = (self.svn_or_none(), self.dir_path(index)) else {
             return;
         };
@@ -577,6 +811,31 @@ impl SvnApp {
             self.hint("上一条差异还在读取，稍等再双击");
             return;
         }
+        if self.dir_kind(index) == RepoKind::Git {
+            // git 不需要仓库根地址：「url」直接存仓库相对路径，本地文件被改名 / 删除了照样按 pathspec 查
+            let revision = entry.revision.clone();
+            // XML 整份被改缩进 / 换行符的情况最多，这类文件默认忽略空白；其余文件默认看原始差异
+            let ignore_white = path.path.to_ascii_lowercase().ends_with(".xml");
+            let rev = crate::repo::fmt_rev(self.dir_kind(index), &revision);
+            self.hint(format!("正在读取 {rev} 对 {} 的逐行改动 …", path.path));
+            self.file_diff = Some(FileDiff {
+                dir: index,
+                revision: revision.clone(),
+                author: entry.author.clone(),
+                date: entry.date.clone(),
+                message: entry.message.clone(),
+                path: path.path.clone(),
+                action: path.action,
+                url: path.path.clone(),
+                diff: String::new(),
+                error: String::new(),
+                ignore_white,
+                // 改动明细默认最大化：看差异要的是横向空间，点「还原」才回到原来的大小
+                zoom: Zoom::maximized(),
+            });
+            self.spawn_file_diff(index, revision, path.path.clone(), ignore_white);
+            return;
+        }
         let root = self
             .dirs
             .get(index)
@@ -618,6 +877,43 @@ impl SvnApp {
     /// `svn diff -c <版本> <仓库URL>`：这一次提交相对上一个版本，对该路径改了哪几行。
     /// 用仓库 URL 查，本地没有该文件（或已被改名 / 删除）也能取到；本次新增的文件会整份显示为 +。
     pub fn spawn_file_diff(&mut self, index: usize, revision: String, url: String, ignore_white: bool) {
+        if self.dir_kind(index) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            let Some(dir) = self.dir_path(index) else { return };
+            if self.pool.has(Kind::FileDiff, index) {
+                self.hint("上一条差异还在读取，读完再点「重新读取」");
+                return;
+            }
+            let rev = crate::repo::fmt_rev(self.dir_kind(index), &revision);
+            let shown = url.rsplit('/').next().unwrap_or("").to_owned();
+            self.pool.spawn(
+                Kind::FileDiff,
+                index,
+                format!("{shown} {rev} 差异"),
+                move |sink| {
+                    let flags = if ignore_white {
+                        format!(" {}", crate::git::DIFF_IGNORE_ARGS.join(" "))
+                    } else {
+                        String::new()
+                    };
+                    sink.line(format!(
+                        "$ git diff {revision}~1 {revision} --no-ext-diff{flags} \":(top){url}\""
+                    ));
+                    let run = git.diff_rev(&dir, &revision, &url, ignore_white);
+                    sink.line(format!(
+                        "→ {}",
+                        if run.ok { "已取到差异".to_owned() } else { run.summary() }
+                    ));
+                    Data::Run {
+                        dir: index,
+                        ok: run.ok,
+                        message: if run.ok { run.out } else { run.summary() },
+                        reload: false,
+                    }
+                },
+            );
+            return;
+        }
         let Some(svn) = self.svn_or_none() else {
             self.hint("没有可用的 svn.exe，无法读取差异");
             return;
@@ -656,6 +952,22 @@ impl SvnApp {
             self.hint("上一个文件的提交记录还在读取，稍等再点");
             return;
         }
+        if self.dir_kind(index) == RepoKind::Git {
+            // git 的「url」就是仓库相对路径：按 pathspec 查历史，不依赖仓库根地址
+            let limit = self.cfg.log_limit.clamp(1, 2000);
+            self.hint(format!("正在读取 {} 的提交记录 …", path.path));
+            self.file_log = Some(FileLog {
+                dir: index,
+                url: path.path.clone(),
+                name: path.path.clone(),
+                limit,
+                entries: Vec::new(),
+                error: String::new(),
+                zoom: Zoom::default(),
+            });
+            self.spawn_file_log(index, path.path.clone(), limit);
+            return;
+        }
         let root = self
             .dirs
             .get(index)
@@ -688,6 +1000,28 @@ impl SvnApp {
 
     /// `svn log <仓库URL>`：只返回改动过这个路径的那些版本（同样一律读服务器）。
     pub fn spawn_file_log(&mut self, index: usize, url: String, limit: i64) {
+        if self.dir_kind(index) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            let Some(dir) = self.dir_path(index) else { return };
+            if self.pool.has(Kind::FileLog, index) {
+                self.hint("上一个文件的提交记录还在读取，稍等再点");
+                return;
+            }
+            let shown = url.rsplit('/').next().unwrap_or("").to_owned();
+            self.pool
+                .spawn(Kind::FileLog, index, format!("{shown} 提交记录"), move |sink| {
+                    sink.line(format!("$ git log --name-status -- \":(top){url}\""));
+                    let (entries, run) = git.log_path(&dir, &url, limit, "");
+                    sink.line(format!("→ 共 {} 条记录", entries.len()));
+                    Data::Log {
+                        dir: index,
+                        entries,
+                        ok: run.ok,
+                        message: if run.ok { String::new() } else { run.summary() },
+                    }
+                });
+            return;
+        }
         let Some(svn) = self.svn_or_none() else {
             self.hint("没有可用的 svn.exe，无法读取文件提交记录");
             return;
@@ -715,6 +1049,27 @@ impl SvnApp {
         );
     }
     pub fn spawn_diff(&mut self, index: usize, path: String, ignore_white: bool) {
+        if self.dir_kind(index) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            let target = PathBuf::from(&path);
+            self.pool
+                .spawn(Kind::Diff, index, "查看差异".into(), move |sink| {
+                    let flags = if ignore_white {
+                        format!(" {}", crate::git::DIFF_IGNORE_ARGS.join(" "))
+                    } else {
+                        String::new()
+                    };
+                    sink.line(format!("$ git diff HEAD --no-ext-diff{flags} \"{path}\""));
+                    let run = git.diff(&target, ignore_white);
+                    Data::Run {
+                        dir: index,
+                        ok: run.ok,
+                        message: if run.ok { run.out } else { run.summary() },
+                        reload: false,
+                    }
+                });
+            return;
+        }
         let Some(svn) = self.svn_or_none() else {
             self.hint("没有可用的 svn.exe，无法读取差异");
             return;
@@ -735,6 +1090,10 @@ impl SvnApp {
     }
 
     pub fn spawn_maintain(&mut self, index: usize, op: Maintain) {
+        if self.dir_kind(index) == RepoKind::Git {
+            self.spawn_maintain_git(index, op);
+            return;
+        }
         let (Some(svn), Some(path)) = (self.svn_or_none(), self.dir_path(index)) else {
             return;
         };
@@ -794,6 +1153,73 @@ impl SvnApp {
             });
     }
 
+    /// Git 目录的维护操作：加 / 删 / 撤销三项照常，清理与解决冲突是 SVN 特有的概念。
+    fn spawn_maintain_git(&mut self, index: usize, op: Maintain) {
+        let sub = match op {
+            Maintain::Cleanup | Maintain::Resolve => {
+                self.hint(format!("Git 仓库用不到「{}」", op.label()));
+                return;
+            }
+            Maintain::Add => "add -A",
+            Maintain::Delete => "rm -r",
+            Maintain::Revert => "reset + restore",
+        };
+        let (Some(git), Some(path)) = (self.git_or_none(), self.dir_path(index)) else {
+            return;
+        };
+        let targets: Vec<String> = match op {
+            Maintain::Add | Maintain::Delete => {
+                let list = self
+                    .commit
+                    .as_ref()
+                    .map(|commit| commit.selected_targets(op))
+                    .unwrap_or_default();
+                if list.is_empty() {
+                    self.hint(format!("请先勾选需要「{}」的条目", op.label()));
+                    return;
+                }
+                list
+            }
+            _ => Vec::new(),
+        };
+        if op == Maintain::Revert {
+            self.hint("已撤销该目录下的全部本地修改");
+        }
+        let count = targets.len();
+        let label = self.dir_label(index);
+        self.pool
+            .spawn(Kind::Maintain, index, format!("{label} {sub}"), move |sink| {
+                if count > 0 {
+                    sink.line(format!("$ git {sub}（{count} 项）"));
+                } else {
+                    sink.line(format!("$ git {sub} \"{}\"", path.display()));
+                }
+                let run = match op {
+                    Maintain::Add => git.add(&path, &targets, &|line| sink.line(line)),
+                    Maintain::Delete => git.delete(&path, &targets, &|line| sink.line(line)),
+                    Maintain::Revert => git.revert_all(&path, &|line| sink.line(line)),
+                    // 上面已经拦掉，给个空结果只为让 match 完整
+                    Maintain::Cleanup | Maintain::Resolve => crate::svn::Run {
+                        ok: true,
+                        code: 0,
+                        out: String::new(),
+                        err: String::new(),
+                    },
+                };
+                let message = if run.ok {
+                    format!("{label}：{} 完成", op.label())
+                } else {
+                    format!("{label}：{} 失败——{}", op.label(), run.summary())
+                };
+                Data::Run {
+                    dir: index,
+                    ok: run.ok,
+                    message,
+                    reload: op != Maintain::Cleanup,
+                }
+            });
+    }
+
     /// 打开「回退到 r{版本}」确认窗口。`path` 不给 = 整个目录回到这一次提交的样子；
     /// 给了就是历史页「涉及文件」里的那一个文件，只回退它。
     /// 两种都只改本地工作副本，确认窗口里讲清楚后果才执行。
@@ -817,6 +1243,10 @@ impl SvnApp {
             .filter(|count| *count > 0)
         {
             self.hint(format!("该目录还有 {count} 项冲突没处理，先「解决冲突」或「撤销修改」再回退"));
+            return;
+        }
+        if self.dir_kind(index) == RepoKind::Git {
+            self.open_rollback_git(index, entry, path, local);
             return;
         }
         let (target, name, is_dir) = match path {
@@ -853,6 +1283,52 @@ impl SvnApp {
         self.hint(format!("回退到 r{} 会改动本地文件，请在弹出窗口里确认", entry.revision));
     }
 
+    /// Git 版的回退确认。整目录 = `git revert --no-commit {rev}..HEAD`，这是仓库级操作，
+    /// 目录必须是仓库根；单文件 = `git restore --source={rev}`（文件在那次提交里还没有就删掉它）。
+    /// 两种都只产生本地改动（含已暂存），不产生提交、不碰远端，确认窗口里讲清楚后果才执行。
+    fn open_rollback_git(
+        &mut self,
+        index: usize,
+        entry: &LogEntry,
+        path: Option<&LogPath>,
+        local: PathBuf,
+    ) {
+        let Some(top) = self.git.toplevel(&local) else {
+            self.hint("读不到 Git 仓库根目录，无法回退");
+            return;
+        };
+        if top != local {
+            self.hint("该目录不是 Git 仓库根：回退要按整个仓库来算，请把仓库根目录添加进来再回退");
+            return;
+        }
+        let (target, name, is_dir) = match path {
+            None => (local.clone(), self.dir_label(index), true),
+            Some(item) => {
+                // 日志里的路径相对仓库根，仓库根就是本目录时拼上就是本地真实文件
+                let target = local.join(&item.path);
+                if !target.is_file() {
+                    self.hint(format!(
+                        "本地没有这个文件：{}\n（没检出、已改名或已删除；回退只针对本地还在的文件）",
+                        target.display()
+                    ));
+                    return;
+                }
+                (target, item.path.clone(), false)
+            }
+        };
+        self.rollback = Some(Rollback {
+            dir: index,
+            revision: entry.revision.clone(),
+            target,
+            name,
+            is_dir,
+            confirm: false,
+            error: String::new(),
+        });
+        let rev = crate::repo::fmt_rev(self.dir_kind(index), &entry.revision);
+        self.hint(format!("回退到 {rev} 会改动本地文件，请在弹出窗口里确认"));
+    }
+
     /// 执行回退：`svn merge -r HEAD:<rev> --accept postpone <目标>`，产物是一批本地改动。
     /// 完成后重读 status 与检测，回退出来的那些项立刻出现在「待提交」里，由他决定上传还是撤销。
     pub fn spawn_rollback(
@@ -863,6 +1339,62 @@ impl SvnApp {
         name: String,
         is_dir: bool,
     ) {
+        if self.dir_kind(dir) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            if self.pool.has(Kind::Rollback, dir) {
+                self.hint("上一次回退还在执行，等它结束再点");
+                return;
+            }
+            let rev = crate::repo::fmt_rev(self.dir_kind(dir), &revision);
+            self.pool.spawn(
+                Kind::Rollback,
+                dir,
+                format!("{name} 回退 {rev}"),
+                move |sink| {
+                    let workdir = if is_dir {
+                        target.clone()
+                    } else {
+                        target
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| target.clone())
+                    };
+                    if is_dir {
+                        sink.line(format!(
+                            "$ git revert --no-commit {revision}..HEAD \"{}\"",
+                            target.display()
+                        ));
+                    } else {
+                        sink.line(format!(
+                            "$ git restore --staged --worktree --source={revision} \"{}\"",
+                            target.display()
+                        ));
+                    }
+                    let run = git.merge_back(
+                        &workdir,
+                        if is_dir { None } else { Some(target.as_path()) },
+                        &revision,
+                        &|line| sink.line(line),
+                    );
+                    let scope = if is_dir { "整个目录" } else { "该文件" };
+                    let message = if run.ok {
+                        format!(
+                            "{name}：已回到 {rev}——{scope}的改动只落在本地，核对后再上传，不想要就「撤销修改」"
+                        )
+                    } else {
+                        format!("{name}：回退到 {rev} 失败——{}", run.summary())
+                    };
+                    // 收尾文案只交给回收端统一写进输出区，避免同一句显示两遍
+                    Data::Run {
+                        dir,
+                        ok: run.ok,
+                        message,
+                        reload: true,
+                    }
+                },
+            );
+            return;
+        }
         let Some(svn) = self.svn_or_none() else {
             self.hint("没有可用的 svn.exe，无法回退");
             return;
@@ -902,6 +1434,10 @@ impl SvnApp {
 
     /// 打开「修改仓库地址」窗口：原前缀默认填仓库根地址，只需填新的根地址。
     pub fn open_relocate(&mut self, index: usize) {
+        if self.dir_kind(index) == RepoKind::Git {
+            self.hint("Git 仓库改远端地址请在终端执行 git remote set-url，这里不支持");
+            return;
+        }
         let Some(info) = self.dirs.get(index).and_then(|view| view.info.clone()) else {
             self.hint("还没有读到该目录的仓库地址，请先「全部检测」后再试");
             return;
@@ -1042,7 +1578,11 @@ impl SvnApp {
     /// 重置 Beyond Compare 的试用状态：删掉注册表里的 CacheID，结果逐条写进输出记录。
 
     pub fn open_commit(&mut self, index: usize) {
-        if self.svn_or_none().is_none() {
+        if self.dir_kind(index) == RepoKind::Git {
+            if self.git_or_none().is_none() {
+                return;
+            }
+        } else if self.svn_or_none().is_none() {
             return;
         }
         let label = self.dir_label(index);
@@ -1058,12 +1598,23 @@ impl SvnApp {
     /// 打开「提交记录」页并按日期区间读服务器（`None` = 照旧按条数读最近 N 条）。
     /// 统计图下钻走这里：点某天就直接落在那天的记录上。
     pub fn open_history_in(&mut self, index: usize, range: Option<(NaiveDate, NaiveDate)>) {
-        if self.svn_or_none().is_none() {
+        if self.dir_kind(index) == RepoKind::Git {
+            if self.git_or_none().is_none() {
+                return;
+            }
+        } else if self.svn_or_none().is_none() {
             return;
         }
         let label = self.dir_label(index);
         let limit = self.cfg.log_limit;
-        let user = self.svn_user.clone();
+        // git 没有 svn auth 探测：提交人取仓库配置的 user.name，取不到就留空（列表不筛人）
+        let user = if self.dir_kind(index) == RepoKind::Git {
+            self.dir_path(index)
+                .and_then(|path| self.git.auth_user(&path))
+                .unwrap_or_default()
+        } else {
+            self.svn_user.clone()
+        };
         let only_mine = self.cfg.history_only_mine;
         let mut page = HistoryPage::new(index, label, limit, user, only_mine);
         if let Some((from, to)) = range {

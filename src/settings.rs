@@ -78,6 +78,63 @@ impl SvnApp {
                         });
                     }
                     ui.separator();
+                    ui.collapsing("git.exe 路径（.git 目录行用）", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                Vec2::new((ui.available_width() - 150.0).max(180.0), 22.0),
+                                TextEdit::singleline(&mut self.cfg.git_exe).hint_text("留空则自动寻找"),
+                            );
+                            if ui.button("浏览…").clicked() {
+                                if let Some(file) = rfd::FileDialog::new()
+                                    .set_title("选择 git.exe")
+                                    .add_filter("可执行文件", &["exe"])
+                                    .pick_file()
+                                {
+                                    let text = file.to_string_lossy().into_owned();
+                                    self.apply_git_exe(&text);
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("应用此路径").clicked() {
+                                let exe = self.cfg.git_exe.clone();
+                                self.apply_git_exe(&exe);
+                                self.hint(match self.git_version.clone() {
+                                    Some(v) => format!("git.exe 可用，版本 {v}"),
+                                    None => "该路径无法执行，请确认是 git.exe 命令行客户端".to_owned(),
+                                });
+                            }
+                            if ui.button("自动寻找").clicked() {
+                                match crate::git::detect(crate::git::candidates()) {
+                                    Some((found, version)) => {
+                                        self.apply_git_exe(&found.to_string_lossy());
+                                        self.hint(format!(
+                                            "已找到 {}（版本 {version}）",
+                                            found.display()
+                                        ));
+                                    }
+                                    None => self.hint("未找到 git.exe，请手工填写路径"),
+                                }
+                            }
+                            let note = if self.git.available() {
+                                self.git.exe.display().to_string()
+                            } else {
+                                "未找到".to_owned()
+                            };
+                            ui.label(RichText::new(format!("当前：{note}")).weak());
+                            if let Some(v) = &self.git_version {
+                                ui.label(RichText::new(format!("版本 {v}")).weak());
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "列表里带 .git 的目录走这里配置的 git 命令行；Git 目录的「上传」= commit 后自动 push。",
+                            )
+                            .weak()
+                            .size(11.0),
+                        );
+                    });
+                    ui.separator();
                     ui.collapsing("Beyond Compare 设置", |ui| {
                         ui.horizontal(|ui| {
                             ui.add_sized(

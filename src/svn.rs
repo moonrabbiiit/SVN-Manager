@@ -20,7 +20,7 @@ pub fn decode_bytes(bytes: &[u8]) -> String {
     }
 }
 
-fn temp_file(prefix: &str) -> PathBuf {
+pub(crate) fn temp_file(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

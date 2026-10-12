@@ -8,11 +8,13 @@ mod compare;
 mod config;
 mod dialogs;
 mod fonts;
+mod git;
 mod header;
 mod history;
 mod home;
 mod jobs;
 mod localdiff;
+mod repo;
 mod settings;
 mod stats;
 mod svn;
@@ -122,6 +124,9 @@ pub struct OutLine {
 /// 目录的运行期状态，与 `cfg.dirs` 一一对应。
 #[derive(Clone, Default)]
 pub struct DirView {
+    /// 后端类型：目录里有 .git 走 Git，有 .svn 走 SVN（加目录时先按磁盘判定，
+    /// 检测时再核一遍；检测前默认按 SVN 显示）
+    pub kind: crate::repo::RepoKind,
     pub info: Option<WcInfo>,
     pub remote: Option<bool>,
     pub remote_msg: String,
@@ -179,6 +184,10 @@ impl Maintain {
 pub struct SvnApp {
     pub cfg: Config,
     pub svn: Svn,
+    /// Git 命令行（git.exe），给 .git 目录行用
+    pub git: crate::git::Git,
+    /// git.exe 的版本号（设置窗口与状态行显示）
+    pub git_version: Option<String>,
     /// Beyond Compare（BCompare.exe）路径，未找到时为空
     pub bc: PathBuf,
     pub version: Option<String>,

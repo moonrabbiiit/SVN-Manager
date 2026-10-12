@@ -20,6 +20,8 @@ pub struct DirConfig {
 #[serde(default)]
 pub struct Config {
     pub svn_exe: String,
+    /// git.exe 路径，留空则自动寻找（给 .git 目录行用）
+    pub git_exe: String,
     /// Beyond Compare 路径，留空则自动寻找
     pub bc_exe: String,
     /// 调用对比时服务器端放在哪一侧：left / right
@@ -68,6 +70,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             svn_exe: String::new(),
+            // git.exe 由探测链现找（PATH / 注册表 / 标准安装位置），找到后写回配置
+            git_exe: String::new(),
             bc_exe: String::new(),
             // 默认服务器端在左：文件对比的 BASE 版本一直在左，用户的 BC 记录也是 server 在左
             bc_server_side: "left".to_owned(),
@@ -183,6 +187,8 @@ mod tests {
         assert!(parsed.ai_key.is_empty());
         assert!(parsed.ai_model.is_empty());
         assert!(parsed.ai_tone.is_empty());
+        // git.exe 是双后端改造后加的设置：老配置没有要按空值补齐（启动时自动探测）
+        assert!(parsed.git_exe.is_empty());
         // 界面字体、字号是后加的设置：老配置没有也要按默认值（自动挑字体、标准字号）补齐
         assert_eq!(parsed.ui_font, crate::fonts::AUTO);
         assert_eq!(parsed.ui_scale, crate::fonts::SCALE_STANDARD);

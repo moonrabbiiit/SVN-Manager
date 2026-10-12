@@ -3,6 +3,7 @@ use std::path::Path;
 use egui::{Align, Button, Color32, FontId, Frame, Layout, RichText, ScrollArea, TextEdit, Ui, Vec2};
 
 use crate::jobs::{Data, Kind, Sink};
+use crate::repo::RepoKind;
 use crate::svn::{blocked_count, Item, StatusEntry, Svn};
 use crate::{highlight, ink, Level, Maintain, SvnApp};
 
@@ -144,6 +145,10 @@ impl SvnApp {
     pub fn not_up_to_date_hint(&self, index: usize) -> Option<String> {
         let view = self.dirs.get(index)?;
         let pending = view.out_of_date.filter(|count| *count > 0)?;
+        if self.dir_kind(index) == RepoKind::Git {
+            // git 的落后数是提交个数：远端有新提交时直接 push 会被拒，先更新再提交
+            return Some(format!("未更新到最新：远端还有 {pending} 个提交没拉到本地"));
+        }
         let revision = match view.remote_rev.as_str() {
             "" => String::new(),
             rev => format!("，远端已是 r{rev}"),
@@ -155,7 +160,38 @@ impl SvnApp {
 
     /// 提交。勾选里的未版本化 / 已丢失条目会先补上 svn add / svn delete，
     /// 再和修改项一起 svn commit；add / delete 只成一部分时那几条会被跳过并写明原因。
+    /// Git 目录：`git add -A` + `git commit` + 自动 push（提交即上传，见 `git_commit_run`）。
     pub fn spawn_commit(&mut self, index: usize, plan: CommitPlan, message: String) {
+        let Some(path) = self.dir_path(index) else {
+            self.hint("无法提交：该目录已从列表中移除");
+            return;
+        };
+        if self.dir_kind(index) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            if plan.targets.is_empty() {
+                self.hint("请先勾选要提交的文件（新增 / 修改 / 删除可以一起提交）");
+                return;
+            }
+            // git 不收空的提交说明（svn 可以留空，git 会直接拒掉）
+            if message.trim().is_empty() {
+                self.hint("Git 提交需要提交说明：请先在「提交备注」里写明这次改了什么");
+                return;
+            }
+            if self.pool.has(Kind::Commit, index) {
+                self.hint("该目录的提交任务还在执行中，请等当前提交结束");
+                return;
+            }
+            let label = self.dir_label(index);
+            let count = plan.targets.len();
+            if let Some(commit) = self.commit.as_mut() {
+                commit.done_ok = false;
+            }
+            self.pool
+                .spawn(Kind::Commit, index, format!("{label} 提交 {count} 项"), move |sink| {
+                    git_commit_run(&git, &sink, &path, &label, index, plan.targets, &message)
+                });
+            return;
+        }
         let (Some(svn), Some(path)) = (self.svn_or_none(), self.dir_path(index)) else {
             self.hint("无法提交：svn.exe 不可用，或该目录已从列表中移除");
             return;
@@ -181,9 +217,54 @@ impl SvnApp {
     }
 
     /// 「全部上传」：不看勾选，把该目录里所有能提交的条目一次提交上去。
-    /// 清单在后台现读 `svn status`，口径和提交页的「只选可提交项」一致：未版本化 / 已丢失
-    /// 先补 svn add / svn delete，再和修改项一起提交；没有可提交改动时这个目录自己跳过。
+    /// 清单在后台现读状态，口径和提交页的「只选可提交项」一致：未版本化 / 已丢失
+    /// 一并带上（svn 先补 add / delete；git 的 add -A 天生就管），没有可提交改动时跳过。
     pub fn spawn_upload_all(&mut self, index: usize, message: String) {
+        let Some(path) = self.dir_path(index) else {
+            self.hint("无法提交：该目录已从列表中移除");
+            return;
+        };
+        if self.dir_kind(index) == RepoKind::Git {
+            let Some(git) = self.git_or_none() else { return };
+            // git 不收空的提交说明（svn 可以留空，git 会直接拒掉）
+            if message.trim().is_empty() {
+                self.hint("Git 提交需要提交说明：请补一句说明再上传");
+                return;
+            }
+            if self.pool.has(Kind::Commit, index) {
+                self.hint("该目录的提交任务还在执行中，请等当前提交结束");
+                return;
+            }
+            let label = self.dir_label(index);
+            self.pool
+                .spawn(Kind::Commit, index, format!("{label} 全部上传"), move |sink| {
+                    let (entries, stat) = git.status(&path);
+                    if !stat.ok {
+                        return Data::Run {
+                            dir: index,
+                            ok: false,
+                            message: format!("{label}：读取本地修改失败——{}", stat.summary()),
+                            reload: false,
+                        };
+                    }
+                    let targets: Vec<String> = entries
+                        .iter()
+                        .filter(|entry| entry.item.uploadable())
+                        .map(|entry| entry.path.clone())
+                        .collect();
+                    if targets.is_empty() {
+                        return Data::Run {
+                            dir: index,
+                            ok: true,
+                            message: format!("{label}：没有可提交的改动，已跳过"),
+                            reload: false,
+                        };
+                    }
+                    sink.line(format!("{label}：全部上传 {} 项", targets.len()));
+                    git_commit_run(&git, &sink, &path, &label, index, targets, &message)
+                });
+            return;
+        }
         let (Some(svn), Some(path)) = (self.svn_or_none(), self.dir_path(index)) else {
             self.hint("无法提交：svn.exe 不可用，或该目录已从列表中移除");
             return;
@@ -254,6 +335,7 @@ impl SvnApp {
             self.back_to_main();
             return;
         };
+        let git_kind = self.dir_kind(page.dir) == RepoKind::Git;
         let url = self
             .dirs
             .get(page.dir)
@@ -312,9 +394,11 @@ impl SvnApp {
                 self.spawn_update(page.dir);
             }
             hit.on_hover_text(if writing {
-                "服务器上还有没拉到本地的新改动；该目录正有 SVN 写操作在执行，等它结束再更新"
+                "服务器上还有没拉到本地的新改动；该目录正有写操作在执行，等它结束再更新".to_owned()
+            } else if git_kind {
+                format!("服务器上还有没拉到本地的新改动，这次上传是在旧基线上做的；点这一句直接执行该目录的 git pull")
             } else {
-                "服务器上还有没拉到本地的新改动，这次上传是在旧基线上做的；点这一句直接执行该目录的 svn update"
+                format!("服务器上还有没拉到本地的新改动，这次上传是在旧基线上做的；点这一句直接执行该目录的 svn update")
             });
         }
         ui.separator();
@@ -443,11 +527,12 @@ impl SvnApp {
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("提交备注").strong());
-            ui.label(
-                RichText::new("可留空；不会自动带入任何内容")
-                    .weak()
-                    .size(11.5),
-            );
+            let note = if git_kind {
+                "必填：git 提交不允许空说明"
+            } else {
+                "可留空；不会自动带入任何内容"
+            };
+            ui.label(RichText::new(note).weak().size(11.5));
         });
         let targets = page.commit_targets();
         let picked_count = targets.len();
@@ -553,9 +638,10 @@ impl SvnApp {
                 if armed && blocked.is_none() {
                     // 拦住的这一下要给退路：要么先更新到最新，要么明确放弃
                     ui.horizontal(|ui| {
+                        let tool = if git_kind { "git pull" } else { "svn update" };
                         if ui
                             .button("先更新到最新")
-                            .on_hover_text("对该目录执行 svn update，再重新读一遍本地改动")
+                            .on_hover_text(format!("对该目录执行 {tool}，再重新读一遍本地改动"))
                             .clicked()
                         {
                             page.confirm_outdated = false;
@@ -932,6 +1018,59 @@ fn commit_run(
     Data::Run {
         dir: index,
         ok: run.ok,
+        message: text,
+        reload: true,
+    }
+}
+
+/// Git 版的提交流程：`git add -A` 暂存 → `git commit`（只提交点名的路径）→ `git push`。
+/// 「Git 的提交 = 上传」：commit 落地后紧接着推远端；push 失败不算提交失败，
+/// 但要把「改动已经 commit 在本地、只差推送」讲清楚，被拒时顺带指出该先更新。
+fn git_commit_run(
+    git: &crate::git::Git,
+    sink: &Sink,
+    dir: &Path,
+    label: &str,
+    index: usize,
+    targets: Vec<String>,
+    message: &str,
+) -> Data {
+    let count = targets.len();
+    sink.line(format!(
+        "$ git add -A && git commit --（{} 项，说明：{}）",
+        count,
+        match message.trim() {
+            "" => "（空）".to_owned(),
+            text => text.lines().next().unwrap_or("").trim().to_owned(),
+        }
+    ));
+    let run = git.commit(dir, &targets, message, &|line| sink.line(line));
+    if !run.ok {
+        return Data::Run {
+            dir: index,
+            ok: false,
+            message: format!("{label}：提交失败——{}", run.summary()),
+            reload: true,
+        };
+    }
+    sink.line("$ git push");
+    let pushed = git.push(dir, &|line| sink.line(line));
+    let text = if pushed.ok {
+        format!("{label}：已提交 {count} 项并推送到远端")
+    } else {
+        let rejected = ["rejected", "non-fast-forward", "fetch first"]
+            .iter()
+            .any(|mark| pushed.err.contains(mark) || pushed.out.contains(mark));
+        let mut text =
+            format!("{label}：提交已在本地完成（{count} 项），但推送失败——{}", pushed.summary());
+        if rejected {
+            text.push_str("\n（远端有你本地没有的提交：先「↓ 更新」拉下来，核对后再提交一次）");
+        }
+        text
+    };
+    Data::Run {
+        dir: index,
+        ok: pushed.ok,
         message: text,
         reload: true,
     }

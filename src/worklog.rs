@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use egui::{Align, Color32, FontId, Frame, RichText, ScrollArea, TextEdit, Ui, Vec2};
 
 use crate::jobs::{Data, Kind};
+use crate::repo::RepoKind;
 use crate::svn::LogEntry;
 use crate::{ink, SvnApp};
 
@@ -29,6 +30,8 @@ pub struct AiPick {
     pub dir_label: String,
     /// 那条提交记录（版本 / 作者 / 时间 / 说明 / 涉及文件）
     pub entry: LogEntry,
+    /// 来源目录的后端类型：版本号按 svn 显示 r123、git 显示短 sha
+    pub kind: RepoKind,
 }
 
 /// 勾选里一共涉及多少个文件（用于 >20 的 token 提醒）
@@ -46,8 +49,11 @@ pub fn build_content(picks: &[AiPick]) -> String {
             text.push('\n');
         }
         text.push_str(&format!(
-            "【{}】r{} {} 作者：{}\n",
-            pick.dir_label, entry.revision, entry.date, entry.author
+            "【{}】{} {} 作者：{}\n",
+            pick.dir_label,
+            crate::repo::fmt_rev(pick.kind, &entry.revision),
+            entry.date,
+            entry.author
         ));
         let message = entry.message.trim();
         text.push_str(&format!(
@@ -418,10 +424,13 @@ impl SvnApp {
                                                     .size(12.5),
                                             );
                                             ui.label(
-                                                RichText::new(format!("r{}", entry.revision))
-                                                    .monospace()
-                                                    .size(12.5)
-                                                    .color(ink(ui, Color32::from_rgb(120, 190, 240))),
+                                                RichText::new(crate::repo::fmt_rev(
+                                                    self.dir_kind(pick.dir),
+                                                    &entry.revision,
+                                                ))
+                                                .monospace()
+                                                .size(12.5)
+                                                .color(ink(ui, Color32::from_rgb(120, 190, 240))),
                                             );
                                             ui.label(RichText::new(&entry.date).size(11.5).weak());
                                             ui.label(
@@ -653,6 +662,7 @@ mod tests {
         AiPick {
             dir: 0,
             dir_label: "订单服务".to_owned(),
+            kind: RepoKind::Svn,
             entry: LogEntry {
                 revision: revision.to_owned(),
                 author: "zhangsan".to_owned(),

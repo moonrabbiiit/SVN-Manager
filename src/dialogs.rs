@@ -4,6 +4,7 @@
 use egui::{Align, Color32, Frame, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 
 use crate::jobs::Kind;
+use crate::repo::fmt_rev;
 use crate::{update, APP_VERSION, Level, SvnApp, UploadAll, ink};
 
 impl SvnApp {
@@ -126,6 +127,7 @@ impl SvnApp {
             return;
         };
         let dir = dialog.dir;
+        let kind = self.dir_kind(dir);
         let revision = dialog.revision.clone();
         let name = dialog.name.clone();
         let target_path = dialog.target.clone();
@@ -143,7 +145,7 @@ impl SvnApp {
         let pending = self.dirs.get(dir).and_then(|view| view.changed).unwrap_or(0);
         let scope = if is_dir { "整个目录" } else { "这个文件" };
         let mut open = true;
-        egui::Window::new(format!("回退到 r{revision} · {label}"))
+        egui::Window::new(format!("回退到 {} · {label}", fmt_rev(kind, &revision)))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -151,7 +153,11 @@ impl SvnApp {
             .default_pos(egui::pos2(420.0, 240.0))
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new(format!("确定要把{scope}从 r{wc_rev} 回退到 r{revision}？"))
+                    RichText::new(format!(
+                        "确定要把{scope}从 {} 回退到 {}？",
+                        fmt_rev(kind, &wc_rev),
+                        fmt_rev(kind, &revision)
+                    ))
                         .strong()
                         .size(13.0),
                 );
@@ -174,7 +180,7 @@ impl SvnApp {
                 ui.horizontal(|ui| {
                     if dialog.confirm {
                         let button = egui::Button::new(
-                            RichText::new(format!("确认回退到 r{revision}"))
+                            RichText::new(format!("确认回退到 {}", fmt_rev(kind, &revision)))
                                 .strong()
                                 .color(Color32::from_rgb(255, 240, 240)),
                         )
@@ -195,7 +201,7 @@ impl SvnApp {
                         .add_enabled(
                             !running,
                             egui::Button::new(
-                                RichText::new(format!("回退到 r{revision}"))
+                                RichText::new(format!("回退到 {}", fmt_rev(kind, &revision)))
                                     .strong()
                                     .color(Color32::from_rgb(255, 240, 240)),
                             )

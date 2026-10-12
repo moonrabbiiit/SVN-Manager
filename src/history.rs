@@ -4,6 +4,7 @@ use egui::{
 };
 
 use crate::jobs::Kind;
+use crate::repo::{fmt_rev, RepoKind};
 use crate::stats::{parse_date, resolve_range, reversed_hint, RangePreset};
 use crate::svn::{LogEntry, LogPath};
 use crate::{highlight_with, ink, Search, SvnApp};
@@ -339,10 +340,20 @@ impl SvnApp {
             .get(page.dir)
             .map(|view| view.remote_rev.clone())
             .unwrap_or_default();
-        // 服务器比本地新：说明这批记录还没更新到本地
-        let behind = match (local_rev.parse::<i64>(), server_rev.parse::<i64>()) {
-            (Ok(local), Ok(server)) => server > local,
-            _ => false,
+        // 服务器比本地新：说明这批记录还没更新到本地。git 的版本号是 SHA 比不了
+        // 大小，落后与否直接用检测时数出来的「落后几个提交」
+        let kind = self.dir_kind(page.dir);
+        let behind = if kind == RepoKind::Git {
+            self.dirs
+                .get(page.dir)
+                .and_then(|view| view.out_of_date)
+                .unwrap_or(0)
+                > 0
+        } else {
+            match (local_rev.parse::<i64>(), server_rev.parse::<i64>()) {
+                (Ok(local), Ok(server)) => server > local,
+                _ => false,
+            }
         };
         let mine_text = if page.author.trim().is_empty() {
             "只看我的提交".to_owned()
@@ -548,7 +559,9 @@ impl SvnApp {
             if !server_rev.is_empty() {
                 ui.label(
                     RichText::new(format!(
-                        "记录取自服务器（最新 r{server_rev}，本地 r{local_rev}）{}",
+                        "记录取自服务器（最新 {}，本地 {}）{}",
+                        fmt_rev(kind, &server_rev),
+                        fmt_rev(kind, &local_rev),
                         if behind { " · 本地待更新" } else { "" }
                     ))
                     .size(12.0)
@@ -834,6 +847,7 @@ impl SvnApp {
                                                 self.ai_picks.push(crate::worklog::AiPick {
                                                     dir: page.dir,
                                                     dir_label: page.label.clone(),
+                                                    kind: self.dir_kind(page.dir),
                                                     entry: entry.clone(),
                                                 });
                                             } else {
@@ -846,7 +860,7 @@ impl SvnApp {
                                     }
                                     ui.label(highlight_with(
                                         ui,
-                                        &format!("r{}", entry.revision),
+                                        &fmt_rev(kind, &entry.revision),
                                         &search,
                                         FontId::monospace(body),
                                         ink(ui, Color32::from_rgb(120, 190, 240)),
@@ -910,7 +924,7 @@ impl SvnApp {
                         .show(ui2, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new(format!("r{}", entry.revision))
+                                    RichText::new(fmt_rev(kind, &entry.revision))
                                         .size(18.0)
                                         .strong()
                                         .color(ink(ui, Color32::from_rgb(120, 190, 240))),
@@ -919,6 +933,7 @@ impl SvnApp {
                                     ui.ctx().copy_text(entry.message.clone());
                                 }
                                 // 回退入口就挂在选中的这条版本上：整目录回到 r{rev} 的样子，改动先落本地
+                                let shown = fmt_rev(kind, &entry.revision);
                                 let back = ui
                                     .add(
                                         egui::Button::new(
@@ -928,11 +943,10 @@ impl SvnApp {
                                         .fill(Color32::from_rgb(150, 60, 60)),
                                     )
                                     .on_hover_text(format!(
-                                        "把这个目录的本地工作副本倒回 r{}：\n\
-                                         r{} 之后的所有改动都会被撤掉（不是只撤这一次提交），\n\
+                                        "把这个目录的本地工作副本倒回 {shown}：\n\
+                                         {shown} 之后的所有改动都会被撤掉（不是只撤这一次提交），\n\
                                          结果是一批本地改动，主页「待提交」里核对后再上传，不想要就「撤销修改」还原。\n\
-                                         服务器上的东西一点没动。",
-                                        entry.revision, entry.revision
+                                         服务器上的东西一点没动。"
                                     ));
                                 if back.clicked() {
                                     self.open_rollback(page.dir, &entry, None);
@@ -1114,8 +1128,11 @@ impl SvnApp {
         // 关闭交给标题栏的 ×（和设置窗口一个样），工具栏里不再放「关闭」按钮。
         // open 是这一帧的局部变量：点了 × 时 egui 会把它写成 false，下面据此丢掉窗口内容
         let mut open = true;
+        // 版本号按后端格式化：svn 显示 r123，git 显示 8 位短 sha
+        let kind = self.dir_kind(diff.dir);
         let window = egui::Window::new(format!(
-            "r{revision} 改动明细 · {}",
+            "{} 改动明细 · {}",
+            fmt_rev(kind, &revision),
             path.rsplit('/').next().unwrap_or(path.as_str())
         ))
         .id(egui::Id::new("file_diff"))
@@ -1132,7 +1149,7 @@ impl SvnApp {
             .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("r{revision}"))
+                    RichText::new(fmt_rev(kind, &revision))
                         .size(15.0)
                         .strong()
                         .color(ink(ui, Color32::from_rgb(120, 190, 240))),
@@ -1318,6 +1335,22 @@ impl SvnApp {
                             || line.starts_with("+++")
                             || line.starts_with("Propchange:")
                             || line.starts_with('\\')
+                            // git 的文件头行：diff --git a/x b/x、index 哈希、模式/重命名/二进制提示。
+                            // 不拦住它们会掉进下面的上下文分支，被当成一行原文还错误推进行号
+                            || line.starts_with("diff --git")
+                            || line.starts_with("index ")
+                            || line.starts_with("old mode")
+                            || line.starts_with("new mode")
+                            || line.starts_with("new file mode")
+                            || line.starts_with("deleted file mode")
+                            || line.starts_with("similarity index")
+                            || line.starts_with("dissimilarity index")
+                            || line.starts_with("rename from")
+                            || line.starts_with("rename to")
+                            || line.starts_with("copy from")
+                            || line.starts_with("copy to")
+                            || line.starts_with("Binary files")
+                            || line.starts_with("GIT binary patch")
                         {
                             // 文件头 / 属性变更 / 「无行尾换行」这些提示行不参与行号
                             rows.push(DiffRow::Span(line.to_owned(), false));
@@ -1468,6 +1501,7 @@ impl SvnApp {
             return;
         };
         let dir = log.dir;
+        let kind = self.dir_kind(dir);
         let limit = log.limit;
         let url = log.url.clone();
         let name = log.name.clone();
@@ -1573,7 +1607,7 @@ impl SvnApp {
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(format!("r{}", entry.revision))
+                                        RichText::new(fmt_rev(kind, &entry.revision))
                                             .size(14.0)
                                             .strong()
                                             .color(ink(ui, Color32::from_rgb(120, 190, 240))),
