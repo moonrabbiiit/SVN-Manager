@@ -374,6 +374,442 @@ fn read_chunk(file: &mut fs::File, buf: &mut [u8]) -> usize {
     filled
 }
 
+// ============================================================ 诊断报告
+//
+// 主页只报「差异 N 项」，可用户拿 Beyond Compare 打开却看不到差在哪——
+// 比对把读失败的文件按「不同」算、结尾空行按差异算，这些都和 BC 的显示对不上，
+// 而且多半在别人机器上才出现，本地复现不了。所以把每一项判定展开成文字报告：
+// 两边的大小和修改时间、判成不同的原因、第一个差异字节、差在哪些行，
+// 让用户导出这个文件发回来，看一眼就知道是占用、行尾还是真改了内容。
+
+/// 报告里每类最多展开多少个文件：报告是发回来人工看的，几百个文件没人读
+const LISTING_MAX: usize = 100;
+/// 每个不同的文件最多摘录多少对行
+const LINES_MAX: usize = 5;
+/// 行摘录里每行最多多少字节，超了截断（汉字一个 3 字节，别切在半个字上）
+const LINE_BYTES: usize = 150;
+/// 差异处的十六进制对照，每行多少字节
+const HEX_PER_LINE: usize = 16;
+
+/// 单个文件的诊断结论。
+enum Inspect {
+    /// 字节完全一样，只是大小或修改时间对不上
+    Same,
+    /// 只差 BOM / 行尾 / 行尾空白 / 末尾换行（BC 口径算一致）
+    Equivalent(String),
+    /// 一侧打不开或读不了：常规比对把它按「不同」算，多半是文件被临时占用
+    Unreadable { side: &'static str, message: String },
+    /// 超过 16MB 只做了逐字节比较，没做归一化
+    TooBig { first: Option<usize> },
+    /// 二进制内容不同
+    Binary { first: Option<usize> },
+    /// 文本内容不同：first 是第一个差异字节的位置，lines 是开头几对不同的行
+    Text { first: usize, lines: Vec<(usize, String, String)> },
+}
+
+/// 两棵树都再走一遍，把判定逐项展开成报告文本。
+/// 和 `compare` 用同一套筛选与预算，所以数字能对得上主页。
+pub fn diagnose(local: &Path, server: &Path, filter: &str) -> Result<String, String> {
+    if !local.is_dir() {
+        return Err(format!("本地开发侧目录读不到：{}", local.display()));
+    }
+    if !server.is_dir() {
+        return Err(format!("服务器端目录读不到：{}", server.display()));
+    }
+    let ex = Excludes::parse(filter);
+    let start = Instant::now();
+
+    let mut index: HashMap<String, Entry> = HashMap::new();
+    walk(server, server, &ex, 0, &mut |rel, size, modified| {
+        index.insert(rel.to_ascii_lowercase(), Entry { rel: rel.to_owned(), size, modified });
+    });
+
+    let mut differing: Vec<(String, u64, u64, u64, u64, Inspect)> = Vec::new();
+    let mut same_looks: Vec<String> = Vec::new();
+    let mut same_looks_total = 0usize;
+    let mut equivalent: Vec<String> = Vec::new();
+    let mut only_local: Vec<(String, u64, u64)> = Vec::new();
+    let mut counts = Summary::default();
+    let local_owned = local.to_owned();
+    walk(local, local, &ex, 0, &mut |rel, size, modified| {
+        let key = rel.to_ascii_lowercase();
+        let Some(entry) = index.remove(&key) else {
+            counts.only_local += 1;
+            only_local.push((rel.to_owned(), size, modified));
+            return;
+        };
+        if entry.size == size && entry.modified == modified {
+            counts.same += 1;
+            return;
+        }
+        if start.elapsed() > Limits::default().max_time {
+            counts.unverified += 1;
+            return;
+        }
+        let inspect = inspect(&local_owned.join(rel), &server.join(&entry.rel));
+        match inspect {
+            Inspect::Same => {
+                counts.same += 1;
+                same_looks_total += 1;
+                if same_looks.len() < LISTING_MAX {
+                    same_looks.push(rel.to_owned());
+                }
+            }
+            Inspect::Equivalent(reason) => {
+                counts.trivial += 1;
+                if equivalent.len() < LISTING_MAX {
+                    equivalent.push(format!("{rel}（{reason}）"));
+                }
+            }
+            Inspect::Unreadable { side, message } => {
+                counts.differing += 1;
+                if differing.len() < LISTING_MAX {
+                    differing.push((rel.to_owned(), size, modified, entry.size, entry.modified, Inspect::Unreadable { side, message }));
+                }
+            }
+            Inspect::TooBig { first } | Inspect::Binary { first } => {
+                counts.differing += 1;
+                if differing.len() < LISTING_MAX {
+                    differing.push((rel.to_owned(), size, modified, entry.size, entry.modified, match inspect {
+                        Inspect::TooBig { .. } => Inspect::TooBig { first },
+                        _ => Inspect::Binary { first },
+                    }));
+                }
+            }
+            Inspect::Text { first, lines } => {
+                counts.differing += 1;
+                if differing.len() < LISTING_MAX {
+                    differing.push((rel.to_owned(), size, modified, entry.size, entry.modified, Inspect::Text { first, lines }));
+                }
+            }
+        }
+    });
+    counts.only_server = index.len();
+    let mut only_server: Vec<(String, u64, u64)> = index
+        .into_values()
+        .map(|e| (e.rel, e.size, e.modified))
+        .collect();
+    only_server.sort_by(|a, b| a.0.cmp(&b.0));
+    only_local.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // ---------------- 拼报告
+    let mut out = String::new();
+    out.push_str("本地差异诊断报告\r\n");
+    out.push_str(&format!("程序版本 {}\r\n", crate::APP_VERSION));
+    out.push_str(&format!("生成时间 {}\r\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+    out.push_str(&format!("本地开发侧：{}\r\n", local.display()));
+    out.push_str(&format!("工作副本（服务器端）：{}\r\n", server.display()));
+    out.push_str(&format!("对比筛选条件：{}\r\n", if filter.trim().is_empty() { "（未设置）" } else { filter }));
+    out.push_str("判定口径：与 Beyond Compare 默认一致，只差 BOM / 行尾 / 行尾空白 / 末尾换行算一致\r\n");
+    out.push_str(&format!(
+        "汇总：内容不同 {} · 只在本地开发侧 {} · 只在服务器端 {} · 一致 {} · 按BC口径算一致 {} · 未核对 {}\r\n",
+        counts.differing, counts.only_local, counts.only_server, counts.same, counts.trivial, counts.unverified
+    ));
+    out.push_str(&format!("扫描用时 {:.1} 秒\r\n\r\n", start.elapsed().as_secs_f32()));
+
+    if differing.is_empty() {
+        out.push_str("== 内容不同的文件 ==\r\n（无）\r\n\r\n");
+    } else {
+        out.push_str(&format!("== 内容不同的文件（展开 {} / 共 {} 项）==\r\n\r\n", differing.len(), counts.differing));
+        for (no, (rel, lsize, ltime, ssize, stime, inspect)) in differing.iter().enumerate() {
+            out.push_str(&format!("【{}】{}\r\n", no + 1, rel));
+            out.push_str(&format!("    本地端     大小 {} · 修改 {}\r\n", lsize, stamp(*ltime)));
+            out.push_str(&format!("    服务器端   大小 {} · 修改 {}\r\n", ssize, stamp(*stime)));
+            match inspect {
+                Inspect::Unreadable { side, message } => {
+                    out.push_str(&format!(
+                        "    判定：{side}读不出来（{message}）\r\n    常规比对把这类按「不同」算——多半是 IDE / 编译 / 杀毒软件临时占用，\r\n    Beyond Compare 那时候能正常打开，就出现「本软件报差异、BC 看不到」。\r\n    过一会儿重新检测，这一项多半自己消失。\r\n\r\n"
+                    ));
+                }
+                Inspect::TooBig { first } => {
+                    out.push_str("    判定：超过 16MB，只做了逐字节比较\r\n");
+                    if let Some(at) = first {
+                        out.push_str(&format!("    第一个差异字节：第 {at} 字节（0x{at:X}）\r\n"));
+                    }
+                    out.push_str("\r\n");
+                }
+                Inspect::Binary { first } => {
+                    out.push_str("    判定：二进制内容不同\r\n");
+                    if let Some(at) = first {
+                        out.push_str(&format!("    第一个差异字节：第 {at} 字节（0x{at:X}）\r\n"));
+                    }
+                    out.push_str("\r\n");
+                }
+                Inspect::Text { first, lines } => {
+                    out.push_str(&format!("    判定：文本内容不同，第一个差异字节：第 {first} 字节（0x{first:X}）\r\n"));
+                    // 差异处十六进制对照：编码不同（GBK↔UTF-8）、看不见的字符在这段里现形
+                    if let Ok(a) = fs::read(local.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))) {
+                        if let Ok(b) = fs::read(server.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))) {
+                            let dump = hex_diff(&a, &b, *first);
+                            if !dump.is_empty() {
+                                out.push_str("    差异处字节对照（本地 / 服务器）：\r\n");
+                                for line in dump.lines() {
+                                    out.push_str(&format!("      {line}\r\n"));
+                                }
+                            }
+                        }
+                    }
+                    if !lines.is_empty() {
+                        out.push_str("    内容摘录（转义显示，\\r 回车 \\t 制表；行号按换行计）：\r\n");
+                        for (no, left, right) in lines {
+                            out.push_str(&format!("      本地   第 {} 行: {left}\r\n", no + 1));
+                            out.push_str(&format!("      服务器 第 {} 行: {right}\r\n", no + 1));
+                        }
+                    }
+                    out.push_str("\r\n");
+                }
+                Inspect::Same | Inspect::Equivalent(_) => {}
+            }
+        }
+    }
+
+    if equivalent.is_empty() {
+        out.push_str("== 按 BC 口径算一致（不计入差异数）==\r\n（无）\r\n\r\n");
+    } else {
+        out.push_str(&format!(
+            "== 按 BC 口径算一致（不计入差异数，共 {} 项，列 {}）==\r\n",
+            counts.trivial,
+            equivalent.len()
+        ));
+        for item in &equivalent {
+            out.push_str(&format!("- {item}\r\n"));
+        }
+        out.push_str("\r\n");
+    }
+    if !same_looks.is_empty() {
+        out.push_str(&format!(
+            "== 大小或修改时间不同、但内容一致（{} 项，列 {}）==\r\n这些文件多半是 Beyond Compare 合并时重写了时间戳，属于正常现象。\r\n",
+            same_looks_total,
+            same_looks.len()
+        ));
+        for item in &same_looks {
+            out.push_str(&format!("- {item}\r\n"));
+        }
+        out.push_str("\r\n");
+    }
+    listing(&mut out, "只在本地开发侧（工作副本里没有）", &only_local, counts.only_local);
+    listing(&mut out, "只在服务器端（本地开发侧里没有）", &only_server, counts.only_server);
+    if counts.unverified > 0 {
+        out.push_str(&format!(
+            "== 未核对 ==\r\n有 {} 个文件因为预算用满没有读内容，上面的差异数是不完整的下界。\r\n",
+            counts.unverified
+        ));
+    }
+    Ok(out)
+}
+
+fn listing(out: &mut String, title: &str, items: &[(String, u64, u64)], total: usize) {
+    if items.is_empty() {
+        out.push_str(&format!("== {title} ==\r\n（无）\r\n\r\n"));
+        return;
+    }
+    out.push_str(&format!("== {title}（共 {total} 项，列 {}）==\r\n", items.len()));
+    for (rel, size, modified) in items.iter().take(LISTING_MAX) {
+        out.push_str(&format!("- {rel}（大小 {size} · 修改 {}）\r\n", stamp(*modified)));
+    }
+    out.push_str("\r\n");
+}
+
+fn stamp(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| secs.to_string())
+}
+
+/// 逐项读内容判定，返回带原因的结论。与 `verify` 同一套规则，只是把结论拆细了。
+fn inspect(a: &Path, b: &Path) -> Inspect {
+    let (mut fa, mut fb) = match (fs::File::open(a), fs::File::open(b)) {
+        (Ok(fa), Ok(fb)) => (fa, fb),
+        (Err(e), _) => return Inspect::Unreadable { side: "本地端", message: e.to_string() },
+        (_, Err(e)) => return Inspect::Unreadable { side: "服务器端", message: e.to_string() },
+    };
+    let mut ba = vec![0u8; CHUNK];
+    let mut bb = vec![0u8; CHUNK];
+    let mut offset = 0usize;
+    let first = loop {
+        let na = read_chunk(&mut fa, &mut ba);
+        let nb = read_chunk(&mut fb, &mut bb);
+        // 先比公共部分，再比长度：一侧是另一侧前缀时，差异就在短文件结尾处
+        let common = na.min(nb);
+        if let Some(at) = ba[..common].iter().zip(bb[..common].iter()).position(|(x, y)| x != y) {
+            break Some(offset + at);
+        }
+        if na != nb {
+            break Some(offset + common);
+        }
+        offset += na;
+        if na == 0 {
+            break None;
+        }
+    };
+    let Some(first) = first else {
+        return Inspect::Same;
+    };
+    let big = |p: &Path| fs::metadata(p).map(|m| m.len() > NORMALIZE_MAX).unwrap_or(true);
+    if big(a) || big(b) {
+        return Inspect::TooBig { first: Some(first) };
+    }
+    let (x, y) = match (fs::read(a), fs::read(b)) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(e), _) => return Inspect::Unreadable { side: "本地端", message: e.to_string() },
+        (_, Err(e)) => return Inspect::Unreadable { side: "服务器端", message: e.to_string() },
+    };
+    if !looks_text(&x) || !looks_text(&y) {
+        return Inspect::Binary { first: Some(first) };
+    }
+    if normalize(&x) == normalize(&y) {
+        return Inspect::Equivalent(trivial_reason(&x, &y));
+    }
+    Inspect::Text { first, lines: differing_lines(&x, &y) }
+}
+
+/// Equivalent 的原因：从粗到细各归一化一步，第一步打平的那步就是差异所在。
+fn trivial_reason(x: &[u8], y: &[u8]) -> String {
+    const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    let a = x.strip_prefix(BOM).unwrap_or(x);
+    let b = y.strip_prefix(BOM).unwrap_or(y);
+    if a == b {
+        return "只差 BOM".to_owned();
+    }
+    let fold = |v: &[u8]| {
+        let mut out = Vec::with_capacity(v.len());
+        let mut i = 0;
+        while i < v.len() {
+            if v[i] == b'\r' {
+                out.push(b'\n');
+                i += usize::from(v.get(i + 1) == Some(&b'\n'));
+            } else {
+                out.push(v[i]);
+            }
+            i += 1;
+        }
+        out
+    };
+    let (fa, fb) = (fold(a), fold(b));
+    if fa == fb {
+        return "只差行尾（CRLF ↔ LF）".to_owned();
+    }
+    let trim = |v: &[u8]| -> Vec<u8> {
+        v.split(|c| *c == b'\n')
+            .map(|line| match line.iter().rposition(|c| !matches!(c, b' ' | b'\t' | 0x0B | 0x0C)) {
+                Some(kept) => line[..=kept].to_vec(),
+                None => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join(&b'\n')
+    };
+    let (ta, tb) = (trim(&fa), trim(&fb));
+    if ta == tb {
+        return "只差行尾空白（空格 / 制表符）".to_owned();
+    }
+    let eof = |v: &[u8]| -> Vec<u8> {
+        let mut lines: Vec<&[u8]> = v.split(|c| *c == b'\n').collect();
+        if lines.last() == Some(&&[][..]) {
+            lines.pop();
+        }
+        lines.join(&b'\n')
+    };
+    if eof(&ta) == eof(&tb) {
+        return "只差结尾的换行".to_owned();
+    }
+    "多步归一化后才一致".to_owned()
+}
+
+/// 开头几对不同的行：两边同步往前走，行一样就各进一步；
+/// 行不一样时在小窗口里找下一次对齐的位置，对齐前的行都算差异对。
+/// 这不是完整 diff，只是给报告摘开头几处，够看出改了什么。
+fn differing_lines(x: &[u8], y: &[u8]) -> Vec<(usize, String, String)> {
+    fn split(v: &[u8]) -> Vec<(usize, &[u8])> {
+        let mut lines = Vec::new();
+        let mut start = 0usize;
+        for (i, b) in v.iter().enumerate() {
+            if *b == b'\n' {
+                lines.push((start, &v[start..i]));
+                start = i + 1;
+            }
+        }
+        lines.push((start, &v[start..]));
+        lines
+    }
+    let (la, lb) = (split(x), split(y));
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut found = Vec::new();
+    while i < la.len() && j < lb.len() && found.len() < LINES_MAX {
+        if la[i].1 == lb[j].1 {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        // 在前后各 20 行里找重新对齐的点，找不到就整块算不同、直接收尾
+        let mut aligned = None;
+        'seek: for skip in 1..=20 {
+            if i + skip < la.len() && la[i + skip].1 == lb[j].1 {
+                aligned = Some((i + skip, j));
+                break 'seek;
+            }
+            if j + skip < lb.len() && la[i].1 == lb[j + skip].1 {
+                aligned = Some((i, j + skip));
+                break 'seek;
+            }
+        }
+        let (ni, nj) = aligned.unwrap_or((la.len(), lb.len()));
+        for (a, b) in (i..ni).zip(j..nj) {
+            if found.len() >= LINES_MAX {
+                break;
+            }
+            if la[a].1 != lb[b].1 {
+                found.push((la[a].0, excerpt(la[a].1), excerpt(lb[b].1)));
+            }
+        }
+        i = ni;
+        j = nj;
+    }
+    found
+}
+
+/// 一行摘录：先按 UTF-8 解（解不开用替换符），控制字符转义，超长截断。
+fn excerpt(line: &[u8]) -> String {
+    let cut = |mut text: String| -> String {
+        if text.len() > LINE_BYTES {
+            text.truncate(LINE_BYTES);
+            text.push('…');
+        }
+        text
+    };
+    let text = String::from_utf8_lossy(line).replace('\r', "\\r").replace('\t', "\\t");
+    cut(text)
+}
+
+/// 第一个差异处的十六进制对照：差异位置向前取 8 字节、向后取 HEX_PER_LINE*3 字节，
+/// 两侧各按 16 字节一行排出十六进制和可见字符。
+fn hex_diff(a: &[u8], b: &[u8], at: usize) -> String {
+    let start = at.saturating_sub(8);
+    let end = (at + HEX_PER_LINE * 3).min(a.len().max(b.len()));
+    let dump = |label: &str, data: &[u8]| -> String {
+        let mut out = String::new();
+        let mut pos = start;
+        while pos < end.min(data.len()) {
+            let stop = (pos + HEX_PER_LINE).min(end).min(data.len());
+            let row = &data[pos..stop];
+            let hex: Vec<String> = row.iter().map(|byte| format!("{byte:02X}")).collect();
+            let text: String = row
+                .iter()
+                .map(|byte| {
+                    if (0x20..0x7F).contains(byte) {
+                        *byte as char
+                    } else {
+                        '·'
+                    }
+                })
+                .collect();
+            out.push_str(&format!("{label} 0x{pos:06X}  {:<47}  {text}\r\n", hex.join(" ")));
+            pos = stop;
+        }
+        out
+    };
+    format!("{}{}", dump("本地  ", a), dump("服务器", b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +966,78 @@ mod tests {
             "抽样里只该有真不一样的：{:?}",
             s.samples
         );
+    }
+
+    // ------------------------------------------------------------ 诊断报告
+
+    /// 报告要把每类判定都展开：真改内容的给出第一个差异字节和行摘录，
+    /// 只差行尾的写明原因，大小时间不同但内容一致的单独列出免得吓人。
+    #[test]
+    fn diagnose_report_expands_each_verdict() {
+        let (local, server) = tree("diagnose");
+        let t = 1_700_000_000;
+        put(&local, "src/Real.java", b"alpha\r\nbeta\r\n", t);
+        put(&server, "src/Real.java", b"alpha\nBeta\r\n", t + 7);
+        put(&local, "eol.txt", b"x\r\n", t);
+        put(&server, "eol.txt", b"x\n", t + 7);
+        put(&local, "stamp.txt", b"same", t);
+        put(&server, "stamp.txt", b"same", t + 7);
+        put(&local, "gone.txt", b"x", t);
+        put(&server, "extra.txt", b"y", t);
+        let report = diagnose(&local, &server, "").unwrap();
+        assert!(report.contains("内容不同 1"), "{report}");
+        assert!(report.contains("src/Real.java"));
+        assert!(report.contains("第一个差异字节"), "真差异要有字节位置：{report}");
+        assert!(report.contains("第 1 行"), "行摘录要带行号：{report}");
+        assert!(report.contains("只差行尾"), "Equivalent 要写明原因：{report}");
+        assert!(report.contains("stamp.txt"), "只差时间戳的要单独列出：{report}");
+        assert!(report.contains("gone.txt"), "只在本地侧的要列出：{report}");
+        assert!(report.contains("extra.txt"), "只在服务器侧的要列出：{report}");
+        assert!(report.contains("汇总：内容不同 1 · 只在本地开发侧 1 · 只在服务器端 1 · 一致 1"), "汇总数要和主页口径一致：{report}");
+    }
+
+    /// 被 IDEA / 编译 / 杀毒独占打开的文件，常规比对按「不同」算——
+    /// 这正是用户「BC 看不到差异、本软件却报差异」的常见来路，报告里要写清原因。
+    #[cfg(windows)]
+    #[test]
+    fn locked_file_is_expanded_with_reason() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (local, server) = tree("locked");
+        let t = 1_700_000_000;
+        put(&local, "src/Locked.java", b"local text", t);
+        put(&server, "src/Locked.java", b"server text", t + 7);
+        let _guard = std::fs::OpenOptions::new().read(true).share_mode(0).open(local.join("src").join("Locked.java")).unwrap();
+        let report = diagnose(&local, &server, "").unwrap();
+        assert!(report.contains("读不出来"), "{report}");
+        assert!(report.contains("内容不同 1"), "{report}");
+    }
+
+    /// 报告是给用户用记事本看的，必须能按记事本的习惯断行。
+    #[test]
+    fn report_lines_end_with_crlf() {
+        let (local, server) = tree("crlf");
+        put(&local, "a.txt", b"x", 1_700_000_000);
+        put(&server, "a.txt", b"y", 1_700_000_000);
+        let report = diagnose(&local, &server, "").unwrap();
+        assert!(report.contains("\r\n"));
+        for (i, byte) in report.bytes().enumerate() {
+            if byte == b'\r' {
+                assert_eq!(report.as_bytes().get(i + 1), Some(&b'\n'), "第 {i} 字节出现裸 \\r");
+            }
+        }
+    }
+
+    /// 旧目录要清掉，连着两次跑同一个 tree 名不能互相污染。
+    /// 两侧时间戳必须错开：大小和时间全同的文件走快速通道算一致，不读内容。
+    #[test]
+    fn diagnose_is_repeatable() {
+        for _ in 0..2 {
+            let (local, server) = tree("repeat");
+            put(&local, "a.txt", b"x", 1_700_000_000);
+            put(&server, "a.txt", b"y", 1_700_000_001);
+            let report = diagnose(&local, &server, "").unwrap();
+            assert!(report.contains("内容不同 1"), "{report}");
+        }
     }
 
     #[test]

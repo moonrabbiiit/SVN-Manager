@@ -597,6 +597,27 @@ impl RepoApp {
             self.filter_focus = true;
             ui.close();
         }
+        // 本地差异和 Beyond Compare 显示对不上号（本软件报差异、BC 看不到）时，
+        // 让用户把判定展开成报告文件发回来：占用、行尾、编码这些在别人机器上的现象才带得出来
+        if !self.cfg.dirs[index].bc_target.is_empty()
+            && ui
+                .button("导出本地差异报告")
+                .on_hover_text(
+                    "把「本地差异」的每一项判定展开成文字报告：两边的大小和修改时间、判成不同的原因、\
+                     第一个差异字节、差在哪几行。BC 看不到差异而本软件报了差异时，导出这个文件发给开发者排查。",
+                )
+                .clicked()
+        {
+            let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("保存本地差异诊断报告")
+                .set_file_name(format!("本地差异报告_{stamp}.txt"))
+                .save_file()
+            {
+                self.export_local_diff_report(index, path);
+            }
+            ui.close();
+        }
         ui.separator();
         ui.add_enabled_ui(!busy, |ui| {
             if git {

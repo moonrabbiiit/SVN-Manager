@@ -326,6 +326,34 @@ impl RepoApp {
             });
     }
 
+    /// 导出本地差异诊断报告：把上一次比对的每一项判定重新读内容展开成文字报告
+    /// （大小 / 修改时间 / 判成不同的原因 / 第一个差异字节 / 行摘录），写成文件
+    /// 交给用户发回来——用户机器上才能看到的现象，靠这个文件带出来。
+    pub fn export_local_diff_report(&mut self, index: usize, path: PathBuf) {
+        let target = self
+            .cfg
+            .dirs
+            .get(index)
+            .map(|d| d.bc_target.trim_matches('"').trim_matches(['/', '\\']).to_owned())
+            .unwrap_or_default();
+        let (Some(server), label) = (self.dir_path(index), self.dir_label(index)) else { return };
+        let filter = self.cfg.dirs[index].bc_filter.clone();
+        self.pool
+            .spawn(Kind::Diagnose, index, format!("{label} 导出差异报告"), move |sink| {
+                sink.line("$ 导出本地差异诊断报告");
+                let message = match crate::localdiff::diagnose(Path::new(&target), &server, &filter) {
+                    Ok(report) => match std::fs::write(&path, report) {
+                        Ok(()) => format!("诊断报告已写入：{}", path.display()),
+                        Err(e) => format!("报告写入失败：{e}"),
+                    },
+                    Err(e) => e,
+                };
+                let ok = message.starts_with("诊断报告已写入");
+                sink.line(format!("→ {message}"));
+                Data::Run { dir: index, ok, message, reload: false }
+            });
+    }
+
     /// `quiet` 为真时不在输出区打印执行日志（提交成功后的自动刷新用：那是程序
     /// 自己补的读操作，逐行 `$ svn …` 只会淹没提交结果；失败仍走结果消息报出来）。
     pub fn spawn_refresh(&mut self, index: usize, quiet: bool) {

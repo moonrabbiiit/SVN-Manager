@@ -480,6 +480,11 @@ impl RepoApp {
                         self.spawn_refresh(index, quiet);
                     }
                 }
+                (Kind::Diagnose, Data::Run { dir: _, ok, message, .. }) => {
+                    // 报告已经写成文件了，这里只报结果，不用跟着刷新整棵树
+                    self.hint(message.clone());
+                    self.push(if ok { Level::Success } else { Level::Error }, message);
+                }
                 (Kind::LocalDiff, Data::LocalDiff { dir: index, ok, summary }) => {
                     if let Some(view) = self.dirs.get_mut(index) {
                         // 读失败同样清成 None：本地端比对慢几秒，拿上一次的数冒充现状最坏
