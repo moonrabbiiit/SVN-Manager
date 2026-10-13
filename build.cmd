@@ -1,6 +1,6 @@
 @echo off
 rem ============================================================
-rem  Build SVN Manager (single-file Windows exe)
+rem  Build repo-manager (single-file Windows exe)
 rem
 rem  Usage:  build.cmd [version]        e.g.  build.cmd 1.2.4.1
 rem
@@ -54,16 +54,16 @@ if exist "%~dp0version.txt" set /p SHOWVER=<"%~dp0version.txt"
 if defined SHOWVER echo [.] embedding version V%SHOWVER%
 
 rem ---- Windows cannot replace a running exe: warn before the link step ----
-tasklist /nh /fi "imagename eq svn_manager.exe" 2>nul | find /i "svn_manager.exe" >nul
-if not errorlevel 1 echo [!] svn_manager.exe is still running - close it, or the link step cannot replace the exe.
+tasklist /nh /fi "imagename eq repo-manager.exe" 2>nul | find /i "repo-manager.exe" >nul
+if not errorlevel 1 echo [!] repo-manager.exe is still running - close it, or the link step cannot replace the exe.
 
 cargo build --release
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :fail
 echo.
-echo [OK] target\release\svn_manager.exe
+echo [OK] target\release\repo-manager.exe
 if defined SHOWVER echo      embedded version: V%SHOWVER%
-dir target\release\svn_manager.exe
+dir target\release\repo-manager.exe
 echo.
 pause
 exit /b 0

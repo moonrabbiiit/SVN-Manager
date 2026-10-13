@@ -1,25 +1,30 @@
 //! 应用本体：状态构造、每帧的定时与拖放、后台任务结果的回收，以及底部输出面板。
 //!
-//! `SvnApp` 的结构体定义与共享类型留在 main.rs（crate 根），这样各模块照旧写 `crate::SvnApp`。
+//! `RepoApp` 的结构体定义与共享类型留在 main.rs（crate 根），这样各模块照旧写 `crate::RepoApp`。
 
 use crate::config;
-use crate::{APP_TITLE, APP_VERSION, DirView, Level, OutLine, Page, SvnApp};
-use crate::{bcompare, fonts, ink, update};
+use crate::{APP_TITLE, APP_VERSION, DirView, Level, OutLine, Page, RepoApp};
+use crate::{bcompare, fonts, pane_fill, pane_stroke, quiet, update};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use egui::{Align, Color32, Layout, RichText, ScrollArea, Ui};
+use egui::{Align, Layout, RichText, ScrollArea, Ui};
 use crate::config::Config;
 use crate::jobs::{Data, Kind, Pool};
 use crate::svn::Svn;
+use crate::ui::AlignedRow;
 
-impl SvnApp {
+impl RepoApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = Config::load();
         let font_note = fonts::note_for(&cfg.ui_font, fonts::install(&cc.egui_ctx, &cfg.ui_font));
+        let accent = {
+            let [r, g, b] = crate::ui::accent_rgb(&cfg.accent);
+            egui::Color32::from_rgb(r, g, b)
+        };
         for style_theme in [egui::Theme::Dark, egui::Theme::Light] {
             cc.egui_ctx
-                .style_mut_of(style_theme, |style| crate::ui::tune_style(style));
+                .style_mut_of(style_theme, |style| crate::ui::tune_style(style, accent));
         }
         // 直接 with_maximized 会让首帧画在旧尺寸上且不重绘，改为第一帧后再最大化
         cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
@@ -51,10 +56,25 @@ impl SvnApp {
         }
         let git = crate::git::Git { exe: git_exe };
         let git_version = git.version();
+        // 主窗口句柄只在启动时取一次：DWM 的原生标题栏配色只认 HWND，主题随时可切
+        #[cfg(windows)]
+        let hwnd = {
+            use raw_window_handle::HasWindowHandle;
+            cc.window_handle().ok().and_then(|handle| match handle.as_raw() {
+                raw_window_handle::RawWindowHandle::Win32(win32) => {
+                    Some(win32.hwnd.get() as isize)
+                }
+                _ => None,
+            })
+        };
+        #[cfg(not(windows))]
+        let hwnd = None;
         let mut app = Self {
             dirs: vec![DirView::default(); cfg.dirs.len()],
             probing: false,
             refresh_after_detect: true,
+            hwnd,
+            caption_dark: None,
             version,
             candidates: Vec::new(),
             cfg,
@@ -67,7 +87,6 @@ impl SvnApp {
             page: Page::Main,
             commit: None,
             history: None,
-            stats: None,
             file_diff: None,
             file_log: None,
             selected: None,
@@ -85,14 +104,19 @@ impl SvnApp {
             edit_tag: None,
             tag_buf: String::new(),
             tag_focus: false,
+            drag: None,
+            drag_pending: None,
+            drag_pos: None,
+            drag_target: None,
+            drop_zones: Vec::new(),
             relocate: None,
             upload_all: None,
             batch_relocate: None,
+            batch_label: None,
             rollback: None,
             svn_user: String::new(),
             user_probed: false,
             show_settings: false,
-            hint: String::new(),
             confirm_remove: None,
             auto_scroll: true,
             next_refresh: Instant::now() + Duration::from_secs(4),
@@ -113,8 +137,12 @@ impl SvnApp {
             ai_extra: String::new(),
             ai_result: String::new(),
             ai_error: String::new(),
+            mascot: mascot_texture(&cc.egui_ctx),
         };
         app.push(Level::Info, format!("{APP_TITLE} 已启动（配置：{}）", config::config_file().display()));
+        // 后端要在任何检测之前定下来：sync_views 之前每个 DirView 的 kind 还是默认的 Svn，
+        // 先刷新一轮就会拿 svn 去问 Git 目录，报出「不是 SVN 工作副本 E155007」
+        app.sync_views();
         // 自更新的残局在这里收：上次换名留下的 `.old.exe`（旧进程刚退出才删得掉）、
         // 以及下载完没走到换名的暂存文件
         if let Ok(exe) = std::env::current_exe() {
@@ -150,8 +178,6 @@ impl SvnApp {
                 ),
             );
         }
-        // 每个目录先按磁盘上的 .git / .svn 定后端，不等第一轮检测
-        app.sync_views();
         app
     }
 
@@ -172,8 +198,20 @@ impl SvnApp {
         }
     }
 
+    /// 提示不再常驻在底部那一行，直接作为一条 INFO 写进上面的日志区
     pub fn hint(&mut self, text: impl Into<String>) {
-        self.hint = text.into();
+        self.push(Level::Info, text);
+    }
+
+    /// 测试用：日志末尾几条拼起来看（一条提示可能占好几行，只看最后一条会截到半句）
+    #[cfg(test)]
+    pub(crate) fn log_tail(&self) -> String {
+        let from = self.output.len().saturating_sub(4);
+        self.output[from..]
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn persist(&mut self) {
@@ -330,8 +368,6 @@ impl SvnApp {
                             .unwrap_or((false, None));
                         self.spawn_log_in(dir, true, unlimited, range);
                     }
-                    // 统计页可能正等这个登录人（打开时还没探测到），拿到人就补跑一次
-                    self.stats_after_user_probe();
                 }
                 (Kind::CheckUpdate, Data::UpdateCheck { ok, message, info, ready, quiet }) => {
                     if !ok {
@@ -501,13 +537,6 @@ impl SvnApp {
                         self.push(Level::Error, format!("读取提交记录失败：{message}"));
                     }
                 }
-                (Kind::Stats, Data::Stats { dir, epoch, entries, ok, message }) => {
-                    // 一个目录的统计结果：epoch 对不上（用户中途换了条件）会在里面直接丢弃
-                    self.apply_stats(dir, epoch, entries, ok, message.clone());
-                    if !ok {
-                        self.push(Level::Error, format!("读取提交统计失败：{message}"));
-                    }
-                }
                 (Kind::Commit, Data::Run { dir, ok, message, reload }) => {
                     self.hint(message.clone());
                     self.push(if ok { Level::Success } else { Level::Error }, message);
@@ -627,7 +656,7 @@ impl SvnApp {
     fn tick(&mut self, ctx: &egui::Context) {
         ctx.request_repaint_after(Duration::from_millis(150));
         // 主题随时可切换（顶部按钮 / 设置里选），这里统一同步给 egui；
-        // 原生标题栏由 Options::sync_window_theme（默认开启）自动跟随
+        // 原生标题栏不再交给 sync_window_theme 的出厂色，下面按当前视觉自己写给 DWM
         let preference = match self.cfg.theme.as_str() {
             "light" => egui::ThemePreference::Light,
             "dark" => egui::ThemePreference::Dark,
@@ -635,6 +664,18 @@ impl SvnApp {
         };
         if ctx.options(|opt| opt.theme_preference) != preference {
             ctx.set_theme(preference);
+        }
+        // 首帧设一次，之后只有深浅真的换了才重设（DWM 调用不便宜，也没必要逐帧发）
+        let dark = ctx.theme() == egui::Theme::Dark;
+        if self.caption_dark != Some(dark) {
+            self.caption_dark = Some(dark);
+            let style = ctx.style_of(ctx.theme());
+            style_title_bar(
+                self.hwnd,
+                dark,
+                style.visuals.panel_fill,
+                style.visuals.widgets.noninteractive.fg_stroke.color,
+            );
         }
         self.drain(ctx);
         self.spawn_auth_user();
@@ -685,26 +726,17 @@ impl SvnApp {
     // ------------------------------------------------------------ 底部输出面板
 
     fn output_panel(&mut self, ui: &mut Ui) {
-        // 提示条常驻在日志正下方：先占住面板底部这一行，日志区（含滚动条）只吃剩下的高度，
-        // 消息来、消息换都不会把上面那块顶得一跳
-        egui::Panel::bottom("hint_bar").show(ui, |ui| {
-            ui.label(
-                RichText::new(self.hint.clone())
-                    .size(12.5)
-                    .color(ink(ui, Color32::from_rgb(140, 205, 255))),
-            );
-        });
         let count = self.output.len();
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             ui.label(RichText::new(format!("输出运行（{count} 行）")).strong().size(13.0));
-            if ui.button("清空").clicked() {
+            if quiet(ui, |ui| ui.button("清空")).clicked() {
                 self.output.clear();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let mut auto_scroll = self.auto_scroll;
                 ui.checkbox(&mut auto_scroll, "自动滚动");
                 self.auto_scroll = auto_scroll;
-                if ui.button("打开配置目录").clicked() {
+                if quiet(ui, |ui| ui.button("打开配置目录")).clicked() {
                     let dir = config::config_file()
                         .parent()
                         .map(|p| p.display().to_string())
@@ -734,7 +766,89 @@ impl SvnApp {
     }
 }
 
-impl eframe::App for SvnApp {
+/// 原生标题栏跟着当前视觉走。eframe 自带的 sync_window_theme 只会切「出厂深 / 出厂浅」，
+/// 切不出我们这套冷白与冷黑，顶部于是总像别人家的窗口；Win11 的 DWM 允许直接把
+/// 标题栏底色和文字色写掉，于是那一条终于和界面是同一套颜色。
+/// 非 Windows、拿不到 HWND、或者系统不认这些属性（Win10 及更早）——一律什么都不做，
+/// 出厂标题栏照样能用，不值得为配色报错。
+fn style_title_bar(hwnd: Option<isize>, dark: bool, fill: egui::Color32, text: egui::Color32) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Graphics::Dwm::{
+            DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DwmSetWindowAttribute,
+        };
+        let Some(hwnd) = hwnd else { return };
+        let hwnd = hwnd as *mut core::ffi::c_void;
+        // COLORREF 的字节序是 0x00BBGGRR，和 Color32 的 RGBA 正好反着
+        let colorref = |color: egui::Color32| {
+            let [r, g, b, _] = color.to_array();
+            ((b as u32) << 16) | ((g as u32) << 8) | r as u32
+        };
+        let immersive: i32 = if dark { 1 } else { 0 };
+        let caption = colorref(fill);
+        let foreground = colorref(text);
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                &immersive as *const i32 as *const _,
+                4,
+            );
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR as u32,
+                &caption as *const u32 as *const _,
+                4,
+            );
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TEXT_COLOR as u32,
+                &foreground as *const u32 as *const _,
+                4,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (hwnd, dark, fill, text);
+}
+
+/// 右下角吉祥物的显示高度（逻辑点）：原图 872×1160，宽度按原比例跟着算。
+/// 日志面板被拖矮时按面板高收，不然头顶会被面板裁掉
+const MASCOT_H: f32 = 200.0;
+
+/// 那张贴图的不透明度 0.2（× 255 取整）
+const MASCOT_ALPHA: u8 = 51;
+
+/// 启动时把嵌进 exe 的 PNG 解成贴图；解不出来就返回 None，界面少一枚贴图而已
+fn mascot_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let rgba = image::load_from_memory(include_bytes!("../mascot.png"))
+        .ok()?
+        .to_rgba8();
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    Some(ctx.load_texture("mascot", image, egui::TextureOptions::LINEAR))
+}
+
+/// 贴在日志面板的右下角。只画不注册感应区，所以既不吃点击也不抢日志行的选中
+fn paint_mascot(ui: &Ui, tex: &egui::TextureHandle) {
+    let outer = ui.max_rect();
+    let height = MASCOT_H.min(outer.height());
+    let width = height * tex.aspect_ratio();
+    ui.painter().image(
+        tex.id(),
+        egui::Rect::from_min_size(
+            egui::pos2(outer.max.x - width, outer.max.y - height),
+            egui::vec2(width, height),
+        ),
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::from_white_alpha(MASCOT_ALPHA),
+    );
+}
+
+impl eframe::App for RepoApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 字号 = 整屏缩放：egui 的 zoom_factor 是「系统 DPI × 这个倍数」，文字和控件一起放大。
         // 每帧对一次，设置页改完下一帧就生效，换显示器 / 改系统缩放也能跟上
@@ -745,15 +859,38 @@ impl eframe::App for SvnApp {
         self.tick(ctx);
     }
 
+    /// eframe 默认的清屏色是近黑（12,12,12,180），面板之间的接缝只要有一像素没被底色盖住，
+    /// 淡色描边就是往这支黑上混合——量出来 #E4E8F0 会变成 #313337，看着就是一条黑线。
+    /// 底色跟着主题走，接缝处补上的就是同一档白
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("header").show(ui, |ui| {
             self.header(ui);
         });
+        // 添加目录这条要顶到窗口两边，所以挂在中央面板之外（主页才画）
+        if self.page == Page::Main {
+            let (fill, line) = (pane_fill(ui), pane_stroke(ui));
+            egui::Panel::top("add_dir_bar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .stroke(egui::Stroke::new(1.0, line)),
+                )
+                .show(ui, |ui| self.add_dir_bar(ui));
+        }
         egui::Panel::bottom("output")
             .default_size(190.0)
             .resizable(true)
             .show(ui, |ui| {
                 self.output_panel(ui);
+                // 贴图压在日志之上，右下角贴边（0.2 不透明度，字照样读得清）
+                if let Some(tex) = self.mascot.as_ref() {
+                    paint_mascot(ui, tex);
+                }
             });
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default().show(ui, |ui| {
@@ -762,13 +899,13 @@ impl eframe::App for SvnApp {
                 Page::Main => self.main_page(ui),
                 Page::Commit => self.commit_page(ui),
                 Page::History => self.history_page(ui),
-                Page::Stats => self.stats_page(ui),
             }
         });
         self.settings(&ctx);
         self.update_confirm_dialog(&ctx);
         self.relocate_dialog(&ctx);
         self.batch_relocate_dialog(&ctx);
+        self.batch_label_dialog(&ctx);
         self.rollback_dialog(&ctx);
         self.upload_all_dialog(&ctx);
         self.file_diff_window(&ctx);
@@ -780,62 +917,53 @@ impl eframe::App for SvnApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testbed::{base_input, stub_app, Stage};
-    use egui::{Context, Rect, ThemePreference};
+    use crate::testbed::{base_input, stub_app};
+    use egui::{Context, ThemePreference};
 
-    /// 提示条要落在日志正文下面，而且空提示也得占着同一行——上面那块日志区的高度
-    /// 不能因为「来了消息 / 消息空着」上下跳一下。
+    /// 嵌进 exe 的右下角贴图：解不出来只是少一枚贴图，跑起来才看得见，所以在测试里先解一次。
+    /// 只验「解得开、不是全透明」，不去比具体像素
     #[test]
-    fn hint_bar_stays_below_the_log() {
+    fn embedded_mascot_png_decodes_to_something_visible() {
+        let rgba = image::load_from_memory(include_bytes!("../mascot.png"))
+            .expect("mascot.png 解不开")
+            .to_rgba8();
+        assert!(
+            rgba.pixels().any(|p| p.0[3] > 0),
+            "贴图整张都是透明的，画出来等于没画"
+        );
+        assert!(
+            rgba.width() < rgba.height(),
+            "贴图是竖构图才按高度铺得好看：实际 {}×{}",
+            rgba.width(),
+            rgba.height()
+        );
+    }
+
+    /// 提示不再占底部一行：hint() 的话要作为一条 INFO 落进日志，日志面板里只画一次
+    #[test]
+    fn hint_lands_in_the_log() {
         let ctx = Context::default();
         ctx.set_theme(ThemePreference::Dark);
         crate::fonts::install(&ctx, crate::fonts::AUTO);
         let mut app = stub_app(false);
-        app.output.push(OutLine { level: Level::Info, text: "svn status".to_owned() });
+        app.hint("已添加目录：C:\\Test");
 
-        let frame = |app: &mut SvnApp| -> Vec<(String, Rect)> {
-            let mut out = ctx.run_ui(base_input(), |ui| app.output_panel(ui));
-            out.textures_delta.clear();
-            out.shapes
-                .iter()
-                .filter_map(|item| match &item.shape {
-                    egui::Shape::Text(text) => Some((
-                        text.galley.text().to_string(),
-                        item.shape.visual_bounding_rect(),
-                    )),
-                    _ => None,
-                })
-                .filter(|(text, _)| !text.trim().is_empty())
-                .collect()
-        };
-        let strip = |ctx: &Context| {
-            egui::containers::PanelState::load(ctx, egui::Id::new("hint_bar"))
-                .map(|state| state.size().y)
-        };
+        let last = app.output.last().expect("提示要进日志");
+        assert_eq!(last.text, "已添加目录：C:\\Test");
+        assert!(matches!(last.level, Level::Info), "提示按 INFO 记，不抢命令输出的颜色");
 
-        // 面板尺寸第一帧才量得出来，第二帧才是稳的
-        let _ = frame(&mut app);
-        let _ = frame(&mut app);
-        let empty_strip = strip(&ctx).expect("提示条该一直占着这一条");
-
-        app.hint = "已添加目录：C:\\Test".to_owned();
-        let _ = frame(&mut app);
-        let texts = frame(&mut app);
-        let hint = Stage::rect_of(&texts, "已添加目录：C:\\Test").expect("提示条要画出来");
-        let title = Stage::rect_of(&texts, "输出运行（1 行）").expect("日志标题");
-        let line = Stage::rect_of(&texts, "svn status").expect("日志正文");
-
-        assert!(hint.min.y > title.max.y, "提示条要在日志标题下面：{hint:?} / {title:?}");
-        assert!(hint.min.y > line.max.y, "提示条要在日志正文下面：{hint:?} / {line:?}");
-        assert!(
-            hint.max.y <= base_input().screen_rect.unwrap().max.y,
-            "提示条不该顶出窗口下沿：{hint:?}"
-        );
-        assert_eq!(
-            empty_strip,
-            strip(&ctx).unwrap(),
-            "空提示和有提示该占同一条，日志区高度不能跟着变"
-        );
+        let mut out = ctx.run_ui(base_input(), |ui| app.output_panel(ui));
+        out.textures_delta.clear();
+        let hits = out
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .filter(|text| text.contains("已添加目录"))
+            .count();
+        assert_eq!(hits, 1, "这条提示只该在日志里出现一次：{hits}");
     }
 
     /// 两个 GitHub 源（最新发布 / 测试分支）不用填任何地址；自建服务端源没地址就不算可用
@@ -859,9 +987,10 @@ mod tests {
     #[test]
     fn auto_check_fires_only_on_its_own_beat() {
         // 定时检查会写配置（spawn 里顺带 persist），别碰到用户真实的 config.json
+        let _appdata = crate::testbed::lock_appdata();
         std::env::set_var(
             "APPDATA",
-            std::env::temp_dir().join("svn_manager_auto_check_test"),
+            std::env::temp_dir().join("repo_manager_auto_check_test"),
         );
         let ctx = Context::default();
         let mut app = stub_app(false);

@@ -10,6 +10,8 @@ build.done
 /*.png
 # 图标源文件需要入库（build.rs 与 make_ico.ps1 依赖它生成 ico）
 !/rabbit.png
+# 右下角贴图同样要入库（app.rs 用 include_bytes! 嵌进 exe）
+!/mascot.png
 # 本机 IDE / 构建环境配置
 /.idea/
 /.cargo/

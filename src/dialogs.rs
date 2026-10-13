@@ -5,7 +5,33 @@ use egui::{Align, Color32, Frame, Key, Layout, RichText, ScrollArea, TextEdit, V
 
 use crate::jobs::Kind;
 use crate::repo::fmt_rev;
-use crate::{update, APP_VERSION, Level, SvnApp, UploadAll, ink};
+use crate::ui::WindowCentered;
+use crate::{pane_hover, update, APP_VERSION, Level, RepoApp, UploadAll, ink};
+use crate::ui::{AlignedRow, field_margin};
+
+/// 清单行：勾选中的行淡染主色、没勾的行悬停给一档灰底，长列表里指到哪行看得清哪行。
+/// 行内容照旧由调用方摆；悬停读的是上一帧的命中结果——逐帧跟着指针走，滞后一帧看不出来。
+fn checked_row(ui: &mut egui::Ui, id: egui::Id, checked: bool, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let hovered = ui
+        .ctx()
+        .read_response(id)
+        .is_some_and(|resp| resp.hovered());
+    let fill = if checked {
+        ui.visuals().selection.bg_fill
+    } else if hovered {
+        pane_hover(ui)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let row = Frame::new()
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .corner_radius(5.0)
+        .fill(fill)
+        .show(ui, |ui| {
+            ui.horizontal(add_contents);
+        });
+    ui.interact(row.response.rect, id, egui::Sense::hover());
+}
 
 /// 地址前缀改写：把 `current` 开头的 `from` 换成 `to`。两边都先掐掉尾部斜杠；
 /// from 是 current 的开头且 to 非空才改写，否则给 None（没有可显示的新地址）。
@@ -19,7 +45,7 @@ pub(crate) fn rewrite_url(current: &str, from: &str, to: &str) -> Option<String>
     Some(current.replacen(from, to, 1))
 }
 
-impl SvnApp {
+impl RepoApp {
     // ------------------------------------------------------------ 「修改仓库地址」窗口
 
     pub(crate) fn relocate_dialog(&mut self, ctx: &egui::Context) {
@@ -39,7 +65,7 @@ impl SvnApp {
         let mut open = true;
         egui::Window::new(format!("修改仓库地址 · {label}"))
             .open(&mut open)
-            .default_pos(egui::pos2(400.0, 220.0))
+            .centered(ctx, "relocate")
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new("只改写工作副本记录的仓库地址，不会更新、也不会改动任何本地文件。")
@@ -49,14 +75,17 @@ impl SvnApp {
                 ui.label(RichText::new(format!("当前地址：{current}")).size(12.0).monospace());
                 ui.add_space(5.0);
                 ui.label(RichText::new("原地址前缀").strong().size(12.5));
-                ui.add_sized(
-                    Vec2::new(470.0, 22.0),
-                    TextEdit::singleline(&mut dialog.from),
+                ui.add(
+                    TextEdit::singleline(&mut dialog.from)
+                        .margin(field_margin(ui))
+                        .desired_width(470.0),
                 );
                 ui.label(RichText::new("新地址前缀").strong().size(12.5));
-                let field = ui.add_sized(
-                    Vec2::new(470.0, 22.0),
-                    TextEdit::singleline(&mut dialog.to).hint_text("例如 https://ypcloud/svn/java"),
+                let field = ui.add(
+                    TextEdit::singleline(&mut dialog.to)
+                        .hint_text("例如 https://ypcloud/svn/java")
+                        .margin(field_margin(ui))
+                        .desired_width(470.0),
                 );
                 if dialog.focus {
                     field.request_focus();
@@ -92,7 +121,7 @@ impl SvnApp {
                             .color(ink(ui, Color32::from_rgb(240, 100, 100))),
                     );
                 }
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     let ready = !running && !new_url.is_empty() && new_url != current;
                     if ui.add_enabled_ui(ready, |ui| ui.button("✓ 执行 relocate")).inner.clicked() {
                         dialog.error.clear();
@@ -126,7 +155,7 @@ impl SvnApp {
         }
     }
 
-    // ------------------------------------------------------------ 「批量改地址」窗口
+    // ------------------------------------------------------------ 「批量修改仓库」窗口
 
     /// 服务器搬家时一次给多个目录改地址：共用一对地址前缀，每个目录各起一个
     /// relocate 任务（同目录的并发约束由 spawn_relocate 把关，有任务在跑的跳过并计数）。
@@ -178,10 +207,10 @@ impl SvnApp {
             .count();
         let mut open = true;
         let mut close = false;
-        egui::Window::new("批量改地址")
+        egui::Window::new("批量修改仓库")
             .open(&mut open)
             .default_width(760.0)
-            .default_pos(egui::pos2(380.0, 160.0))
+            .centered(ctx, "batch_relocate")
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(
@@ -192,23 +221,25 @@ impl SvnApp {
                 );
                 ui.add_space(5.0);
                 ui.label(RichText::new("原地址前缀").strong().size(12.5));
-                let from_field = ui.add_sized(
-                    Vec2::new(560.0, 22.0),
+                let from_field = ui.add(
                     TextEdit::singleline(&mut dialog.from)
-                        .hint_text("要替换掉的地址开头，例如 http://192.168.1.251:8080/svn"),
+                        .hint_text("要替换掉的地址开头，例如 http://192.168.1.251:8080/svn")
+                        .margin(field_margin(ui))
+                        .desired_width(560.0),
                 );
                 if dialog.focus {
                     from_field.request_focus();
                     dialog.focus = false;
                 }
                 ui.label(RichText::new("新地址前缀").strong().size(12.5));
-                ui.add_sized(
-                    Vec2::new(560.0, 22.0),
+                ui.add(
                     TextEdit::singleline(&mut dialog.to)
-                        .hint_text("新前缀，例如 https://svn.example.com/repo"),
+                        .hint_text("新前缀，例如 https://svn.example.com/repo")
+                        .margin(field_margin(ui))
+                        .desired_width(560.0),
                 );
                 ui.add_space(5.0);
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     ui.label(RichText::new("参与改地址的目录").strong().size(12.5));
                     if ui.button("全选").clicked() {
                         for (index, checked) in dialog.checked.iter_mut().enumerate() {
@@ -230,68 +261,87 @@ impl SvnApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for (index, (label, url, new_url, git)) in rows.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                let can = !git && new_url.is_some();
-                                let mut checked = dialog.checked.get(index).copied().unwrap_or(false);
-                                if ui
-                                    .add_enabled(can, egui::Checkbox::new(&mut checked, ""))
-                                    .on_hover_text("勾选参与本次批量改地址")
-                                    .changed()
-                                {
-                                    dialog.checked[index] = checked;
-                                }
-                                ui.label(RichText::new(label).size(12.5).strong());
-                                match (*git, new_url) {
-                                    (true, _) => {
+                            let picked_row = dialog.checked.get(index).copied().unwrap_or(false);
+                            checked_row(
+                                ui,
+                                egui::Id::new(("relocate_row", index)),
+                                picked_row,
+                                |ui| {
+                                    let can = !git && new_url.is_some();
+                                    let mut checked =
+                                        dialog.checked.get(index).copied().unwrap_or(false);
+                                    if ui
+                                        .add_enabled(can, egui::Checkbox::new(&mut checked, ""))
+                                        .on_hover_text("勾选参与本次批量修改仓库")
+                                        .changed()
+                                    {
+                                        dialog.checked[index] = checked;
+                                    }
+                                    ui.label(RichText::new(label).size(12.5).strong());
+                                    match (*git, new_url) {
+                                        (true, _) => {
+                                            ui.label(
+                                                RichText::new("Git 目录不支持")
+                                                    .size(11.5)
+                                                    .color(ink(ui, Color32::from_gray(130))),
+                                            );
+                                        }
+                                        (false, Some(new)) => {
+                                            ui.label(
+                                                RichText::new(url).size(11.5).monospace().weak(),
+                                            );
+                                            ui.label(RichText::new("→").size(11.5).weak());
+                                            ui.label(
+                                                RichText::new(new)
+                                                    .size(11.5)
+                                                    .monospace()
+                                                    .color(ink(ui, Color32::from_rgb(
+                                                        80, 200, 120,
+                                                    ))),
+                                            );
+                                        }
+                                        (false, None) if url.is_empty() => {
+                                            ui.label(
+                                                RichText::new("未检测，没有地址")
+                                                    .size(11.5)
+                                                    .color(ink(ui, Color32::from_gray(130))),
+                                            );
+                                        }
+                                        (false, None) => {
+                                            ui.label(
+                                                RichText::new(url).size(11.5).monospace().weak(),
+                                            );
+                                            ui.label(
+                                                RichText::new("前缀不匹配")
+                                                    .size(11.5)
+                                                    .color(ink(ui, Color32::from_rgb(
+                                                        240, 100, 100,
+                                                    ))),
+                                            );
+                                        }
+                                    }
+                                    if self.pool.is_busy(index) {
+                                        ui.spinner();
                                         ui.label(
-                                            RichText::new("Git 目录不支持")
-                                                .size(11.5)
-                                                .color(ink(ui, Color32::from_gray(130))),
+                                            RichText::new("有任务在跑，本次跳过")
+                                                .weak()
+                                                .size(11.5),
                                         );
                                     }
-                                    (false, Some(new)) => {
-                                        ui.label(RichText::new(url).size(11.5).monospace().weak());
-                                        ui.label(RichText::new("→").size(11.5).weak());
-                                        ui.label(
-                                            RichText::new(new)
-                                                .size(11.5)
-                                                .monospace()
-                                                .color(ink(ui, Color32::from_rgb(80, 200, 120))),
-                                        );
-                                    }
-                                    (false, None) if url.is_empty() => {
-                                        ui.label(
-                                            RichText::new("未检测，没有地址")
-                                                .size(11.5)
-                                                .color(ink(ui, Color32::from_gray(130))),
-                                        );
-                                    }
-                                    (false, None) => {
-                                        ui.label(RichText::new(url).size(11.5).monospace().weak());
-                                        ui.label(
-                                            RichText::new("前缀不匹配")
-                                                .size(11.5)
-                                                .color(ink(ui, Color32::from_rgb(240, 100, 100))),
-                                        );
-                                    }
-                                }
-                                if self.pool.is_busy(index) {
-                                    ui.spinner();
-                                    ui.label(RichText::new("有任务在跑，本次跳过").weak().size(11.5));
-                                }
-                            });
+                                },
+                            );
                         }
                     });
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     let ready = picked > 0;
                     if dialog.confirm {
                         let button = egui::Button::new(
                             RichText::new(format!("确认改地址？{picked} 个目录"))
                                 .strong()
-                                .color(Color32::from_rgb(255, 240, 240)),
+                                .color(crate::DANGER_TEXT),
                         )
-                        .fill(Color32::from_rgb(150, 60, 60));
+                        .fill(crate::DANGER_FILL);
                         if ui.add_enabled(ready, button).clicked() {
                             let from = dialog.from.trim().trim_end_matches('/').to_owned();
                             let to = dialog.to.trim().trim_end_matches('/').to_owned();
@@ -311,7 +361,7 @@ impl SvnApp {
                                 self.spawn_relocate(index, from.clone(), to.clone(), new_url.clone());
                                 done += 1;
                             }
-                            let mut text = format!("批量改地址：已为 {done} 个目录发起改地址");
+                            let mut text = format!("批量修改仓库：已为 {done} 个目录发起改地址");
                             if skipped > 0 {
                                 text.push_str(&format!("，{skipped} 个因有任务在跑被跳过"));
                             }
@@ -347,6 +397,208 @@ impl SvnApp {
         }
     }
 
+    // ------------------------------------------------------------ 「批量分组 / 标记」窗口
+
+    /// 给勾选的目录统一写分组：空串即清除。只动本地配置，persist 一次，返回真正改动的个数
+    pub(crate) fn apply_batch_group(&mut self, checked: &[bool], group: &str) -> usize {
+        let group = group.trim();
+        let mut done = 0;
+        for (index, dir) in self.cfg.dirs.iter_mut().enumerate() {
+            if !checked.get(index).copied().unwrap_or(false) || dir.group == group {
+                continue;
+            }
+            dir.group = group.to_owned();
+            done += 1;
+        }
+        if done > 0 {
+            self.persist();
+        }
+        done
+    }
+
+    /// 给勾选的目录统一写标记：tag 非空才存颜色（与单目录编辑器同一口径），tag 为空连颜色一起清。
+    /// 只动本地配置，persist 一次，返回真正改动的个数
+    pub(crate) fn apply_batch_tag(&mut self, checked: &[bool], tag: &str, hex: &str) -> usize {
+        let tag = tag.trim();
+        let hex = crate::home::tag_color_hex(crate::home::tag_color_rgb(hex));
+        let mut done = 0;
+        for (index, dir) in self.cfg.dirs.iter_mut().enumerate() {
+            if !checked.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            if tag.is_empty() {
+                if dir.tag.is_empty() && dir.tag_color.is_empty() {
+                    continue;
+                }
+                dir.tag.clear();
+                dir.tag_color.clear();
+            } else {
+                if dir.tag == tag && dir.tag_color == hex {
+                    continue;
+                }
+                dir.tag = tag.to_owned();
+                dir.tag_color = hex.clone();
+            }
+            done += 1;
+        }
+        if done > 0 {
+            self.persist();
+        }
+        done
+    }
+
+    /// 批量分组 / 标记：勾选若干目录，统一设置（或清除）分组、标记。改的是本地配置、
+    /// 随时能逐个改回来，所以不做两步确认；分组与标记两个按钮互不牵连，各写各的字段。
+    pub(crate) fn batch_label_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.batch_label.clone() else {
+            return;
+        };
+        // 窗口开着时目录列表可能增删：勾选状态跟着对齐，新出现的目录默认不勾
+        dialog.checked.resize(self.cfg.dirs.len(), false);
+        dialog.checked.truncate(self.cfg.dirs.len());
+        // 每行一份快照：目录名、当前分组、当前标记——勾了才知道会覆盖谁
+        let rows: Vec<(String, String, String)> = (0..self.cfg.dirs.len())
+            .map(|index| {
+                let dir = &self.cfg.dirs[index];
+                (self.dir_label(index), dir.group.clone(), dir.tag.clone())
+            })
+            .collect();
+        let picked = dialog.checked.iter().filter(|checked| **checked).count();
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("批量分组 / 标记")
+            .open(&mut open)
+            .default_width(560.0)
+            .centered(ctx, "batch_tag")
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "给勾选的目录统一设置分组、标记：只改本地配置，随时能逐个改回来。两个按钮互不影响，各写各的字段。",
+                    )
+                    .weak()
+                    .size(11.5),
+                );
+                ui.add_space(5.0);
+                ui.label(RichText::new("分组").strong().size(12.5));
+                let group_field = ui.add(
+                    TextEdit::singleline(&mut dialog.group)
+                        .hint_text("留空 = 清除所选目录的分组")
+                        .margin(field_margin(ui))
+                        .desired_width(520.0),
+                );
+                if dialog.focus {
+                    group_field.request_focus();
+                    dialog.focus = false;
+                }
+                ui.add_space(3.0);
+                ui.label(RichText::new("标记").strong().size(12.5));
+                ui.aligned_row(|ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut dialog.tag)
+                            .hint_text("留空 = 清除所选目录的标记")
+                            .margin(field_margin(ui))
+                            .desired_width(490.0),
+                    );
+                    let mut rgb = crate::home::tag_color_rgb(&dialog.tag_hex);
+                    if crate::ui::color_swatch(ui, &mut rgb)
+                        .on_hover_text("标记颜色")
+                        .changed()
+                    {
+                        dialog.tag_hex = crate::home::tag_color_hex(rgb);
+                    }
+                });
+                ui.add_space(5.0);
+                ui.aligned_row(|ui| {
+                    ui.label(RichText::new("要修改的目录").strong().size(12.5));
+                    if ui.button("全选").clicked() {
+                        dialog.checked.iter_mut().for_each(|checked| *checked = true);
+                    }
+                    if ui.button("全不选").clicked() {
+                        dialog.checked.iter_mut().for_each(|checked| *checked = false);
+                    }
+                    if picked == 0 {
+                        ui.label(RichText::new("先勾上要修改的目录").weak().size(11.5));
+                    }
+                });
+                ScrollArea::vertical()
+                    .id_salt("batch_label_dirs")
+                    .max_height(220.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, (label, group, tag)) in rows.iter().enumerate() {
+                            let picked_row = dialog.checked.get(index).copied().unwrap_or(false);
+                            checked_row(
+                                ui,
+                                egui::Id::new(("label_row", index)),
+                                picked_row,
+                                |ui| {
+                                    let mut checked =
+                                        dialog.checked.get(index).copied().unwrap_or(false);
+                                    if ui
+                                        .checkbox(&mut checked, "")
+                                        .on_hover_text("勾选参与本次批量修改")
+                                        .changed()
+                                    {
+                                        dialog.checked[index] = checked;
+                                    }
+                                    ui.label(RichText::new(label).size(12.5).strong());
+                                    if !group.trim().is_empty() {
+                                        ui.label(
+                                            RichText::new(format!("分组：{group}"))
+                                                .size(11.5)
+                                                .weak(),
+                                        );
+                                    }
+                                    if !tag.is_empty() {
+                                        ui.label(
+                                            RichText::new(format!("标记：{tag}")).size(11.5).weak(),
+                                        );
+                                    }
+                                    if group.trim().is_empty() && tag.is_empty() {
+                                        ui.label(
+                                            RichText::new("未分组、无标记")
+                                                .size(11.5)
+                                                .color(ink(ui, Color32::from_gray(130))),
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                    });
+                ui.separator();
+                ui.aligned_row(|ui| {
+                    let ready = picked > 0;
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(RichText::new(format!("设置分组（{picked}）")).strong()),
+                        )
+                        .clicked()
+                    {
+                        let n = self.apply_batch_group(&dialog.checked, &dialog.group);
+                        self.push(Level::Info, format!("批量分组：已修改 {n} 个目录的分组"));
+                        close = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(RichText::new(format!("设置标记（{picked}）")).strong()),
+                        )
+                        .clicked()
+                    {
+                        let n = self.apply_batch_tag(&dialog.checked, &dialog.tag, &dialog.tag_hex);
+                        self.push(Level::Info, format!("批量标记：已修改 {n} 个目录的标记"));
+                        close = true;
+                    }
+                });
+            });
+        if open && !close {
+            self.batch_label = Some(dialog);
+        } else {
+            self.batch_label = None;
+        }
+    }
+
     // ------------------------------------------------------------ 「回退到某个版本」窗口
 
     /// 回退确认窗口：这一步会改本地工作副本里的文件，所以第一下只把按钮换成「确认回退」，
@@ -379,7 +631,7 @@ impl SvnApp {
             .collapsible(false)
             .resizable(false)
             .default_width(460.0)
-            .default_pos(egui::pos2(420.0, 240.0))
+            .centered(ctx, "rollback")
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(format!(
@@ -406,14 +658,14 @@ impl SvnApp {
                     );
                 }
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     if dialog.confirm {
                         let button = egui::Button::new(
                             RichText::new(format!("确认回退到 {}", fmt_rev(kind, &revision)))
                                 .strong()
-                                .color(Color32::from_rgb(255, 240, 240)),
+                                .color(crate::DANGER_TEXT),
                         )
-                        .fill(Color32::from_rgb(150, 60, 60));
+                        .fill(crate::DANGER_FILL);
                         if ui.add_enabled(!running, button).clicked() {
                             self.spawn_rollback(
                                 dir,
@@ -432,9 +684,9 @@ impl SvnApp {
                             egui::Button::new(
                                 RichText::new(format!("回退到 {}", fmt_rev(kind, &revision)))
                                     .strong()
-                                    .color(Color32::from_rgb(255, 240, 240)),
+                                    .color(crate::DANGER_TEXT),
                             )
-                            .fill(Color32::from_rgb(150, 60, 60)),
+                            .fill(crate::DANGER_FILL),
                         )
                         .clicked()
                     {
@@ -495,7 +747,7 @@ impl SvnApp {
         let mut close = false;
         egui::Window::new("全部上传")
             .open(&mut open)
-            .default_pos(egui::pos2(430.0, 180.0))
+            .centered(ctx, "upload_all")
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new("风险：这一步会直接改动服务器上的仓库")
@@ -526,7 +778,7 @@ impl SvnApp {
                     dialog.focus = false;
                 }
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     ui.label(RichText::new("参与上传的目录").strong().size(12.5));
                     if ui.button("全选").clicked() {
                         dialog.checked.iter_mut().for_each(|checked| *checked = true);
@@ -544,7 +796,7 @@ impl SvnApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for (index, (label, changed, running)) in rows.iter().enumerate() {
-                            ui.horizontal(|ui| {
+                            ui.aligned_row(|ui| {
                                 let mut checked =
                                     dialog.checked.get(index).copied().unwrap_or(true);
                                 if ui
@@ -624,7 +876,7 @@ impl SvnApp {
                         );
                     }
                 });
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     let ready = total > 0 && picked > 0 && !busy;
                     if dialog.confirm {
                         let caption = if outdated_checked.is_empty() {
@@ -638,9 +890,9 @@ impl SvnApp {
                         let button = egui::Button::new(
                             RichText::new(caption)
                                 .strong()
-                                .color(Color32::from_rgb(255, 240, 240)),
+                                .color(crate::DANGER_TEXT),
                         )
-                        .fill(Color32::from_rgb(150, 60, 60));
+                        .fill(crate::DANGER_FILL);
                         if ui.add_enabled(ready, button).clicked() {
                             let message = dialog.message.clone();
                             for index in 0..total {
@@ -728,7 +980,7 @@ impl SvnApp {
         let mut open = true;
         egui::Window::new(format!("待提交明细 · {label}"))
             .open(&mut open)
-            .default_pos(egui::pos2(520.0, 240.0))
+            .centered(ctx, "pending_detail")
             .default_size(Vec2::new(560.0, 430.0))
             .show(ctx, |ui| {
                 if !path.is_empty() {
@@ -746,7 +998,7 @@ impl SvnApp {
                         _ => {}
                     }
                 }
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     ui.label(RichText::new(format!("共 {} 项", view.changes.len()))
                         .strong()
                         .size(12.5));
@@ -860,7 +1112,7 @@ impl SvnApp {
             .collapsible(false)
             .resizable(false)
             .default_width(440.0)
-            .default_pos(egui::pos2(430.0, 200.0))
+            .centered(ctx, "update_available")
             .show(ctx, |ui| {
                 let latest = manifest.version.trim();
                 // 版本号没变、只是更新源重新发布过构建时不做「旧 → 新」的对比：
@@ -923,7 +1175,7 @@ impl SvnApp {
                 ui.add_space(6.0);
                 if downloading {
                     // 下载中：状态直接在对话框里，不用翻日志区
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         ui.spinner();
                         ui.label(RichText::new("正在下载新版本并校验…").size(12.5));
                     });
@@ -948,7 +1200,7 @@ impl SvnApp {
                     );
                 }
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     // 动作行整组靠右；add 顺序反过来，「开始更新」才仍然排在「稍后再说」左边
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.add_enabled(!downloading, egui::Button::new("稍后再说")).clicked() {
@@ -1014,5 +1266,48 @@ mod tests {
         assert_eq!(rewrite_url("http://old/hrp", "http://old", ""), None, "新前缀为空");
         assert_eq!(rewrite_url("http://old/hrp", "", "https://new"), None, "旧前缀为空");
         assert_eq!(rewrite_url("http://a/b", "b", "c"), None, "中段出现不算前缀");
+    }
+
+    /// 批量分组只动勾选的目录：前后空白掐掉，空串就是清除
+    #[test]
+    fn apply_batch_group_writes_only_checked_dirs() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_batch_group_test"),
+        );
+        let mut app = crate::testbed::stub_app(false);
+        let n = app.apply_batch_group(&[true, false, true, false], "  生产  ");
+        assert_eq!(n, 2, "勾了两个该改两个");
+        assert_eq!(app.cfg.dirs[0].group, "生产");
+        assert_eq!(app.cfg.dirs[1].group, "", "没勾的不动");
+        assert_eq!(app.cfg.dirs[2].group, "生产");
+
+        let n = app.apply_batch_group(&[true, false, false, false], "");
+        assert_eq!(n, 1, "本来就没分组的目录不算改动");
+        assert_eq!(app.cfg.dirs[0].group, "", "空串即清除");
+    }
+
+    /// 批量标记：tag 非空连颜色一起写，tag 为空连颜色一起清；没勾的不受牵连
+    #[test]
+    fn apply_batch_tag_sets_and_clears_with_color() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_batch_tag_test"),
+        );
+        let mut app = crate::testbed::stub_app(false);
+        let n = app.apply_batch_tag(&[true, true, false, false], " 冻结 ", "#FF8040");
+        assert_eq!(n, 2);
+        assert_eq!(app.cfg.dirs[0].tag, "冻结");
+        assert_eq!(app.cfg.dirs[0].tag_color, "#FF8040");
+        assert_eq!(app.cfg.dirs[1].tag_color, "#FF8040");
+
+        let n = app.apply_batch_tag(&[true, false, false, false], "  ", "");
+        assert_eq!(n, 1);
+        assert_eq!(app.cfg.dirs[0].tag, "", "tag 为空连颜色一起清");
+        assert_eq!(app.cfg.dirs[0].tag_color, "");
+        assert_eq!(app.cfg.dirs[1].tag, "冻结", "没勾的不受牵连");
+        assert_eq!(app.cfg.dirs[1].tag_color, "#FF8040");
     }
 }

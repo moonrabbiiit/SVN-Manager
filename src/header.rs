@@ -1,17 +1,18 @@
 //! 顶部状态栏：仓库连接状态、页面切换、主题与设置入口，以及有新版本时的那个按钮。
 
 use crate::repo::RepoKind;
-use crate::{APP_TITLE, DirView, Page, SvnApp, ink};
+use crate::{APP_TITLE, DirView, RepoApp, ink, quiet};
 use egui::{Align, Color32, Layout, RichText, Ui};
 use crate::jobs::Kind;
+use crate::ui::AlignedRow;
 
-impl SvnApp {
+impl RepoApp {
     // ------------------------------------------------------------ 顶部状态栏
 
     fn connection(&self) -> (Color32, String, String) {
-        let green = Color32::from_rgb(80, 200, 120);
-        let amber = Color32::from_rgb(240, 190, 70);
-        let red = Color32::from_rgb(240, 100, 100);
+        let green = crate::ui::OK;
+        let amber = crate::ui::AMBER;
+        let red = crate::ui::ERR;
         let gray = Color32::from_gray(150);
         if self.probing || self.pool.has(Kind::DetectSvn, usize::MAX) {
             return (amber, "正在寻找 svn.exe".into(), "自动探测 SVN 命令行工具".into());
@@ -66,7 +67,7 @@ impl SvnApp {
             .selected
             .and_then(|index| self.pool.busy_label(index))
             .or_else(|| if running > 0 { Some("任务执行中".into()) } else { None });
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             ui.label(RichText::new(APP_TITLE).size(19.0).strong());
             ui.separator();
             if running > 0 {
@@ -115,7 +116,7 @@ impl SvnApp {
                         self.show_update_confirm = true;
                     }
                 }
-                if ui.button("设置").clicked() {
+                if quiet(ui, |ui| ui.button("设置")).clicked() {
                     self.show_settings = !self.show_settings;
                 }
                 let theme_name = match self.cfg.theme.as_str() {
@@ -123,8 +124,7 @@ impl SvnApp {
                     "dark" => "深色",
                     _ => "跟随系统",
                 };
-                if ui
-                    .button(format!("主题：{theme_name}"))
+                if quiet(ui, |ui| ui.button(format!("主题：{theme_name}")))
                     .on_hover_text("点击在 跟随系统 / 浅色 / 深色 之间循环切换")
                     .clicked()
                 {
@@ -136,28 +136,7 @@ impl SvnApp {
                     .to_owned();
                     self.persist();
                 }
-                if ui
-                    .button(if self.page == Page::Stats { "提交统计 ●" } else { "提交统计" })
-                    .on_hover_text(
-                        "统计本人在指定区间里提交涉及的文件数量，整页显示。\n\
-                         区间：当天 / 一周 / 一个月 / 一年 / 所有 / 自定义起止日期。\n\
-                         图：折线图、直方图、火力图（日历格子，颜色越深当天提交越多）。\n\
-                         可以只看某一个目录，也可以选「全部目录（合并）」一起看；\n\
-                         合并时按「版本 + 仓库路径」去重，同一仓库挂在两个目录行下不会重复计。",
-                    )
-                    .clicked()
-                {
-                    self.open_stats();
-                }
-                if ui.button("重新寻找 svn").clicked() {
-                    self.spawn_detect();
-                }
-                if ui.button("全部刷新").clicked() {
-                    self.hint("正在刷新全部目录 …");
-                    self.spawn_all_refresh();
-                }
-                if ui
-                    .button("Beyond Compare")
+                if quiet(ui, |ui| ui.button("Beyond Compare"))
                     .on_hover_text("启动Beyond Compare")
                     .clicked()
                 {
@@ -187,8 +166,7 @@ impl SvnApp {
                          （接口在 设置 → AI 日志 里配置；模式保持开启，可到其他目录继续勾选）".to_owned(),
                     )
                 };
-                if ui
-                    .button(ai_label)
+                if quiet(ui, |ui| ui.button(ai_label))
                     .on_hover_text(ai_hover)
                     .clicked()
                 {
@@ -200,17 +178,51 @@ impl SvnApp {
                         self.show_worklog = true;
                     }
                 }
+                if quiet(ui, |ui| ui.button("提意见"))
+                    .on_hover_text("在 GitHub 上给本项目提 issue：报问题、提需求都可以")
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::same_tab(format!(
+                        "{}/issues",
+                        crate::update::OFFICIAL_PAGE
+                    )));
+                    self.hint("已在默认浏览器打开 GitHub 的 issue 页面");
+                }
             });
         });
-        ui.horizontal(|ui| {
-            let exe = if self.cfg.svn_exe.is_empty() { "未设置".to_owned() } else { self.cfg.svn_exe.clone() };
-            ui.label(RichText::new(format!("svn.exe：{exe}")).weak().size(12.0));
-            let git = if self.git.exe.as_os_str().is_empty() {
-                "未设置".to_owned()
-            } else {
-                self.git.exe.display().to_string()
-            };
-            ui.label(RichText::new(format!("git.exe：{git}")).weak().size(12.0));
-        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 顶栏单独跑一帧，收下这一帧画出来的全部文字。
+    fn header_labels() -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        let mut out = ctx.run_ui(crate::testbed::base_input(), |ui| app.header(ui));
+        // 测试里没有渲染器，字体增量不应用就得显式丢弃，否则 epaint 在 Drop 时 panic
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 右上角换了人：「提意见」进来顶替「重新寻找svn.exe」，找 svn 的活归设置页那颗「自动寻找」。
+    #[test]
+    fn feedback_entry_takes_over_the_svn_rescan_slot() {
+        let labels = header_labels();
+        assert!(labels.iter().any(|text| text == "提意见"), "顶栏没有「提意见」：{labels:?}");
+        assert!(
+            !labels.iter().any(|text| text.contains("重新寻找")),
+            "顶栏不该再有重新寻找 svn.exe：{labels:?}"
+        );
     }
 }

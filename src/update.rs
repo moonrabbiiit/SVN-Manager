@@ -24,7 +24,7 @@
 //! ```json
 //! {
 //!   "version": "1.2.0",
-//!   "url": "files/svn_manager_1.2.0.exe",
+//!   "url": "files/repo-manager_1.2.0.exe",
 //!   "notes": "修复了 xxx",
 //!   "sha256": "……（发布脚本会写；客户端拿它判有没有新版，下载后也用它校验）"
 //! }
@@ -328,7 +328,7 @@ pub fn check(server: &str) -> Result<UpdateManifest, String> {
         return Err("未配置更新服务端地址".to_owned());
     }
     let url = manifest_url(server);
-    let dest = std::env::temp_dir().join("svn_manager_latest.json");
+    let dest = std::env::temp_dir().join("repo_manager_latest.json");
     let _ = std::fs::remove_file(&dest);
     fetch(&url, &dest)?;
     let text = std::fs::read_to_string(&dest)
@@ -553,12 +553,12 @@ fn github_json(url: &str, temp_name: &str) -> Result<String, String> {
 
 /// 从 GitHub 取最新发布。返回的 manifest.url 是资产的 `browser_download_url`（绝对地址）。
 pub fn check_github() -> Result<UpdateManifest, String> {
-    parse_release(&github_json(OFFICIAL_API, "svn_manager_github_latest.json")?)
+    parse_release(&github_json(OFFICIAL_API, "repo_manager_github_latest.json")?)
 }
 
 /// 从 GitHub 取最新一条发布，含预发布（测试分支）。
 pub fn check_github_test() -> Result<UpdateManifest, String> {
-    parse_release_list(&github_json(OFFICIAL_TEST_API, "svn_manager_github_releases.json")?)
+    parse_release_list(&github_json(OFFICIAL_TEST_API, "repo_manager_github_releases.json")?)
 }
 
 /// 按配置选中的更新源检查一次；`server` 只在自建服务端源时用到。
@@ -668,9 +668,9 @@ pub fn sha256_of(path: &Path) -> Result<String, String> {
 pub const AUTO_CHECK_EVERY_SECS: u64 = 300;
 
 /// 新版 exe 暂存用的文件名。程序目录与 %TEMP% 下各放一份都用它。
-pub const STAGED_EXE: &str = "svn_manager_update.exe";
+pub const STAGED_EXE: &str = "repo_manager_update.exe";
 
-/// 旧程序让路时改成的名字：`svn_manager.exe` → `svn_manager.old.exe`。
+/// 旧程序让路时改成的名字：`repo-manager.exe` → `repo-manager.old.exe`。
 /// 名字由正式名推得出来，所以新进程不需要任何跨进程传参就能清掉残局。
 pub fn old_path(exe: &Path) -> PathBuf {
     exe.with_extension("old.exe")
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn sha256_of_works_with_hidden_window() {
-        let path = std::env::temp_dir().join("svn_manager_hash_test.bin");
+        let path = std::env::temp_dir().join("repo_manager_hash_test.bin");
         std::fs::write(&path, b"abc").unwrap();
         let got = sha256_of(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -763,10 +763,10 @@ mod tests {
     /// 控制台代码页，中文不该有任何影响（脚本方案就是死在这儿的）。
     #[test]
     fn swap_in_place_puts_the_new_exe_in_place() {
-        let dir = std::env::temp_dir().join("svn管理器_换名测试");
+        let dir = std::env::temp_dir().join("仓库管理器_换名测试");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("SVN管理器.exe");
+        let exe = dir.join("仓库管理器.exe");
         let staged = dir.join(STAGED_EXE);
         std::fs::write(&exe, b"old-binary").unwrap();
         std::fs::write(&staged, b"new-binary").unwrap();
@@ -786,10 +786,10 @@ mod tests {
     /// 不会停在「正式名字下没有程序」的中间态。
     #[test]
     fn swap_in_place_rolls_back_when_the_staged_file_is_gone() {
-        let dir = std::env::temp_dir().join("svn_manager_swap_rollback");
+        let dir = std::env::temp_dir().join("repo_manager_swap_rollback");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("svn_manager.exe");
+        let exe = dir.join("repo-manager.exe");
         std::fs::write(&exe, b"old-binary").unwrap();
         let staged = dir.join(STAGED_EXE); // 故意不存在
 
@@ -806,10 +806,10 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn swap_in_place_renames_a_running_exe() {
-        let dir = std::env::temp_dir().join("svn_manager_running_swap");
+        let dir = std::env::temp_dir().join("repo_manager_running_swap");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("svn_manager.exe");
+        let exe = dir.join("repo-manager.exe");
         std::fs::copy(r"C:\Windows\System32\ping.exe", &exe).expect("复制替身 exe");
         let mut child = std::process::Command::new(&exe)
             .args(["-n", "20", "127.0.0.1"])
@@ -846,12 +846,12 @@ mod tests {
     /// 以及内网地址是否真能连通（排查过代理劫持导致 curl 28 的现场）：
     ///
     /// ```text
-    /// SVN_UPDATE_TEST_URL=http://192.168.1.251:20700 cargo test -- --ignored
+    /// REPO_MANAGER_UPDATE_TEST_URL=http://192.168.1.251:20700 cargo test -- --ignored
     /// ```
     #[test]
     #[ignore]
     fn check_real_server_smoke() {
-        let Ok(server) = std::env::var("SVN_UPDATE_TEST_URL") else {
+        let Ok(server) = std::env::var("REPO_MANAGER_UPDATE_TEST_URL") else {
             return; // 没给地址就当跳过，不算失败
         };
         let info = check(&server).unwrap_or_else(|e| panic!("检查更新失败：{e}"));
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn sha256_of_matches_known_digest() {
-        let path = std::env::temp_dir().join("svn_manager_sha_test.txt");
+        let path = std::env::temp_dir().join("repo_manager_sha_test.txt");
         std::fs::write(&path, b"hello").expect("写测试文件");
         // sha256("hello") 的公认值
         assert_eq!(

@@ -1,4 +1,4 @@
-# SVN Manager（SVN 管理器）
+# repo-manager（仓库管理器）
 
 单文件 Windows 桌面程序（Rust + egui，无运行时依赖），用来管理多个 SVN 工作副本：
 自动寻找 `svn.exe`、更新 / 上传（提交）/ 查看提交记录 / 左右分栏逐行对比 / Beyond Compare 联动 /
@@ -25,7 +25,7 @@
 
 ### 目录管理
 
-- **自动寻找 svn.exe**：按 `SVN_MANAGER_SVN` 环境变量 → `PATH` → 注册表（TortoiseSVN）→
+- **自动寻找 svn.exe**：按 `REPO_MANAGER_SVN` 环境变量 → `PATH` → 注册表（TortoiseSVN）→
   各磁盘常见安装目录 → 磁盘浅扫描的顺序探测，并用 `svn --version` 验证；也可在设置里手工指定。
   顶部状态灯实时显示「已连接 / 未连接 / 检测中」，每个目录行左侧还有独立状态灯（悬停看原因）。
 - **添加目录**：「选择文件夹」、手工输入、或直接把文件夹拖进窗口；配置持久化。
@@ -91,7 +91,7 @@
 
 ## 快速开始
 
-1. 下载或构建 `svn_manager.exe`（见 [构建指南](#构建指南)）；
+1. 下载或构建 `repo-manager.exe`（见 [构建指南](#构建指南)）；
 2. 双击运行，程序自动寻找本机 `svn.exe`；
 3. 把工作副本文件夹拖进窗口（或点「添加」选择文件夹）；
 4. 每行按需点 `⬇ 更新` / `⬆ 上传` / `🕘 历史`。
@@ -110,7 +110,7 @@ build.cmd 1.2.4.1      :: 顺便把这次的内嵌版本号设成 1.2.4.1
 脚本会自动寻找 MinGW-w64 工具链（优先 `tools\mingw64`，其次 msys2 常见位置，最后 PATH），
 并在缺少 `libpthread.a` 时自动从 rustup 补齐；每一步出错都会停住显示原因。
 
-产物：`target\release\svn_manager.exe`（单文件，无运行时依赖）。
+产物：`target\release\repo-manager.exe`（单文件，无运行时依赖）。
 
 ### 版本号
 
@@ -138,7 +138,7 @@ cargo build --release
 
 ### exe 图标
 
-图标链路：`rabbit.png` → `icon\make_ico.ps1` → `icon\svn_manager.ico`（16–256 共 7 个尺寸），
+图标链路：`rabbit.png` → `icon\make_ico.ps1` → `icon\repo-manager.ico`（16–256 共 7 个尺寸），
 `build.rs` 用 windres 编进 exe（文件 / 窗口 / 任务栏图标）。想换图标：替换根目录 `rabbit.png` 后：
 
 ```bat
@@ -169,7 +169,7 @@ build.cmd
 ```json
 {
   "version": "1.2.0",
-  "url": "files/svn_manager_1.2.0.exe",
+  "url": "files/repo-manager_1.2.0.exe",
   "notes": "修复了 xxx\n新增了 yyy",
   "sha256": "发布时自动写入；客户端拿它判有没有新版，下载后也用它校验",
   "published_at": "2026-09-07 10:00:00"
@@ -198,7 +198,7 @@ build.cmd
 **方式二：命令行发布**
 
 ```bat
-python tools\update_server.py D:\update_root --publish svn_manager_1.2.0.exe --notes "修复xxx"
+python tools\update_server.py D:\update_root --publish repo-manager_1.2.0.exe --notes "修复xxx"
 ```
 
 ### 托管更新服务
@@ -220,8 +220,10 @@ python tools\update_server.py D:\update_root --serve --port 8666
 
 | 文件 | 用途 |
 |------|------|
-| `%APPDATA%\SVNManager\config.json` | 配置（目录列表、svn/BC 路径、账号、条数、刷新间隔、主题、更新服务端地址、开机自启等）；可用记事本编辑，带 UTF-8 BOM 也能识别 |
-| `%APPDATA%\SVNManager\panic.log` | 异常日志（界面程序没有控制台，panic 写在这里；有新增内容时界面顶部会提示） |
+| `%APPDATA%\RepoManager\config.json` | 配置（目录列表、svn/BC 路径、账号、条数、刷新间隔、主题、更新服务端地址、开机自启等）；可用记事本编辑，带 UTF-8 BOM 也能识别 |
+| `%APPDATA%\RepoManager\panic.log` | 异常日志（界面程序没有控制台，panic 写在这里；有新增内容时界面顶部会提示） |
+
+改名前这些文件在 `%APPDATA%\SVNManager\`：第一次启动会把那个目录整个复制到新目录，旧目录原样保留。
 
 - 仓库账号明文保存，慎用共享机器；
 - 所有 svn 命令都带 `--non-interactive`，需要交互输入（首次接受证书等）时直接返回错误并显示在输出面板；

@@ -2,7 +2,7 @@
 //! clicking anywhere in a row must select it, while the buttons inside the
 //! row (update / commit / history / open folder / more / remove) keep working.
 //!
-//! `SvnApp::dir_row` registers a click-sensing scope around each row and turns
+//! `RepoApp::dir_row` registers a click-sensing scope around each row and turns
 //! off `selectable_labels` inside it, because egui labels sense clicks by
 //! default and would otherwise swallow the row click.
 
@@ -45,7 +45,7 @@ struct Hit {
     remove: bool,
 }
 
-/// One frame of a row that mirrors `SvnApp::dir_row`.
+/// One frame of a row that mirrors `RepoApp::dir_row`.
 /// Returns (row, label, update button, remove button) rectangles.
 fn pass(ctx: &Context, events: Vec<Event>, out: &mut Hit) -> (Rect, Rect, Rect, Rect) {
     let mut row_rect = Rect::NOTHING;

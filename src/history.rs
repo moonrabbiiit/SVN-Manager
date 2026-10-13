@@ -5,9 +5,10 @@ use egui::{
 
 use crate::jobs::Kind;
 use crate::repo::{fmt_rev, RepoKind};
-use crate::stats::{parse_date, resolve_range, reversed_hint, RangePreset};
+use crate::daterange::{parse_date, resolve_range, reversed_hint, RangePreset};
 use crate::svn::{LogEntry, LogPath};
-use crate::{highlight_with, ink, Search, SvnApp};
+use crate::{highlight_with, ink, Search, RepoApp};
+use crate::ui::AlignedRow;
 
 /// 「提交记录」页面状态。
 #[derive(Clone)]
@@ -316,7 +317,7 @@ fn action_color(ui: &Ui, action: char) -> Color32 {
     )
 }
 
-impl SvnApp {
+impl RepoApp {
     pub fn history_page(&mut self, ui: &mut Ui) {
         let mut page = match self.history.clone() {
             Some(page) => page,
@@ -361,7 +362,7 @@ impl SvnApp {
             format!("只看 {} 的提交", page.author)
         };
 
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             if ui.button("← 返回目录").clicked() {
                 self.back_to_main();
                 self.history = None;
@@ -545,7 +546,7 @@ impl SvnApp {
                 }
             });
         });
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             let toggle = ui.toggle_value(&mut page.mine, mine_text).changed();
             if toggle {
                 page.error.clear();
@@ -578,7 +579,7 @@ impl SvnApp {
         // 日期区间：走服务器端 `-r {止}:{起}`，比在已读的那批里筛准（条数之外的旧提交也能拿到）
         let today = chrono::Local::now().date_naive();
         let mut refetch = false;
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             ui.label(RichText::new("区间").strong());
             if ui
                 .selectable_label(page.preset.is_none(), "按条数")
@@ -629,22 +630,22 @@ impl SvnApp {
             if page.preset == Some(RangePreset::Custom) {
                 let from = parse_date(&page.custom_from);
                 let to = parse_date(&page.custom_to);
-                crate::stats::date_input(
+                crate::daterange::date_input(
                     ui,
                     egui::Id::new("hist_custom_from"),
                     &mut page.custom_from,
                     "2026-09-01",
                     today,
-                    crate::stats::DayLimits { from: None, to },
+                    crate::daterange::DayLimits { from: None, to },
                 );
                 ui.label("至");
-                crate::stats::date_input(
+                crate::daterange::date_input(
                     ui,
                     egui::Id::new("hist_custom_to"),
                     &mut page.custom_to,
                     "留空=今天",
                     today,
-                    crate::stats::DayLimits { from, to: None },
+                    crate::daterange::DayLimits { from, to: None },
                 );
                 if ui.button("查询").clicked() {
                     match resolve_range(RangePreset::Custom, &page.custom_from, &page.custom_to, today) {
@@ -702,7 +703,7 @@ impl SvnApp {
             );
         }
         if loading {
-            ui.horizontal(|ui| {
+            ui.aligned_row(|ui| {
                 ui.spinner();
                 ui.label("正在读取服务器提交记录（svn log -r HEAD:1）…");
             });
@@ -826,7 +827,7 @@ impl SvnApp {
                             })
                             .stroke(egui::Stroke::new(1.0, row_stroke))
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                ui.aligned_row(|ui| {
                                     // 日志模式开启时才显示勾选框（右上角「AI 日志」开关控制）；
                                     // 是本机登录人的提交才有。勾选后收进「AI 工作日志」，跨目录汇总，
                                     // 状态每帧按勾选清单现算
@@ -922,7 +923,7 @@ impl SvnApp {
                         .id_salt("history_detail")
                         .auto_shrink([false, false])
                         .show(ui2, |ui| {
-                            ui.horizontal(|ui| {
+                            ui.aligned_row(|ui| {
                                 ui.label(
                                     RichText::new(fmt_rev(kind, &entry.revision))
                                         .size(18.0)
@@ -995,7 +996,7 @@ impl SvnApp {
                                 } else {
                                     FontId::proportional(12.0)
                                 };
-                                let row = ui.horizontal(|ui| {
+                                let row = ui.aligned_row(|ui| {
                                     ui.label(
                                         RichText::new(path.action.to_string())
                                             .strong()
@@ -1144,10 +1145,10 @@ impl SvnApp {
             .place(
                 ctx,
                 window,
-                Rect::from_min_size(egui::pos2(200.0, 100.0), Vec2::new(1080.0, 660.0)),
+                crate::ui::centered_rect(ctx, Vec2::new(1080.0, 660.0)),
             )
             .show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.aligned_row(|ui| {
                 ui.label(
                     RichText::new(fmt_rev(kind, &revision))
                         .size(15.0)
@@ -1177,7 +1178,7 @@ impl SvnApp {
             if !diff.message.trim().is_empty() {
                 ui.label(RichText::new(format!("说明：{}", diff.message.trim())).size(12.0));
             }
-            ui.horizontal(|ui| {
+            ui.aligned_row(|ui| {
                 // 开关只跟着这个窗口走：XML 打开时已经自动勾上，其余文件默认看原始差异
                 let mut ignore = diff.ignore_white;
                 if ui
@@ -1248,7 +1249,7 @@ impl SvnApp {
                     let col = ((ui.available_width() - 132.0) * 0.5).max(150.0);
                     // 列标题挪进滚动区，并且用和下面每一行一模一样的格子宽度，
                     // 否则标题会压偏自己那一列（滚动条占掉的宽度外面算不到）
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         ui.add_sized(Vec2::new(44.0, 18.0), egui::Label::new(""));
                         ui.add_sized(
                             Vec2::new(col, 18.0),
@@ -1524,11 +1525,11 @@ impl SvnApp {
             .place(
                 ctx,
                 window,
-                Rect::from_min_size(egui::pos2(420.0, 200.0), Vec2::new(720.0, 500.0)),
+                crate::ui::centered_rect(ctx, Vec2::new(720.0, 500.0)),
             )
             .show(ctx, |ui| {
             ui.label(RichText::new(&url).size(11.5).monospace().weak());
-            ui.horizontal(|ui| {
+            ui.aligned_row(|ui| {
                 if ui.button("重新读取").clicked() {
                     log.error.clear();
                     log.entries.clear();
@@ -1697,7 +1698,7 @@ impl SvnApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::parse_date;
+    use crate::daterange::parse_date;
 
     fn entry(revision: &str, when: &str) -> LogEntry {
         LogEntry {
@@ -1840,7 +1841,7 @@ mod tests {
     /// 跑一帧历史页，返回画出来的「文字 + 矩形」；给了 click 就在这一帧按下鼠标左键
     fn painted_frame(
         ctx: &egui::Context,
-        app: &mut crate::SvnApp,
+        app: &mut crate::RepoApp,
         click: Option<egui::Pos2>,
     ) -> Vec<(String, egui::Rect)> {
         let mut events = Vec::new();
@@ -1875,7 +1876,7 @@ mod tests {
     /// 只把指针停在指定位置（不按下去）跑一帧：悬停才露出来的控件要靠它拿矩形
     fn hover_frame(
         ctx: &egui::Context,
-        app: &mut crate::SvnApp,
+        app: &mut crate::RepoApp,
         pos: egui::Pos2,
     ) -> Vec<(String, egui::Rect)> {
         let mut input = crate::testbed::base_input();
@@ -1902,7 +1903,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, crate::fonts::AUTO);
         // 单文件回退要求本地文件真的在，所以拿临时目录当工作副本
-        let root = std::env::temp_dir().join("svn_manager_rollback_ui");
+        let root = std::env::temp_dir().join("repo_manager_rollback_ui");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).expect("建临时工作副本目录");
         std::fs::write(root.join("src/address.vue"), "x").expect("建临时文件");
@@ -1960,7 +1961,7 @@ mod tests {
         // 5 浮层是 Area，要再空跑一帧才画得出来。
         fn open_menu(
             ctx: &egui::Context,
-            app: &mut crate::SvnApp,
+            app: &mut crate::RepoApp,
             at: egui::Pos2,
         ) -> Vec<(String, egui::Rect)> {
             painted_frame(ctx, app, Some(egui::pos2(4.0, 4.0)));
@@ -2068,21 +2069,21 @@ mod tests {
         let gone = LogPath { action: 'M', kind: "file".to_owned(), path: "/hrp/src/gone.vue".to_owned() };
         app.open_rollback(0, &record, Some(&gone));
         assert!(app.rollback.is_none(), "本地没有这个文件不该开窗口");
-        assert!(app.hint.contains("本地没有这个文件"), "要说明原因：{}", app.hint);
+        assert!(app.log_tail().contains("本地没有这个文件"), "要说明原因：{}", app.log_tail());
 
         // 同仓库别的项目（本地这个目录里没有）：同样不开窗口
-        app.hint.clear();
+        app.output.clear();
         let outside = LogPath { action: 'M', kind: "file".to_owned(), path: "/crm/x.cs".to_owned() };
         app.open_rollback(0, &record, Some(&outside));
         assert!(app.rollback.is_none(), "拼不出本地路径不该开窗口");
-        assert!(app.hint.contains("不在本目录"), "要说清是路径不在本地：{}", app.hint);
+        assert!(app.log_tail().contains("不在本目录"), "要说清是路径不在本地：{}", app.log_tail());
 
         // 还有冲突没解决：整目录回退也先挡回去
-        app.hint.clear();
+        app.output.clear();
         app.dirs[0].conflicts = Some(1);
         app.open_rollback(0, &record, None);
         assert!(app.rollback.is_none(), "冲突没解决不该开始回退");
-        assert!(app.hint.contains("冲突"), "提示要指向「解决冲突」：{}", app.hint);
+        assert!(app.log_tail().contains("冲突"), "提示要指向「解决冲突」：{}", app.log_tail());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2220,7 +2221,7 @@ mod tests {
         page.filter = "externalDB".to_owned();
         app.history = Some(page);
 
-        let click = |glyph: &str, app: &mut crate::SvnApp| {
+        let click = |glyph: &str, app: &mut crate::RepoApp| {
             let frame = painted_frame(&ctx, app, None);
             let target = frame
                 .iter()
@@ -2229,7 +2230,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("搜索框那一行该有 {glyph} 按钮"));
             painted_frame(&ctx, app, Some(target.center()))
         };
-        let page = |app: &crate::SvnApp| app.history.clone().expect("页面状态还在");
+        let page = |app: &crate::RepoApp| app.history.clone().expect("页面状态还在");
 
         // 命中两处，都在涉及文件里（第 2、3 项），说明那条不算落点
         click("▼", &mut app);
@@ -2268,7 +2269,7 @@ mod tests {
         page.filter = "药品".to_owned();
         app.history = Some(page);
 
-        let click = |glyph: &str, app: &mut crate::SvnApp| {
+        let click = |glyph: &str, app: &mut crate::RepoApp| {
             let frame = painted_frame(&ctx, app, None);
             let target = frame
                 .iter()
@@ -2277,7 +2278,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("搜索框那一行该有 {glyph} 按钮"));
             painted_frame(&ctx, app, Some(target.center()))
         };
-        let page = |app: &crate::SvnApp| app.history.clone().expect("页面状态还在");
+        let page = |app: &crate::RepoApp| app.history.clone().expect("页面状态还在");
 
         click("▼", &mut app);
         assert_eq!(page(&app).picked, Some(0), "第一次点 ▼ 落到第一条");

@@ -1,5 +1,5 @@
 //! Regression test for the side-by-side diff rows rendered inside
-//! `SvnApp::file_diff_window`: every row is
+//! `RepoApp::file_diff_window`: every row is
 //! [old line no][old text cell][new line no][new text cell], and hunk headers
 //! (`@@ -461,7 +461,7 @@`) are whole-width rows of their own.
 //!

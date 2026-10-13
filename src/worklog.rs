@@ -14,8 +14,10 @@ use egui::{Align, Color32, FontId, Frame, RichText, ScrollArea, TextEdit, Ui, Ve
 
 use crate::jobs::{Data, Kind};
 use crate::repo::RepoKind;
+use crate::ui::WindowCentered;
 use crate::svn::LogEntry;
-use crate::{ink, SvnApp};
+use crate::{ink, RepoApp};
+use crate::ui::AlignedRow;
 
 /// 一次 AI 生成时单文件条数超过这个值就提醒可能消耗较多 token
 const FILE_WARN_LIMIT: usize = 20;
@@ -152,7 +154,7 @@ pub fn request(
 fn post_json(url: &str, key: &str, body: &str) -> Result<String, String> {
     let curl = crate::update::find_curl()
         .ok_or("未找到系统 curl.exe（Windows 10 1803+ 自带），无法调用 AI 接口")?;
-    let dir = std::env::temp_dir().join("SVNManager").join("ai");
+    let dir = std::env::temp_dir().join("RepoManager").join("ai");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
     let body_path = dir.join("request.json");
     let cfg_path = dir.join("curl.cfg");
@@ -241,7 +243,7 @@ fn preview(text: &str) -> String {
     }
 }
 
-impl SvnApp {
+impl RepoApp {
     /// 把勾选的提交发给 AI（后台任务，结果整块回传）
     pub fn spawn_ai_log(&mut self) {
         if self.pool.has(Kind::AiLog, usize::MAX) {
@@ -300,7 +302,7 @@ impl SvnApp {
             .default_size(Vec2::new(880.0, 800.0))
             .min_width(780.0)
             .min_height(620.0)
-            .default_pos(egui::pos2(240.0, 50.0))
+            .centered(ctx, "worklog")
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("把勾选的提交交给 AI，按你的口吻整理成工作日志").size(13.0));
@@ -319,7 +321,7 @@ impl SvnApp {
                 ui.add_space(2.0);
 
                 // ---- 已选提交 ----
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     ui.label(
                         RichText::new(format!("已选提交（{} 个版本 / {files} 个文件）", self.ai_picks.len()))
                             .strong()
@@ -339,7 +341,7 @@ impl SvnApp {
                     });
                 });
                 // ---- 从其他目录补充勾选：跨目录汇总的入口就放在窗口里 ----
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     ui.label(RichText::new("还要加其他目录的提交：").size(12.5));
                     if self.cfg.dirs.is_empty() {
                         ui.label(RichText::new("目录列表为空").weak().size(12.0));
@@ -417,7 +419,7 @@ impl SvnApp {
                                     .stroke(egui::Stroke::new(1.0, stroke))
                                     .show(ui, |ui| {
                                         ui.set_width(ui.available_width());
-                                        ui.horizontal(|ui| {
+                                        ui.aligned_row(|ui| {
                                             ui.label(
                                                 RichText::new(format!("【{}】", pick.dir_label))
                                                     .strong()
@@ -507,7 +509,7 @@ impl SvnApp {
                 ui.add_space(6.0);
 
                 // ---- 生成 ----
-                ui.horizontal(|ui| {
+                ui.aligned_row(|ui| {
                     let (fill, text_color) = if ui.visuals().dark_mode {
                         (Color32::from_rgb(70, 130, 245), Color32::WHITE)
                     } else {
@@ -570,7 +572,7 @@ impl SvnApp {
                 // ---- 结果 ----
                 if !self.ai_result.is_empty() || !generating {
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         ui.label(RichText::new("生成结果（可直接编辑）").strong().size(13.0));
                         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                             if ui

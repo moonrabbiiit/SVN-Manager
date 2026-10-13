@@ -5,11 +5,13 @@ use std::path::PathBuf;
 use egui::{RichText, ScrollArea, TextEdit, Vec2};
 
 use crate::{autostart, bcompare, config, fonts};
+use crate::ui::WindowCentered;
 use crate::jobs::Kind;
 use crate::update;
-use crate::{APP_VERSION, Level, SvnApp};
+use crate::{APP_VERSION, Level, RepoApp};
+use crate::ui::{AlignedRow, field_margin};
 
-impl SvnApp {
+impl RepoApp {
     // ------------------------------------------------------------ 设置窗口
 
     pub(crate) fn settings(&mut self, ctx: &egui::Context) {
@@ -21,15 +23,17 @@ impl SvnApp {
         let version = self.version.clone().unwrap_or_else(|| "不可用".into());
         egui::Window::new("设置")
             .open(&mut open)
-            .default_pos(egui::pos2(240.0, 120.0))
+            .centered(ctx, "settings")
             .default_size(Vec2::new(660.0, 430.0))
             .show(ctx, |ui| {
                 ScrollArea::vertical().id_salt("settings").show(ui, |ui| {
                     ui.label(RichText::new("svn.exe 路径").strong());
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            Vec2::new((ui.available_width() - 150.0).max(180.0), 22.0),
-                            TextEdit::singleline(&mut self.cfg.svn_exe).hint_text("留空则自动寻找"),
+                    ui.aligned_row(|ui| {
+                        ui.add(
+                            TextEdit::singleline(&mut self.cfg.svn_exe)
+                                .hint_text("留空则自动寻找")
+                                .margin(field_margin(ui))
+                                .desired_width((ui.available_width() - 150.0).max(180.0)),
                         );
                         if ui.button("浏览…").clicked() {
                             if let Some(file) = rfd::FileDialog::new()
@@ -44,7 +48,7 @@ impl SvnApp {
                         }
                     });
                     ui.label(RichText::new("如果显示“无法添加工作副本”，请重新安装svn，并且勾选“command line client tools”").weak());
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         if ui.button("应用此路径").clicked() {
                             let exe = self.cfg.svn_exe.clone();
                             self.apply_svn_exe(&exe);
@@ -79,10 +83,12 @@ impl SvnApp {
                     }
                     ui.separator();
                     ui.collapsing("git.exe 路径（.git 目录行用）", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                Vec2::new((ui.available_width() - 150.0).max(180.0), 22.0),
-                                TextEdit::singleline(&mut self.cfg.git_exe).hint_text("留空则自动寻找"),
+                        ui.aligned_row(|ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut self.cfg.git_exe)
+                                    .hint_text("留空则自动寻找")
+                                    .margin(field_margin(ui))
+                                    .desired_width((ui.available_width() - 150.0).max(180.0)),
                             );
                             if ui.button("浏览…").clicked() {
                                 if let Some(file) = rfd::FileDialog::new()
@@ -95,7 +101,7 @@ impl SvnApp {
                                 }
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             if ui.button("应用此路径").clicked() {
                                 let exe = self.cfg.git_exe.clone();
                                 self.apply_git_exe(&exe);
@@ -136,10 +142,12 @@ impl SvnApp {
                     });
                     ui.separator();
                     ui.collapsing("Beyond Compare 设置", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                Vec2::new((ui.available_width() - 150.0).max(180.0), 22.0),
-                                TextEdit::singleline(&mut self.cfg.bc_exe).hint_text("留空则自动寻找"),
+                        ui.aligned_row(|ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut self.cfg.bc_exe)
+                                    .hint_text("留空则自动寻找")
+                                    .margin(field_margin(ui))
+                                    .desired_width((ui.available_width() - 150.0).max(180.0)),
                             );
                             if ui.button("浏览…").clicked() {
                                 if let Some(file) = rfd::FileDialog::new()
@@ -153,7 +161,7 @@ impl SvnApp {
                                 }
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             if ui.button("应用此路径").clicked() {
                                 self.bc = PathBuf::from(self.cfg.bc_exe.trim_matches('"'));
                                 self.persist();
@@ -178,7 +186,7 @@ impl SvnApp {
                         });
                         // 调用对比时的服务器端所在侧：文件对比的 BASE 版本、
                         // 文件夹对比里所选的工作副本目录都算服务器端
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("调用对比时，服务器端放在");
                             for (value, text) in [("left", "左侧"), ("right", "右侧")] {
                                 if ui
@@ -224,7 +232,7 @@ impl SvnApp {
                                         "写的是 BCSessions.xml 里「新建文件夹比较」那个默认值节点，\
                                          之后所有新建的文件夹比较都按它来（包括本程序打开的）。\n\
                                          Beyond Compare 退出时会整个覆盖会话存储，所以改之前要先全部关掉它；\
-                                         写入前会自动备份成 BCSessions.xml.svnmanager.bak。",
+                                         写入前会自动备份成 BCSessions.xml.repomanager.bak。",
                                     )
                                     .clicked()
                                 {
@@ -268,13 +276,22 @@ impl SvnApp {
                     });
                     ui.separator();
                     ui.collapsing("仓库账号（留空则使用 svn 已缓存的凭据）", |ui| {
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("用户名");
-                            ui.add(TextEdit::singleline(&mut self.cfg.auth_user).desired_width(180.0));
+                            ui.add(
+                                TextEdit::singleline(&mut self.cfg.auth_user)
+                                    .margin(field_margin(ui))
+                                    .desired_width(180.0),
+                            );
                         });
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("密码    ");
-                            ui.add(TextEdit::singleline(&mut self.cfg.auth_pass).password(true).desired_width(180.0));
+                            ui.add(
+                                TextEdit::singleline(&mut self.cfg.auth_pass)
+                                    .password(true)
+                                    .margin(field_margin(ui))
+                                    .desired_width(180.0),
+                            );
                         });
                         if ui.button("保存账号信息").clicked() {
                             self.svn.username = self.cfg.auth_user.clone();
@@ -286,11 +303,11 @@ impl SvnApp {
                         ui.label(RichText::new("注意：密码以明文保存于配置文件中，仅在仓库没有缓存凭据时填写。").weak().size(11.5));
                     });
                     ui.collapsing("常规", |ui| {
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("提交记录读取条数");
                             ui.add(egui::DragValue::new(&mut self.cfg.log_limit).range(5..=500).speed(5));
                         });
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("自动刷新间隔（秒，0 = 关闭）");
                             ui.add(egui::DragValue::new(&mut self.cfg.auto_refresh).range(0..=3600).speed(10));
                         });
@@ -351,7 +368,7 @@ impl SvnApp {
                                 }
                             }
                         }
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("主题");
                             for (value, text) in
                                 [("system", "跟随系统"), ("light", "浅色"), ("dark", "深色")]
@@ -362,7 +379,23 @@ impl SvnApp {
                                 }
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
+                            ui.label("主题色");
+                            // 取色器读写的都是 "#RRGGBB"；留空时 accent_rgb 回落到默认靛蓝，
+                            // 所以按钮一上来就停在当前真正生效的那支色上
+                            let mut rgb = crate::ui::accent_rgb(&self.cfg.accent);
+                            if crate::ui::color_swatch(ui, &mut rgb).changed() {
+                                self.cfg.accent = crate::ui::accent_hex(rgb);
+                                self.apply_accent(ctx);
+                                self.persist();
+                            }
+                            if ui.button("恢复默认").clicked() {
+                                self.cfg.accent.clear();
+                                self.apply_accent(ctx);
+                                self.persist();
+                            }
+                        });
+                        ui.aligned_row(|ui| {
                             ui.label("字号");
                             let mut changed = false;
                             egui::ComboBox::from_id_salt("ui_scale")
@@ -381,7 +414,7 @@ impl SvnApp {
                                 self.persist();
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("字体");
                             let mut picked: Option<String> = None;
                             egui::ComboBox::from_id_salt("ui_font")
@@ -419,30 +452,34 @@ impl SvnApp {
                             .size(11.5)
                             .weak(),
                         );
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("服务地址");
-                            ui.add_sized(
-                                Vec2::new((ui.available_width() - 90.0).max(180.0), 22.0),
-                                TextEdit::singleline(&mut self.cfg.ai_url).hint_text(
-                                    "如 https://api.deepseek.com（通义：https://dashscope.aliyuncs.com/compatible-mode/v1）",
-                                ),
+                            ui.add(
+                                TextEdit::singleline(&mut self.cfg.ai_url)
+                                    .hint_text(
+                                        "如 https://api.deepseek.com（通义：https://dashscope.aliyuncs.com/compatible-mode/v1）",
+                                    )
+                                    .margin(field_margin(ui))
+                                    .desired_width((ui.available_width() - 90.0).max(180.0)),
                             );
                         });
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("API Key");
-                            ui.add_sized(
-                                Vec2::new((ui.available_width() - 90.0).max(180.0), 22.0),
+                            ui.add(
                                 TextEdit::singleline(&mut self.cfg.ai_key)
                                     .password(true)
-                                    .hint_text("sk-…"),
+                                    .hint_text("sk-…")
+                                    .margin(field_margin(ui))
+                                    .desired_width((ui.available_width() - 90.0).max(180.0)),
                             );
                         });
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             ui.label("模型名  ");
-                            ui.add_sized(
-                                Vec2::new((ui.available_width() - 90.0).max(180.0), 22.0),
+                            ui.add(
                                 TextEdit::singleline(&mut self.cfg.ai_model)
-                                    .hint_text("如 deepseek-chat / gpt-4o-mini / qwen-plus"),
+                                    .hint_text("如 deepseek-chat / gpt-4o-mini / qwen-plus")
+                                    .margin(field_margin(ui))
+                                    .desired_width((ui.available_width() - 90.0).max(180.0)),
                             );
                         });
                         ui.label(RichText::new("口吻").size(11.5).weak());
@@ -465,7 +502,7 @@ impl SvnApp {
                     ui.separator();
                     ui.collapsing("版本更新", |ui| {
                         ui.label(RichText::new("更新源").size(11.5).weak());
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             // 三个都先求值再判断：`||` 短路会让没求值的那个 radio 某帧消失
                             let pick_official = ui.radio_value(
                                 &mut self.cfg.update_source,
@@ -514,11 +551,12 @@ impl SvnApp {
                                 .size(11.5)
                                 .weak(),
                             );
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    Vec2::new((ui.available_width() - 90.0).max(180.0), 22.0),
+                            ui.aligned_row(|ui| {
+                                ui.add(
                                     TextEdit::singleline(&mut self.cfg.update_server)
-                                        .hint_text("如 http://192.168.1.10:8666"),
+                                        .hint_text("如 http://192.168.1.10:8666")
+                                        .margin(field_margin(ui))
+                                        .desired_width((ui.available_width() - 90.0).max(180.0)),
                                 );
                                 if ui.button("保存地址").clicked() {
                                     self.persist();
@@ -551,7 +589,7 @@ impl SvnApp {
                                 "已关闭自动检查更新"
                             });
                         }
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             let checking = self.pool.has(Kind::CheckUpdate, usize::MAX);
                             if ui
                                 .button(if checking { "检查中…" } else { "检查更新" })

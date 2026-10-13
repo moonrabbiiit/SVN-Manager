@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,9 @@ pub struct Config {
     pub auto_refresh: u64,
     /// 主题：system / light / dark
     pub theme: String,
+    /// 主题色 "#RRGGBB"（选中态、链接、焦点框、拖拽高亮都跟着它走）。
+    /// 留空或读不出来都用默认那支靛蓝，见 `ui::accent_rgb`
+    pub accent: String,
     /// 界面字体族：「自动」= 按本机现成的中文字体挑，其余是 `fonts::available()` 里的族名
     pub ui_font: String,
     /// 界面字号：小 / 标准 / 大 / 特大（整屏缩放，见 `fonts::SCALES`）
@@ -89,6 +92,8 @@ impl Default for Config {
             log_limit: 100,
             auto_refresh: 120,
             theme: "system".to_owned(),
+            // 主题色留空 = 用默认靛蓝，用户在设置页取色后才写 hex
+            accent: String::new(),
             history_only_mine: true,
             // 默认查官方 GitHub 发布：不用填任何地址就能检查更新；要用内网服务端在设置里切
             update_source: "official".to_owned(),
@@ -115,15 +120,68 @@ impl Default for Config {
     }
 }
 
-fn config_dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
+/// 用户在 Explorer 里看到的本程序数据目录名
+const APP_DIR: &str = "RepoManager";
+/// 改名前的数据目录名，只用于把老用户数据搬过来（见 `migrate_legacy_dir`）
+const LEGACY_APP_DIR: &str = "SVNManager";
+
+fn app_data_base() -> PathBuf {
+    std::env::var_os("APPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("SVNManager")
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn config_dir() -> PathBuf {
+    app_data_base().join(APP_DIR)
+}
+
+/// 改名前的老目录：`%APPDATA%\SVNManager`
+fn legacy_config_dir() -> PathBuf {
+    app_data_base().join(LEGACY_APP_DIR)
 }
 
 pub fn config_file() -> PathBuf {
     config_dir().join("config.json")
+}
+
+/// 递归复制一棵目录树；`std::fs::copy` 只处理文件，老目录里的 `bc-store-backup-*` 是目录
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+/// 机器名从 svn_manager 改成 repo-manager 之后第一次启动时，把老目录里的用户数据搬进新目录：
+/// 目录列表、分组、标记、更新服务端地址都在 config.json 里，不搬就等于让他重配一遍。
+pub fn migrate_legacy_dir() {
+    copy_legacy_data(&config_dir(), &legacy_config_dir());
+}
+
+/// 搬家实际做的那一步，两个目录直接给进来：测试并发 `set_var("APPDATA")`，
+/// 让它自己读环境会互相踩。只在 new 目录还没有 config.json、old 目录有的时候动手；
+/// 搬完**保留**旧目录：中途崩了下次启动会再搬一遍，而他要是想换回旧版 exe，老配置还是原样。
+/// 返回这一趟到底搬了没有。
+fn copy_legacy_data(new_dir: &Path, old_dir: &Path) -> bool {
+    if new_dir.join("config.json").is_file() || !old_dir.join("config.json").is_file() {
+        return false;
+    }
+    if std::fs::create_dir_all(new_dir).is_err() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(old_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let _ = copy_tree(&entry.path(), &new_dir.join(entry.file_name()));
+    }
+    true
 }
 
 impl Config {
@@ -229,5 +287,84 @@ mod tests {
         assert_eq!(parsed.collapsed_groups, vec!["生产".to_owned(), "测试".to_owned()]);
         let back: Config = serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(back, parsed);
+    }
+
+    /// 每条用例一个独立的临时根目录，跑完自己清掉，不碰 APPDATA
+    fn migration_root(case: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("repo_manager_{case}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// 改名后第一次启动：老目录里的东西整棵搬进新目录，旧目录留着
+    #[test]
+    fn data_moves_from_the_legacy_dir_once() {
+        let root = migration_root("migration_case");
+        let old = root.join(LEGACY_APP_DIR);
+        let new = root.join(APP_DIR);
+        std::fs::create_dir_all(old.join("bc-store-backup-20260903")).unwrap();
+        std::fs::write(
+            old.join("config.json"),
+            r#"{"svn_exe":"svn","dirs":[{"path":"D:\\a","label":"A","group":"生产"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(old.join("panic.log"), b"boom").unwrap();
+        std::fs::write(old.join("bc-store-backup-20260903/BCSessions.xml"), b"<xml/>").unwrap();
+
+        assert!(copy_legacy_data(&new, &old), "老目录有配置就该搬");
+        let text = std::fs::read_to_string(new.join("config.json")).unwrap();
+        let moved: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(moved.dirs[0].label, "A");
+        assert_eq!(moved.dirs[0].group, "生产");
+        assert_eq!(std::fs::read(new.join("panic.log")).unwrap(), b"boom".to_vec());
+        assert!(new.join("bc-store-backup-20260903/BCSessions.xml").is_file(), "子目录也要跟着搬");
+        // 保留旧目录：想换回旧版 exe 时老配置还是原样
+        assert!(old.join("config.json").is_file(), "旧目录不该被删");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 新目录已经有 config.json 就说明搬过了（或者他是全新用户），绝不能拿旧目录盖回去
+    #[test]
+    fn migration_never_overwrites_a_populated_new_dir() {
+        let root = migration_root("migration_keep");
+        let old = root.join(LEGACY_APP_DIR);
+        let new = root.join(APP_DIR);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("config.json"), r#"{"dirs":[{"path":"D:\\old","label":"旧"}]}"#)
+            .unwrap();
+        std::fs::write(new.join("config.json"), r#"{"dirs":[{"path":"D:\\new","label":"新"}]}"#)
+            .unwrap();
+
+        assert!(!copy_legacy_data(&new, &old), "新目录有配置就不该再搬");
+        let kept: Config =
+            serde_json::from_str(&std::fs::read_to_string(new.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(kept.dirs[0].label, "新");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 没有老目录（全新安装）不是错误，也不该顺手建出一个空的新目录
+    #[test]
+    fn nothing_to_move_leaves_no_empty_dir() {
+        let root = migration_root("migration_absent");
+        let old = root.join(LEGACY_APP_DIR);
+        let new = root.join(APP_DIR);
+
+        assert!(!copy_legacy_data(&new, &old), "老目录不在就什么都不做");
+        assert!(!new.exists(), "不该留下空的新目录");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 钉住目录名本身：万一以后有人手滑改回旧名，这条会当场红
+    #[test]
+    fn data_dir_is_named_after_the_project() {
+        assert_eq!(config_file().file_name().unwrap(), "config.json");
+        assert_eq!(config_dir().file_name().unwrap(), APP_DIR);
+        assert_eq!(APP_DIR, "RepoManager");
+        assert_eq!(legacy_config_dir().file_name().unwrap(), LEGACY_APP_DIR);
     }
 }

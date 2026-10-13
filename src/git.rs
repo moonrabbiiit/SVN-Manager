@@ -174,12 +174,14 @@ impl Git {
         };
         let remote = self.git(&["remote", "get-url", "origin"], Some(dir));
         let url = if remote.ok { remote.out.trim().to_owned() } else { String::new() };
+        let branch = self.branch(dir);
         (
             Some(WcInfo {
                 is_wc: true,
                 url: url.clone(),
                 repos_root: url,
                 revision: head,
+                branch,
                 node_kind: "dir".to_owned(),
                 last_rev,
                 last_author,
@@ -275,7 +277,7 @@ impl Git {
         self.log_common(dir, "", "", limit, author, None)
     }
 
-    /// 带日期区间的提交记录（提交统计用）。`since` / `until` 为空表示不限那一头，
+    /// 带日期区间的提交记录（「提交记录」页按区间查询用）。`since` / `until` 为空表示不限那一头，
     /// 格式就是 git 自己认的日期写法（如 `2026-09-11`）。
     pub fn log_in(
         &self,
@@ -445,7 +447,7 @@ impl Git {
         if !staged.ok {
             return staged;
         }
-        let message_file = crate::svn::temp_file("svn_manager_log");
+        let message_file = crate::svn::temp_file("repo_manager_log");
         if fs::write(&message_file, message.as_bytes()).is_err() {
             return Run::error("无法写入提交说明临时文件");
         }
@@ -917,7 +919,7 @@ mod tests {
             return;
         };
         let git = Git { exe };
-        let root = std::env::temp_dir().join(format!("svn_manager_git_chain_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("repo_manager_git_chain_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("建临时目录");
         let origin = root.join("origin.git");

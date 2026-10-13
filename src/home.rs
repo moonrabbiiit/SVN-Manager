@@ -4,11 +4,84 @@
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, TextEdit, Ui, Vec2};
 use egui::Key;
 
-use crate::{ink, DirView, Maintain, SvnApp, UploadAll};
+use crate::{
+    field_margin, ink, pale, pane_fill, pane_hover, pane_stroke, quiet, DirView, Maintain, RepoApp,
+    UploadAll,
+};
+use crate::ui::AlignedRow;
 
 /// 简约形态下目录卡片的边长（逻辑点）：四角各摆一块内容（状态灯、计数标记、版本行、
 /// 「+」），名称横排在正中；168 是让这几块互不相撞、名称还能放六七个汉字的最小尺寸
 const CARD_SIZE: f32 = 168.0;
+
+/// 拖动落点。分组标题条整条通栏，落上去 = 并入那一组；目录行 / 卡片各切成两半，
+/// 落在前半或后半 = 插到它之前或之后，分组也跟着那一行走——
+/// 所以拖到未分组的行上，就等于把这行从分组里拉出来
+#[derive(Clone, Debug, PartialEq)]
+pub enum DropZone {
+    Header(String),
+    Row(usize, Edge),
+}
+
+/// 落点在某一行的哪一侧：详细列表按上、下切，简约卡片按左、右切
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Before,
+    After,
+}
+
+/// 把刚画出来的一块矩形登记成两块落点。先裁进可视区：滚出视野的那一行
+/// 坐标还留在列表顶上，不裁就会在屏幕另一头接住落点
+fn half_zones(
+    rect: egui::Rect,
+    clip: egui::Rect,
+    index: usize,
+    horizontal: bool,
+) -> Vec<(DropZone, egui::Rect)> {
+    let rect = rect.intersect(clip);
+    if rect.is_negative() {
+        return Vec::new();
+    }
+    let (before, after) = if horizontal {
+        let x = rect.center().x;
+        (
+            egui::Rect::from_min_max(rect.min, egui::pos2(x, rect.max.y)),
+            egui::Rect::from_min_max(egui::pos2(x, rect.min.y), rect.max),
+        )
+    } else {
+        let y = rect.center().y;
+        (
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, y)),
+            egui::Rect::from_min_max(egui::pos2(rect.min.x, y), rect.max),
+        )
+    };
+    vec![
+        (DropZone::Row(index, Edge::Before), before),
+        (DropZone::Row(index, Edge::After), after),
+    ]
+}
+
+/// 指针落在上一帧登记的哪块区域上。属于被拖那一行自己的半区跳过：原地放下等于没动
+fn hit_zone(zones: &[(DropZone, egui::Rect)], from: usize, pos: egui::Pos2) -> Option<DropZone> {
+    zones.iter().find_map(|(zone, rect)| {
+        if !rect.contains(pos) {
+            return None;
+        }
+        match zone {
+            DropZone::Row(index, _) if *index == from => None,
+            other => Some(other.clone()),
+        }
+    })
+}
+
+/// 这一点被浮层（弹窗 / 弹层 / 菜单）盖住了没有。拖动只看几何——按下点落在哪一行的
+/// 矩形里，于是压在列表上的弹窗也当成了列表本身；`layer_id_at` 只认可以交互的 Area，
+/// 主页列表在背景层，所以那一点的顶层不是背景层就是按到了浮层身上。
+fn covered_by_overlay(ctx: &egui::Context, pos: egui::Pos2) -> bool {
+    ctx
+        .layer_id_at(pos)
+        .is_some_and(|layer| layer.order != egui::Order::Background)
+}
 
 /// 卡片计数标记的底色：这个方向上没有待办时是实心绿，有待办换成更深的黄
 const MARK_QUIET: Color32 = Color32::from_rgb(56, 168, 96);
@@ -87,7 +160,7 @@ fn tag_pill(ui: &mut Ui, text: &str, color: Color32) {
         });
 }
 
-impl SvnApp {
+impl RepoApp {
     // ------------------------------------------------------------ 主页面
 
     fn dir_row(&mut self, ui: &mut Ui, index: usize) {
@@ -101,29 +174,42 @@ impl SvnApp {
         let lamp = ink(
             ui,
             match view.remote {
-                Some(true) => Color32::from_rgb(80, 200, 120),
-                Some(false) => Color32::from_rgb(240, 100, 100),
-                None if busy => Color32::from_rgb(240, 190, 70),
+                Some(true) => crate::OK,
+                Some(false) => crate::ERR,
+                None if busy => crate::AMBER,
                 None => Color32::from_gray(120),
             },
         );
-        let row_fill = if ui.visuals().dark_mode {
-            Color32::from_gray(38)
-        } else {
-            Color32::from_gray(236)
-        };
+        // 悬停反馈：读上一帧这行的命中状态（悬停本来就是逐帧跟着指针走的，滞后一帧看不出）
+        let hovered = ui
+            .ctx()
+            .read_response(egui::Id::new(("dir_row", index)))
+            .is_some_and(|hit| hit.hovered());
+        // 手里正拖着这一行：描边换成主色、底色抬到悬停那一档，看得出它被「拿起来了」
+        let dragging = self.drag == Some(index);
         let frame = Frame::new()
             .inner_margin(7.0)
-            .corner_radius(6.0)
+            // 分了组的行整块往右让一截：底色条跟着一起缩（外边距），不是在通栏行里加大内边距
+            .outer_margin(egui::Margin {
+                left: if dir.group.trim().is_empty() { 0 } else { 14 },
+                ..Default::default()
+            })
+            .corner_radius(8.0)
+            .stroke(egui::Stroke::new(
+                if dragging { 1.6 } else { 1.0 },
+                if dragging { self.accent_ink() } else { pane_stroke(ui) },
+            ))
             .fill(if is_selected {
                 ui.visuals().selection.bg_fill
+            } else if hovered || dragging {
+                pane_hover(ui)
             } else {
-                row_fill
+                pane_fill(ui)
             });
         frame.show(ui, |ui| {
             // 行内文字默认可选中，会抢占点击；关掉后整行空白处才能选中本行
             ui.style_mut().interaction.selectable_labels = false;
-            ui.horizontal(|ui| {
+            ui.aligned_row(|ui| {
                 ui.label(RichText::new("●").size(15.0).color(lamp)).on_hover_text({
                     let mut tip = view.remote_msg.clone();
                     if tip.is_empty() {
@@ -162,7 +248,7 @@ impl SvnApp {
                         ui.label(
                             RichText::new(format!("待提交 {changed} 项"))
                                 .size(12.0)
-                                .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                                .color(ink(ui, crate::AMBER)),
                         )
                         .on_hover_text(
                             "口径与「全部上传」一致：新增(?)、已丢失(!) 也算在内——\n\
@@ -172,7 +258,7 @@ impl SvnApp {
                         ui.label(
                             RichText::new("无待提交项")
                                 .size(12.0)
-                                .color(ink(ui, Color32::from_rgb(80, 200, 120))),
+                                .color(ink(ui, crate::OK)),
                         );
                     }
                 }
@@ -203,12 +289,12 @@ impl SvnApp {
                 // 点一下选中本目录并打开 Beyond Compare。
                 if let Some(summary) = view.local_diff.as_ref() {
                     if changed_before || conflict_before {
-                        ui.label(RichText::new("|").size(12.0).weak());
+                        ui.label(RichText::new("·").size(12.0).weak());
                     }
                     let color = if summary.is_clean() {
-                        ink(ui, Color32::from_rgb(80, 200, 120))
+                        ink(ui, crate::OK)
                     } else {
-                        ink(ui, Color32::from_rgb(240, 190, 70))
+                        ink(ui, crate::AMBER)
                     };
                     let tip = self.local_diff_tip(index, summary, self.pool.comparing(index));
                     let hit = ui
@@ -234,20 +320,19 @@ impl SvnApp {
                 // 同一个 horizontal 内由同一个 Ui 摆放，中心线才完全一致。
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
 
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         let confirm = self.confirm_remove == Some(index);
                         let mut button = egui::Button::new(if confirm {
                             RichText::new("确认移除?")
                                 .strong()
-                                .color(Color32::from_rgb(255, 240, 240))
+                                .color(crate::DANGER_TEXT)
                         } else {
                             RichText::new("移除")
                         });
                         if confirm {
-                            button = button.fill(Color32::from_rgb(150, 60, 60));
+                            button = button.fill(crate::DANGER_FILL);
                         }
-                        if ui
-                            .add_enabled(!busy, button)
+                        if quiet(ui, |ui| ui.add_enabled(!busy, button))
                             .on_hover_text("仅从列表移除，不删除磁盘文件")
                             .clicked()
                         {
@@ -258,19 +343,21 @@ impl SvnApp {
                                 self.hint("再次点击「确认移除」可把该目录从列表移除（不会删除文件）");
                             }
                         }
-                        ui.menu_button("更多", |ui| self.more_menu(ui, index, busy, &view));
-                        if ui.button("打开目录").clicked() {
+                        quiet(ui, |ui| {
+                            ui.menu_button("更多", |ui| self.more_menu(ui, index, busy, &view))
+                        });
+                        if quiet(ui, |ui| ui.button("打开目录")).clicked() {
                             self.open_folder(index);
                         }
-                        if ui.button("历史").clicked() {
+                        if quiet(ui, |ui| ui.button("历史")).clicked() {
                             self.selected = Some(index);
                             self.open_history(index);
                         }
-                        if ui.button("↑ 上传").clicked() {
+                        if quiet(ui, |ui| ui.button("↑ 上传")).clicked() {
                             self.selected = Some(index);
                             self.open_commit(index);
                         }
-                        if ui.button("↓ 更新").clicked() {
+                        if quiet(ui, |ui| ui.button("↓ 更新")).clicked() {
                             self.selected = Some(index);
                             self.confirm_remove = None;
                             self.spawn_update(index);
@@ -285,11 +372,17 @@ impl SvnApp {
             ui.horizontal(|ui| {
                 match &view.info {
                     Some(info) => {
-                        ui.label(
-                            RichText::new(&info.url)
-                                .size(12.0)
-                                .color(ink(ui, Color32::from_rgb(140, 205, 255))),
-                        );
+                        // Git 目录在地址前面带上当前分支（SVN 没有分支概念，恒为空不画）
+                        if !info.branch.is_empty() {
+                            ui.label(
+                                RichText::new(&info.branch)
+                                    .size(12.0)
+                                    .monospace()
+                                    .strong(),
+                            )
+                            .on_hover_text("当前分支");
+                        }
+                        ui.label(RichText::new(&info.url).size(12.0).weak());
                         // 「本地」按内容算：没有待更新项就说明工作副本已经包含 HEAD 的全部
                         // 改动，根目录的版本号因为混合版本停在旧值，不代表内容还是旧的
                         let up_to_date =
@@ -311,7 +404,7 @@ impl SvnApp {
                             ui.label(
                                 RichText::new("已是最新")
                                     .size(12.0)
-                                    .color(ink(ui, Color32::from_rgb(80, 200, 120))),
+                                    .color(ink(ui, crate::OK)),
                             );
                         } else if let Some(pending) =
                             view.out_of_date.filter(|count| *count > 0)
@@ -328,7 +421,7 @@ impl SvnApp {
                                     crate::repo::fmt_rev(view.kind, &view.remote_rev)
                                 ))
                                 .size(12.0)
-                                .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                                .color(ink(ui, crate::AMBER)),
                             );
                         }
                         // 优先显示服务器上的最后提交（检测时从仓库 URL 读取）；
@@ -360,7 +453,7 @@ impl SvnApp {
                         ui.label(
                             RichText::new(if view.checked_at.is_empty() { "未检测" } else { "非工作副本或无法读取" })
                                 .size(12.0)
-                                .color(ink(ui, Color32::from_rgb(240, 100, 100))),
+                                .color(ink(ui, crate::ERR)),
                         );
                     }
                 }
@@ -544,6 +637,7 @@ impl SvnApp {
             TextEdit::singleline(&mut self.label_buf)
                 .id_salt(("alias", index))
                 .desired_width(240.0)
+                .margin(field_margin(ui))
                 .hint_text("别名，留空则显示文件夹名"),
         );
         if self.label_focus {
@@ -572,12 +666,13 @@ impl SvnApp {
 
     /// 对比筛选条件的输入框（带前缀说明），位置同上
     fn filter_editor(&mut self, ui: &mut Ui, index: usize) {
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             ui.label(RichText::new("对比筛选条件：").size(12.0));
             let field = ui.add(
                 TextEdit::singleline(&mut self.filter_buf)
                     .id_salt(("bc_filter", index))
                     .desired_width(320.0)
+                    .margin(field_margin(ui))
                     .hint_text("如 -*.iml;-*.classpath，多个用分号隔开；留空则走 BC 记录里的筛选"),
             );
             if self.filter_focus {
@@ -614,6 +709,7 @@ impl SvnApp {
             TextEdit::singleline(&mut self.group_buf)
                 .id_salt(("dir_group", index))
                 .desired_width(160.0)
+                .margin(field_margin(ui))
                 .hint_text("分组，留空取消分组"),
         );
         if self.group_focus {
@@ -644,17 +740,18 @@ impl SvnApp {
     /// 标记编辑行：一段文字 + 一枚 RGB 取色按钮（egui 自带的取色弹层：RGB / HSV 滑块与
     /// hex 输入）。位置同分组编辑器；文字清空时把颜色一起清掉，下次设置标记从头选
     fn tag_editor(&mut self, ui: &mut Ui, index: usize) {
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             let field = ui.add(
                 TextEdit::singleline(&mut self.tag_buf)
                     .id_salt(("dir_tag", index))
                     .desired_width(140.0)
+                    .margin(field_margin(ui))
                     .hint_text("留空清除"),
             );
             // 取色按钮只在有标记文字时才写回配置：没有文字的标记不显示，颜色存着也是死数据
             let current = self.cfg.dirs[index].tag_color.clone();
             let mut rgb = tag_color_rgb(&current);
-            let picked = ui.color_edit_button_srgb(&mut rgb);
+            let picked = crate::ui::color_swatch(ui, &mut rgb);
             if picked.changed() && !self.cfg.dirs[index].tag.trim().is_empty() {
                 self.cfg.dirs[index].tag_color = tag_color_hex(rgb);
                 self.persist();
@@ -706,11 +803,11 @@ impl SvnApp {
         };
         let accent = ui.visuals().selection.bg_fill;
         let painter = ui.painter();
-        painter.rect_filled(rect, 7.0, Color32::from_gray(if dark { 30 } else { 224 }));
+        painter.rect_filled(rect, 7.0, pane_hover(ui));
         painter.rect_stroke(
             rect,
             7.0,
-            egui::Stroke::new(1.0, Color32::from_gray(if dark { 66 } else { 196 })),
+            egui::Stroke::new(1.0, pane_stroke(ui)),
             egui::StrokeKind::Inside,
         );
         let current = cell_rect(on as usize);
@@ -757,15 +854,16 @@ impl SvnApp {
     /// 卡片里塞不下行内输入框，简约形态下别名 / 对比筛选条件单独占一行，摆在列表上方
     fn compact_editors(&mut self, ui: &mut Ui) {
         let total = self.cfg.dirs.len();
-        let fill = Color32::from_gray(if ui.visuals().dark_mode { 34 } else { 240 });
+        let fill = pane_fill(ui);
         if let Some(index) = self.edit_label.filter(|i| *i < total) {
             let label = self.dir_label(index);
             Frame::new()
                 .inner_margin(6.0)
-                .corner_radius(6.0)
+                .corner_radius(8.0)
+                .stroke(egui::Stroke::new(1.0, pane_stroke(ui)))
                 .fill(fill)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         ui.label(RichText::new(format!("修改别名 · {label}：")).size(12.0));
                         self.alias_editor(ui, index);
                     });
@@ -776,10 +874,11 @@ impl SvnApp {
             let label = self.dir_label(index);
             Frame::new()
                 .inner_margin(6.0)
-                .corner_radius(6.0)
+                .corner_radius(8.0)
+                .stroke(egui::Stroke::new(1.0, pane_stroke(ui)))
                 .fill(fill)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         ui.label(RichText::new(format!("{label}")).size(12.0));
                         self.filter_editor(ui, index);
                     });
@@ -790,10 +889,11 @@ impl SvnApp {
             let label = self.dir_label(index);
             Frame::new()
                 .inner_margin(6.0)
-                .corner_radius(6.0)
+                .corner_radius(8.0)
+                .stroke(egui::Stroke::new(1.0, pane_stroke(ui)))
                 .fill(fill)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         ui.label(RichText::new(format!("修改分组 · {label}：")).size(12.0));
                         self.group_editor(ui, index);
                     });
@@ -804,10 +904,11 @@ impl SvnApp {
             let label = self.dir_label(index);
             Frame::new()
                 .inner_margin(6.0)
-                .corner_radius(6.0)
+                .corner_radius(8.0)
+                .stroke(egui::Stroke::new(1.0, pane_stroke(ui)))
                 .fill(fill)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         ui.label(RichText::new(format!("修改标记 · {label}：")).size(12.0));
                         self.tag_editor(ui, index);
                     });
@@ -816,9 +917,229 @@ impl SvnApp {
         }
     }
 
+    // ------------------------------------------------------------ 拖动：并入分组 / 改顺序
+
+    /// 要按住这么久才算想拖动：一按下就拖，选个目录都会把行拽走
+    const DRAG_HOLD: f64 = 1.0;
+
+    /// 记下鼠标在谁身上按下、什么时刻按下，够 `DRAG_HOLD` 才交给 update_drag 转成拖动
+    fn arm_drag(&mut self, ui: &Ui, rect: egui::Rect, index: usize) {
+        if self.drag.is_some() || self.drag_pending.is_some() {
+            return;
+        }
+        let (down, origin, now) = ui.input(|i| {
+            (
+                i.pointer.button_down(egui::PointerButton::Primary),
+                i.pointer.press_origin(),
+                i.time,
+            )
+        });
+        // 遮没遮住要读 memory，不能塞进上面那个 input 闭包里（egui 的读锁套自己会死锁）
+        let pressed_here =
+            down && origin.is_some_and(|o| rect.contains(o) && !covered_by_overlay(ui.ctx(), o));
+        if pressed_here {
+            self.drag_pending = Some((index, now));
+        }
+    }
+
+    /// 每帧画主页之前调一次：上一帧登记的落点区域 + 当前指针 = 这一帧该落在哪儿。
+    /// 松手就搬行；还按着就更新插入线和跟手的小标签；
+    /// 既没有落下事件也没了按下状态（拖出窗口松手、焦点被抢）当取消处理
+    pub(crate) fn update_drag(&mut self, ui: &Ui) {
+        // 按够了时长才真的开始拖，没按够就松手的只当是一次点击
+        if let Some((index, since)) = self.drag_pending {
+            let (holding, pos, now) = ui.input(|i| {
+                (
+                    i.pointer.button_down(egui::PointerButton::Primary),
+                    i.pointer.interact_pos(),
+                    i.time,
+                )
+            });
+            if !holding {
+                self.drag_pending = None;
+            } else if self.drag.is_none()
+                && now - since >= Self::DRAG_HOLD
+                // 按够时间了，但指针这会儿停在弹窗 / 弹层上：不算起拖
+                && !pos.is_some_and(|pos| covered_by_overlay(ui.ctx(), pos))
+            {
+                self.drag = Some(index);
+                self.drag_pending = None;
+            }
+        }
+        let Some(from) = self.drag else { return };
+        let ctx = ui.ctx();
+        let pos = ctx.input(|i| i.pointer.interact_pos());
+        let released = ctx.input(|i| i.pointer.any_released());
+        let holding = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+        if released || !holding {
+            if released {
+                if let Some(pos) = pos {
+                    // 松手在浮层上只当取消：那一下是给浮层的，不是给底下这行的
+                    if !covered_by_overlay(ctx, pos) {
+                        if let Some(zone) = hit_zone(&self.drop_zones, from, pos) {
+                            match zone {
+                                DropZone::Header(group) => self.drop_on_header(from, &group),
+                                DropZone::Row(target, edge) => self.drop_beside(from, target, edge),
+                            }
+                        }
+                    }
+                }
+            }
+            self.drag = None;
+            self.drag_pos = None;
+            self.drag_target = None;
+            return;
+        }
+        if let Some(pos) = pos {
+            self.drag_pos = Some(pos);
+            self.drag_target = hit_zone(&self.drop_zones, from, pos);
+        }
+        self.paint_drag_ghost(ui);
+    }
+
+    /// 落在分组标题条上：并入那一组，排到同组末尾。已经在这一组里就什么都不动
+    fn drop_on_header(&mut self, from: usize, group: &str) {
+        let want = group.trim().to_owned();
+        if self.cfg.dirs[from].group.trim() == want {
+            return;
+        }
+        let Some(last) = self
+            .cfg
+            .dirs
+            .iter()
+            .enumerate()
+            .filter(|(index, dir)| *index != from && dir.group.trim() == want)
+            .map(|(index, _)| index)
+            .max()
+        else {
+            return;
+        };
+        // 摘掉自己之后，同组末行的位置往前挪了一位；插到它后面
+        let insert = if from < last { last } else { last + 1 };
+        // 收着的组接住落点要先展开：不然这行一进去就看不见，像是拖失败了
+        self.cfg.collapsed_groups.retain(|g| g.trim() != want);
+        self.shift_directory(from, insert, Some(want.clone()));
+        self.hint(format!("已把 {} 并入分组「{want}」", self.dir_label(insert)));
+    }
+
+    /// 落在另一行的前半 / 后半：插到它之前或之后，分组跟着那一行走。
+    /// 目标行没分组，于是这一挪就等于把它从原来的分组里拉出来
+    fn drop_beside(&mut self, from: usize, target: usize, edge: Edge) {
+        let len = self.cfg.dirs.len();
+        if from >= len || target >= len || from == target {
+            return;
+        }
+        let was = self.cfg.dirs[from].group.trim().to_owned();
+        let group = self.cfg.dirs[target].group.clone();
+        // 目标行在「摘掉自己之后」的位置，也就是搬完紧接着它的那一位
+        let at = if from < target { target - 1 } else { target };
+        let insert = match edge {
+            Edge::Before => at,
+            Edge::After => (at + 1).min(len - 1),
+        };
+        self.shift_directory(from, insert, Some(group));
+        let name = self.dir_label(insert);
+        let beside = self.dir_label(at);
+        let new = self.cfg.dirs[insert].group.trim().to_owned();
+        let mut note = format!(
+            "已把 {name} 移到 {beside} {}",
+            if edge == Edge::Before { "之前" } else { "之后" }
+        );
+        if new != was {
+            let changed = if new.is_empty() {
+                format!("（移出分组「{was}」）")
+            } else {
+                format!("（并入分组「{new}」）")
+            };
+            note.push_str(&changed);
+        }
+        self.hint(note);
+    }
+
+    /// 跟手的那张小标签：手里拖的是哪个目录，一眼看得见
+    fn paint_drag_ghost(&self, ui: &Ui) {
+        let (Some(from), Some(pos)) = (self.drag, self.drag_pos) else { return };
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("dir_drag_ghost"),
+        ));
+        let color = ui.visuals().strong_text_color();
+        let galley =
+            painter.layout_no_wrap(self.dir_label(from), egui::FontId::proportional(12.5), color);
+        let pad = Vec2::splat(5.0);
+        let rect = egui::Rect::from_min_size(
+            pos + Vec2::new(14.0, 12.0),
+            galley.size() + pad * 2.0,
+        );
+        painter.rect_filled(rect, 7.0, ui.visuals().window_fill);
+        painter.rect_stroke(
+            rect,
+            7.0,
+            egui::Stroke::new(1.0, self.accent_ink()),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(rect.min + pad, galley, color);
+    }
+
+    /// 插入线：只有「正是要往这儿落」的那一行才画。详细列表横着排，线落在行上沿或下沿；
+    /// 卡片网格先左后右，线落在卡片左沿或右沿
+    fn paint_insert_line(&self, ui: &Ui, rect: egui::Rect, index: usize, horizontal: bool) {
+        let Some(DropZone::Row(target, edge)) = self.drag_target.clone() else { return };
+        if target != index || self.drag == Some(index) {
+            return;
+        }
+        let stroke = egui::Stroke::new(2.0, self.accent_ink());
+        if horizontal {
+            let x = if edge == Edge::Before { rect.min.x } else { rect.max.x };
+            ui.painter().vline(
+                x,
+                egui::Rangef::new(rect.min.y + 6.0, rect.max.y - 6.0),
+                stroke,
+            );
+        } else {
+            let y = if edge == Edge::Before { rect.min.y } else { rect.max.y };
+            ui.painter().hline(
+                egui::Rangef::new(rect.min.x + 6.0, rect.max.x - 6.0),
+                y,
+                stroke,
+            );
+        }
+    }
+
+    /// 显示序列：把目录摆成「段」，每段是（组名, 该组行号列表）。
+    /// 同名分组的行不管散在哪儿，全部拉到该组**第一次出现**的位置集中渲染——
+    /// 后加的目录落在别的组后面，也不该裂出第二个同名标题；
+    /// 未分组行按原相对顺序插空（相邻的并成一段）。配置本身不搬动。
+    pub(crate) fn group_segments(&self) -> Vec<(Option<String>, Vec<usize>)> {
+        let mut segments: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+        let mut taken = vec![false; self.cfg.dirs.len()];
+        for index in 0..self.cfg.dirs.len() {
+            if taken[index] {
+                continue;
+            }
+            taken[index] = true;
+            let group = self.cfg.dirs[index].group.trim().to_owned();
+            if group.is_empty() {
+                match segments.last_mut() {
+                    Some((None, rows)) => rows.push(index),
+                    _ => segments.push((None, vec![index])),
+                }
+            } else {
+                let rows: Vec<usize> = (index..self.cfg.dirs.len())
+                    .filter(|i| self.cfg.dirs[*i].group.trim() == group)
+                    .collect();
+                for row in &rows {
+                    taken[*row] = true;
+                }
+                segments.push((Some(group), rows));
+            }
+        }
+        segments
+    }
+
     /// 简约形态的网格：列数按可用宽度算，一横行一横行地摆正方形卡片。
-    /// 分组标题独占一整行：先把目录摆成「标题 / 卡片」的可见序列（收起的组整段跳过），
-    /// 再按列数流式铺开
+    /// 分组标题独占一整行：先按 group_segments 摆成「标题 / 卡片」的可见序列
+    /// （收起的组整段跳过），再按列数流式铺开
     fn dir_cards(&mut self, ui: &mut Ui) {
         let gap = 10.0;
         let cols = (((ui.available_width() + gap) / (CARD_SIZE + gap)).floor() as usize).max(1);
@@ -827,38 +1148,31 @@ impl SvnApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = gap;
-                let mut index = 0;
+                // 同详细模式：卡片里的文字要是不关掉选中，就会把点选和拖动从整张卡片的感应区抢走
+                ui.style_mut().interaction.selectable_labels = false;
                 let mut row: Vec<usize> = Vec::new();
-                while index < self.cfg.dirs.len() {
-                    let group = self.cfg.dirs[index].group.trim().to_owned();
-                    if !group.is_empty() {
-                        let prev = if index == 0 {
-                            String::new()
-                        } else {
-                            self.cfg.dirs[index - 1].group.trim().to_owned()
-                        };
-                        if group != prev {
-                            // 标题独占一整行：先收掉手里没铺满的横行
-                            if !row.is_empty() {
-                                self.card_row(ui, &row, gap);
-                                row.clear();
-                            }
-                            let count = self.cfg.dirs[index..]
-                                .iter()
-                                .take_while(|d| d.group.trim() == group)
-                                .count();
-                            if self.group_header(ui, &group, count) {
-                                index += count;
-                                continue;
-                            }
+                for (header, rows) in self.group_segments() {
+                    if let Some(group) = &header {
+                        // 标题独占一整行：先收掉手里没铺满的横行
+                        if !row.is_empty() {
+                            self.card_row(ui, &row, gap);
+                            row.clear();
+                        }
+                        if self.group_header(ui, group, rows.len()) {
+                            continue;
                         }
                     }
-                    row.push(index);
-                    if row.len() == cols {
-                        self.card_row(ui, &row, gap);
-                        row.clear();
+                    for index in rows {
+                        // 行内「移除」会当场缩短 cfg.dirs，画之前重新比一次上界
+                        if index >= self.cfg.dirs.len() {
+                            continue;
+                        }
+                        row.push(index);
+                        if row.len() == cols {
+                            self.card_row(ui, &row, gap);
+                            row.clear();
+                        }
                     }
-                    index += 1;
                 }
                 if !row.is_empty() {
                     self.card_row(ui, &row, gap);
@@ -888,20 +1202,45 @@ impl SvnApp {
         });
     }
 
-    /// 目录列表里的分组标题：`▼ 组名（n）`，点一下收起 / 展开（收起状态记进配置）。
+    /// 分组标题：通栏底色条，点整条就收起 / 展开（收起状态记进配置）。
     /// 返回 true = 该组当前收着，调用方应跳过整段目录行
     fn group_header(&mut self, ui: &mut Ui, group: &str, count: usize) -> bool {
         let collapsed = self.cfg.collapsed_groups.iter().any(|g| g == group);
         let title = format!("{} {group}（{count}）", if collapsed { "▶" } else { "▼" });
+        // 手里正拖着别的行为这条标题而来时，整条点亮：一眼看出松手会并进哪一组
+        let targeted = matches!(&self.drag_target, Some(DropZone::Header(g)) if g == group);
+        // 底色：带一点主色的淡染 + 发丝描边，一眼和下面的目录行分层；
+        // 标题文字用正文色（层级交给字重和这条淡染底，不靠把字涂蓝）
+        let accent = self.accent();
+        let fill = if ui.visuals().dark_mode {
+            tint(accent, if targeted { 66 } else { 30 })
+        } else {
+            tint(pale(accent, 0.21), if targeted { 255 } else { 200 })
+        };
+        let bar = Frame::new()
+            .fill(fill)
+            .stroke(egui::Stroke::new(
+                if targeted { 1.8 } else { 1.0 },
+                if targeted { self.accent_ink() } else { pane_stroke(ui) },
+            ))
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(8, 3))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(&title).strong().size(13.0));
+            });
+        // 落点登记：整条标题条都是「并入这一组」。收起的组照样画条、照样接落点，
+        // 松手时由 drop_on_header 把组展开，否则落进去的行看不见，像是拖失败了
+        let zone = bar.response.rect.intersect(ui.clip_rect());
+        if !zone.is_negative() {
+            self.drop_zones.push((DropZone::Header(group.to_owned()), zone));
+        }
+        // 感应区压在整条底色上：点空白处也能收起 / 展开
         let hit = ui
-            .add(
-                egui::Label::new(
-                    RichText::new(&title)
-                        .strong()
-                        .size(13.0)
-                        .color(ink(ui, Color32::from_rgb(140, 205, 255))),
-                )
-                .sense(egui::Sense::click()),
+            .interact(
+                bar.response.rect,
+                egui::Id::new(("group_header", group)),
+                egui::Sense::click(),
             )
             .on_hover_text(if collapsed { "点击展开这一组" } else { "点击收起这一组" })
             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -932,42 +1271,76 @@ impl SvnApp {
 
         let (_id, rect) = ui.allocate_space(Vec2::splat(CARD_SIZE));
         // 整张卡片的感应区先注册，里面的标记和「+」都注册在它之后：
-        // 点在控件上时控件优先命中，点在空白处才是「选中这一张」
-        let hit = ui.interact(rect, egui::Id::new(("dir_card", index)), egui::Sense::click());
+        // 点在控件上时控件优先命中，点在空白处才是「选中这一张」；
+        // 顺带让它可拖——整张卡片都是把手，挪到别的卡片左/右侧就改顺序
+        let hit = ui.interact(
+            rect,
+            egui::Id::new(("dir_card", index)),
+            egui::Sense::click_and_drag(),
+        );
+        self.arm_drag(ui, rect, index);
+        // 落点登记：卡片网格先左后右，于是按左、右两半区分给「插到这张之前 / 之后」
+        self.drop_zones.extend(half_zones(rect, ui.clip_rect(), index, true));
+        self.paint_insert_line(ui, rect, index, true);
+        let dragging = self.drag == Some(index);
         // 边框把状态再标一遍，余光里也能看出来：冲突最要紧（不人工处理就提交不上去），
         // 其次是连不上服务器，再次是正在跑任务
         let border = if conflicts > 0 {
             ink(ui, Color32::from_rgb(255, 80, 160))
         } else if view.remote == Some(false) {
-            ink(ui, Color32::from_rgb(240, 100, 100))
+            ink(ui, crate::ERR)
         } else if busy {
-            ink(ui, Color32::from_rgb(240, 190, 70))
+            ink(ui, crate::AMBER)
         } else {
-            Color32::from_gray(if dark { 60 } else { 206 })
+            pane_stroke(ui)
         };
+        // 悬停浮起：卡片整块是手绘的，这里只把「画」出来的那块往上挪 1px，感应区留在原地不动
+        let hovered = ui
+            .ctx()
+            .read_response(egui::Id::new(("dir_card", index)))
+            .is_some_and(|resp| resp.hovered());
+        let card = rect.translate(Vec2::new(0.0, if hovered { -1.0 } else { 0.0 }));
+        // 柔和投影：一层半透明靛影加模糊，画在填充之前，上面那步会盖住中间、只留四周的虚影
+        let mut shadow = egui::epaint::RectShape::filled(
+            card,
+            10.0,
+            Color32::from_rgba_unmultiplied(
+                if dark { 0 } else { 58 },
+                if dark { 0 } else { 76 },
+                if dark { 0 } else { 126 },
+                if dark { 120 } else { 44 },
+            ),
+        );
+        shadow.blur_width = 10.0;
+        ui.painter().add(shadow);
         ui.painter().rect_filled(
-            rect,
+            card,
             10.0,
             if is_selected {
                 ui.visuals().selection.bg_fill
+            } else if hovered || dragging {
+                pane_hover(ui)
             } else {
-                Color32::from_gray(if dark { 38 } else { 236 })
+                pane_fill(ui)
             },
         );
         ui.painter().rect_stroke(
-            rect,
+            card,
             10.0,
-            egui::Stroke::new(if is_selected { 1.6 } else { 1.0 }, border),
+            egui::Stroke::new(
+                if is_selected { 1.6 } else { 1.0 },
+                if dragging { self.accent_ink() } else { border },
+            ),
             egui::StrokeKind::Inside,
         );
-        let inner = rect.shrink(10.0);
+        let inner = card.shrink(10.0);
         // 左上角：检测状态灯（配色和悬停说明同详细模式的那枚 ●）
         let lamp = ink(
             ui,
             match view.remote {
-                Some(true) => Color32::from_rgb(80, 200, 120),
-                Some(false) => Color32::from_rgb(240, 100, 100),
-                None if busy => Color32::from_rgb(240, 190, 70),
+                Some(true) => crate::OK,
+                Some(false) => crate::ERR,
+                None if busy => crate::AMBER,
                 None => Color32::from_gray(120),
             },
         );
@@ -977,37 +1350,43 @@ impl SvnApp {
         );
         // 目录名称摆在卡片正中
         ui.place(
-            egui::Rect::from_center_size(rect.center(), Vec2::new(inner.width() - 8.0, 26.0)),
+            egui::Rect::from_center_size(card.center(), Vec2::new(inner.width() - 8.0, 26.0)),
             egui::Label::new(RichText::new(&label).strong().size(13.5)).truncate(),
         );
         // 标记胶囊画在名称正下方：不占右上角徽标带，免得和忙碌转圈抢位
         let tag = self.cfg.dirs[index].tag.clone();
         if !tag.is_empty() {
             let color = ink(ui, tag_color(&self.cfg.dirs[index]));
-            let pill_rect = egui::Rect::from_center_size(
-                egui::pos2(rect.center().x, rect.center().y + 17.0),
-                Vec2::new(inner.width() - 16.0, 18.0),
+            // 先量字宽再画框：竖排居中的子 Ui 会把成员沿横轴拉满整宽，交给 Frame
+            // 就是一个和卡片等宽的空盒子。超长标记照名称的口径截断
+            let max_width = inner.width() - 16.0;
+            let mut job = egui::text::LayoutJob::simple(
+                tag.clone(),
+                egui::FontId::proportional(11.5),
+                color,
+                f32::INFINITY,
             );
-            let mut pill = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(pill_rect)
-                    .layout(Layout::top_down(Align::Center))
-                    .sense(egui::Sense::hover()),
+            job.wrap = egui::text::TextWrapping::truncate_at_width(max_width - 12.0);
+            let galley = ui.painter().layout_job(job);
+            let pill = egui::Rect::from_center_size(
+                egui::pos2(card.center().x, card.center().y + 17.0),
+                Vec2::new((galley.size().x + 12.0).min(max_width), 18.0),
             );
-            Frame::new()
-                .stroke(egui::Stroke::new(1.0, color))
-                .corner_radius(9.0)
-                .inner_margin(egui::Margin::symmetric(5, 1))
-                .show(&mut pill, |ui| {
-                    ui.label(RichText::new(&tag).size(11.5).color(color));
-                });
+            ui.painter().rect_stroke(
+                pill,
+                9.0,
+                egui::Stroke::new(1.0, color),
+                egui::StrokeKind::Inside,
+            );
+            let text = egui::Align2::CENTER_CENTER.anchor_size(pill.center(), galley.size());
+            ui.painter().galley(text.min, galley, color);
         }
         if busy {
             // 加载只留一枚转圈：卡片地方小，任务文字挤在名称上面不好看，进度看边框颜色就够了。
             // 颜色显式给：跟着主题走的话浅色底上那圈几乎看不见
             egui::Spinner::new()
                 .size(15.0)
-                .color(ink(ui, Color32::from_rgb(240, 190, 70)))
+                .color(ink(ui, crate::AMBER))
                 .paint_at(
                     ui,
                     egui::Rect::from_min_size(
@@ -1032,7 +1411,7 @@ impl SvnApp {
         };
         // 远端有更新时，远端那行用详细模式里「远端 rX（可更新 N 项）」的黄色
         let remote_color = if pending > 0 {
-            ink(ui, Color32::from_rgb(240, 190, 70))
+            ink(ui, crate::AMBER)
         } else {
             weak
         };
@@ -1113,10 +1492,10 @@ impl SvnApp {
             )
             .min_size(Vec2::splat(30.0))
             .corner_radius(15)
-            .fill(ink(ui, Color32::from_rgb(52, 122, 196)))
+            .fill(ink(ui, self.accent()))
             .stroke(egui::Stroke::new(
                 1.0,
-                ink(ui, Color32::from_rgb(120, 190, 240)),
+                ink(ui, pale(self.accent(), 0.71)),
             )),
         );
         plus.clone().on_hover_text("该目录的全部操作");
@@ -1230,12 +1609,12 @@ impl SvnApp {
         let mut button = egui::Button::new(if confirm {
             RichText::new("确认移除?")
                 .strong()
-                .color(Color32::from_rgb(255, 240, 240))
+                .color(crate::DANGER_TEXT)
         } else {
             RichText::new("移除")
         });
         if confirm {
-            button = button.fill(Color32::from_rgb(150, 60, 60));
+            button = button.fill(crate::DANGER_FILL);
         }
         if ui
             .add_enabled(!busy, button)
@@ -1252,126 +1631,146 @@ impl SvnApp {
         }
     }
 
-    pub fn main_page(&mut self, ui: &mut Ui) {
-        Frame::new()
-            .inner_margin(8.0)
-            .corner_radius(6.0)
-            .fill(if ui.visuals().dark_mode {
-                Color32::from_gray(34)
-            } else {
-                Color32::from_gray(240)
-            })
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("添加目录").strong());
-                    let width = (ui.available_width() - 250.0).max(200.0);
-                    let field = ui.add(
-                        TextEdit::singleline(&mut self.new_path)
-                            .hint_text(r"工作副本目录，例如 C:\Test")
-                            .desired_width(width),
-                    );
-                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    if ui.button("选择文件夹…").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new()
-                            .set_title("选择 SVN 工作副本目录")
-                            .pick_folder()
-                        {
-                            self.new_path = folder.display().to_string();
-                        }
-                    }
-                    if enter || ui.button("＋ 添加").clicked() {
-                        let path = self.new_path.clone();
-                        self.add_directory(path);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("别名(可选)").weak().size(12.0));
-                    ui.add(TextEdit::singleline(&mut self.new_label).desired_width(200.0).hint_text("列表中显示的名称"));
-                    ui.label(RichText::new("也可以直接把文件夹拖到窗口里添加").weak().size(12.0));
-                });
-            });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let count = self.cfg.dirs.len();
-            let changes: usize = self.dirs.iter().filter_map(|d| d.changed).sum();
-            ui.label(RichText::new(format!("目录列表（{count} 个，待提交合计 {changes} 项）")).strong());
-            // 目录多的时候冲突标记要滚动才看得见，这里聚合一份：不用滚就知道有没有卡住
-            let blocked: Vec<(usize, usize)> = self
-                .dirs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, view)| {
-                    Some((index, view.conflicts.filter(|count| *count > 0)?))
-                })
-                .collect();
-            if !blocked.is_empty() {
-                let total: usize = blocked.iter().map(|(_, count)| count).sum();
-                let list = blocked
-                    .iter()
-                    .map(|(index, count)| format!("{}：{count} 项", self.dir_label(*index)))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let first = blocked[0].0;
-                let hit = ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("，{total} 项冲突待处理"))
-                            .size(12.0)
-                            .strong()
-                            .underline()
-                            .color(ink(ui, Color32::from_rgb(255, 80, 160))),
-                    )
-                    .sense(egui::Sense::click()),
-                );
-                if hit.clicked() {
-                    self.open_commit(first);
-                }
-                hit.on_hover_text(format!(
-                    "必须人工处理才能继续提交的条目（冲突 / 不完整），按目录列：\n{list}\n\n点击打开第一个有冲突目录的提交页。"
-                ));
-            }
-            ui.label(
-                RichText::new(if self.cfg.home_compact {
-                    "单击卡片选中，双击打开目录"
-                } else {
-                    "单击整行选中，双击打开目录"
-                })
-                .weak()
-                .size(11.5),
+    /// 添加目录这条横栏。它挂在中央面板之外的顶栏上（见 `RepoApp::ui`），
+    /// 所以能顶到窗口两边；下面的目录列表照旧留横向边距。
+    pub fn add_dir_bar(&mut self, ui: &mut Ui) {
+        let margin = field_margin(ui);
+        ui.aligned_row(|ui| {
+            ui.label(RichText::new("添加仓库目录").strong());
+            let width = (ui.available_width() - 250.0).max(200.0);
+            let field = ui.add(
+                TextEdit::singleline(&mut self.new_path)
+                    .hint_text(r"工作副本目录，例如 C:\Test")
+                    .margin(margin)
+                    .desired_width(width),
             );
-            if ui.button("全部检测").clicked() {
-                self.hint("正在检测全部目录 …");
-                self.spawn_all_refresh();
-            }
-            if ui.button("全部更新").clicked() {
-                for index in 0..self.cfg.dirs.len() {
-                    self.spawn_update(index);
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if ui.button("选择文件夹…").clicked() {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("选择 SVN 工作副本目录")
+                    .pick_folder()
+                {
+                    self.new_path = folder.display().to_string();
                 }
             }
-            if ui
-                .button("全部上传")
-                .on_hover_text("所有目录用同一条说明一次提交（会改动服务器，需再点一次确认）")
-                .clicked()
-            {
-                self.upload_all = Some(UploadAll {
-                    message: String::new(),
-                    confirm: false,
-                    focus: true,
-                    // 打开时默认全选，想排除谁就在窗口里去掉勾
-                    checked: vec![true; self.cfg.dirs.len()],
-                    detail: None,
-                });
+            if enter || ui.button("＋ 添加").clicked() {
+                let path = self.new_path.clone();
+                self.add_directory(path);
             }
-            if ui
-                .button("批量改地址")
-                .on_hover_text("服务器搬家时，一次把多个目录的仓库地址前缀一起换掉（每个目录单独起任务，需再点一次确认）")
-                .clicked()
-            {
-                self.batch_relocate = Some(crate::BatchRelocate {
-                    focus: true,
-                    checked: vec![false; self.cfg.dirs.len()],
-                    ..Default::default()
-                });
+        });
+        ui.aligned_row(|ui| {
+            ui.label(RichText::new("别名(可选)").weak().size(12.0));
+            ui.add(
+                TextEdit::singleline(&mut self.new_label)
+                    .hint_text("列表中显示的名称")
+                    .margin(margin)
+                    .desired_width(200.0),
+            );
+            ui.label(RichText::new("也可以直接把文件夹拖到窗口里添加").weak().size(12.0));
+        });
+    }
+
+    /// 目录列表上方那一组：标题、冲突汇总、一排批量操作按钮
+    fn toolbar_row(&mut self, ui: &mut Ui) {
+        let count = self.cfg.dirs.len();
+        let changes: usize = self.dirs.iter().filter_map(|d| d.changed).sum();
+        let title = ui.label(
+            RichText::new(format!("目录列表（{count} 个，待提交合计 {changes} 项）")).strong(),
+        );
+        title.on_hover_text(
+            "单击选中，双击打开目录。拖动要先按住 1 秒再挪手，按得没这么久只算点了一下：\n\
+             · 拖到分组标题条上 = 并入那一组，排在同组末尾\n\
+             · 拖到另一行的上半 / 下半（卡片是左半 / 右半）= 按显示顺序插到它前面或后面，\n\
+             并跟着那一行的分组走——拖到未分组的行上就是把它移出分组\n\
+             · 松手时不在任何行或标题条上 = 什么都没动",
+        );
+        // 目录多的时候冲突标记要滚动才看得见，这里聚合一份：不用滚就知道有没有卡住
+        let blocked: Vec<(usize, usize)> = self
+            .dirs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, view)| {
+                Some((index, view.conflicts.filter(|count| *count > 0)?))
+            })
+            .collect();
+        if !blocked.is_empty() {
+            let total: usize = blocked.iter().map(|(_, count)| count).sum();
+            let list = blocked
+                .iter()
+                .map(|(index, count)| format!("{}：{count} 项", self.dir_label(*index)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let first = blocked[0].0;
+            let hit = ui.add(
+                egui::Label::new(
+                    RichText::new(format!("，{total} 项冲突待处理"))
+                        .size(12.0)
+                        .strong()
+                        .underline()
+                        .color(ink(ui, Color32::from_rgb(255, 80, 160))),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if hit.clicked() {
+                self.open_commit(first);
             }
+            hit.on_hover_text(format!(
+                "必须人工处理才能继续提交的条目（冲突 / 不完整），按目录列：\n{list}\n\n点击打开第一个有冲突目录的提交页。"
+            ));
+        }
+        if ui.button("全部检测").clicked() {
+            self.hint("正在检测全部目录 …");
+            self.spawn_all_refresh();
+        }
+        if ui.button("全部更新").clicked() {
+            for index in 0..self.cfg.dirs.len() {
+                self.spawn_update(index);
+            }
+        }
+        if ui
+            .button("全部上传")
+            .on_hover_text("所有目录用同一条说明一次提交（会改动服务器，需再点一次确认）")
+            .clicked()
+        {
+            self.upload_all = Some(UploadAll {
+                message: String::new(),
+                confirm: false,
+                focus: true,
+                // 打开时默认全选，想排除谁就在窗口里去掉勾
+                checked: vec![true; self.cfg.dirs.len()],
+                detail: None,
+            });
+        }
+        if ui
+            .button("批量修改仓库")
+            .on_hover_text("服务器搬家时，一次把多个目录的仓库地址前缀一起换掉（每个目录单独起任务，需再点一次确认）")
+            .clicked()
+        {
+            self.batch_relocate = Some(crate::BatchRelocate {
+                focus: true,
+                checked: vec![false; self.cfg.dirs.len()],
+                ..Default::default()
+            });
+        }
+        if ui
+            .button("批量分组 / 标记")
+            .on_hover_text("给勾选的多个目录统一设置分组或标记（只改本地配置，随时能改回）")
+            .clicked()
+        {
+            self.batch_label = Some(crate::BatchLabel {
+                focus: true,
+                checked: vec![false; self.cfg.dirs.len()],
+                ..Default::default()
+            });
+        }
+    }
+
+    pub fn main_page(&mut self, ui: &mut Ui) {
+        // 先用上一帧登记的落点把手里这行落定，再清空区域让这一帧重新登记
+        self.update_drag(ui);
+        self.drop_zones.clear();
+        ui.aligned_row(|ui| {
+            self.toolbar_row(ui);
             // 子布局从右往左排，切换器才能顶在这一行的最右侧
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.compact_switch(ui);
@@ -1395,47 +1794,46 @@ impl SvnApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 5.0;
-                // 分组标题按连续段插：与上一行的组名不同的非空组名 → 先画一枚标题，
-                // 收起的组整段跳过。不重排——上移 / 下移仍是顺序的唯一权威
-                let mut index = 0;
-                while index < self.cfg.dirs.len() {
-                    let group = self.cfg.dirs[index].group.trim().to_owned();
-                    if !group.is_empty() {
-                        let prev = if index == 0 {
-                            String::new()
-                        } else {
-                            self.cfg.dirs[index - 1].group.trim().to_owned()
-                        };
-                        if group != prev {
-                            let count = self.cfg.dirs[index..]
-                                .iter()
-                                .take_while(|d| d.group.trim() == group)
-                                .count();
-                            if self.group_header(ui, &group, count) {
-                                index += count;
-                                continue;
-                            }
+                // 文字默认是「可选中」的 Label，那种 Label 既收点也收拖，注册又排在整行感应区之后，
+                // 于是点名字不选中、按住名字拖不动：这一片关掉文字选中
+                ui.style_mut().interaction.selectable_labels = false;
+                // 按显示序列画：同名组拉到一起共用一枚标题（收起的组整段跳过），
+                // 未分组行按原顺序插空。上移 / 下移也按这个显示顺序走
+                for (header, rows) in self.group_segments() {
+                    if let Some(group) = &header {
+                        if self.group_header(ui, group, rows.len()) {
+                            continue;
                         }
                     }
-                    // 整行可点选中：scope 的点击感应区注册在行内所有控件之下，
-                    // 因此行内按钮、菜单依旧优先命中，不会被抢走；
-                    // 用固定 id 保证这一行的感应区每帧都是同一个控件（目录顺序变化也不影响）
-                    let row_hit = ui
-                        .scope_builder(
-                            egui::UiBuilder::new()
-                                .id(egui::Id::new(("dir_row", index)))
-                                .sense(egui::Sense::click()),
-                            |ui| self.dir_row(ui, index),
-                        )
-                        .response;
-                    if row_hit.clicked() {
-                        self.selected = Some(index);
-                        self.confirm_remove = None;
+                    for index in rows {
+                        // 行内「移除」会当场修改 cfg.dirs，画之前重新比一次上界
+                        if index >= self.cfg.dirs.len() {
+                            continue;
+                        }
+                        // 整行可点选中，也可按住拖走：scope 的点击感应区注册在行内所有控件之下，
+                        // 因此行内按钮、菜单依旧优先命中，不会被抢走；
+                        // 用固定 id 保证这一行的感应区每帧都是同一个控件（目录顺序变化也不影响）
+                        let row_hit = ui
+                            .scope_builder(
+                                egui::UiBuilder::new()
+                                    .id(egui::Id::new(("dir_row", index)))
+                                    .sense(egui::Sense::click_and_drag()),
+                                |ui| self.dir_row(ui, index),
+                            )
+                            .response;
+                        self.arm_drag(ui, row_hit.rect, index);
+                        // 落点登记：整行按上、下两半区分给「插到这行之前 / 之后」
+                        self.drop_zones
+                            .extend(half_zones(row_hit.rect, ui.clip_rect(), index, false));
+                        self.paint_insert_line(ui, row_hit.rect, index, false);
+                        if row_hit.clicked() {
+                            self.selected = Some(index);
+                            self.confirm_remove = None;
+                        }
+                        if row_hit.double_clicked() {
+                            self.open_folder(index);
+                        }
                     }
-                    if row_hit.double_clicked() {
-                        self.open_folder(index);
-                    }
-                    index += 1;
                 }
             });
     }
@@ -1449,11 +1847,60 @@ mod tests {
     use crate::testbed::{base_input, Stage};
     use egui::{Pos2, Rect, ThemePreference};
 
+    /// 添加目录这条横栏里，输入框要和同一行的按钮一样高（他点名要的一致）：
+    /// 量真正画出来的框——两个输入框 + 两枚按钮，四块框必须同高
+    #[test]
+    fn add_dir_bar_boxes_share_one_height() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            crate::ui::tune_style(style, crate::ui::ACCENT);
+        });
+        let mut app = crate::testbed::stub_app(false);
+        let mut out = ctx.run_ui(base_input(), |ui| app.add_dir_bar(ui));
+        out.textures_delta.clear();
+        let heights: Vec<f32> = out
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Rect(rect) => Some(rect.rect.height()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heights.len(), 4, "该量到两个输入框和两枚按钮：{heights:?}");
+        let tallest = heights.iter().cloned().fold(f32::MIN, f32::max);
+        let shortest = heights.iter().cloned().fold(f32::MAX, f32::min);
+        assert_eq!(shortest, tallest, "添加目录栏里的框高不齐：{heights:?}");
+    }
+
+    /// 工具条那行小字要和按钮排在同一条水平线上（他说的「对齐」是这个意思）
+    #[test]
+    fn toolbar_text_sits_on_the_button_line() {
+        let mut stage = Stage::new(false);
+        // 不套 tune_style 就复现不出来：按钮上下各 5 点的内边距正是把小字顶高的原因
+        stage.ctx.style_mut_of(egui::Theme::Dark, |style| {
+            crate::ui::tune_style(style, crate::ui::ACCENT)
+        });
+        let texts = stage.step(None);
+        let title = texts
+            .iter()
+            .find(|(text, _)| text.starts_with("目录列表"))
+            .map(|(_, rect)| *rect)
+            .expect("工具条里应有「目录列表」这行小字");
+        let button = Stage::rect_of(&texts, "全部检测").expect("工具条里应有「全部检测」按钮");
+        assert!(
+            (title.center().y - button.center().y).abs() < 1.5,
+            "小字 {title:?} 没和按钮 {button:?} 对齐"
+        );
+    }
+
     #[test]
     fn switch_toggles_between_detailed_and_compact() {
+        let _appdata = crate::testbed::lock_appdata();
         std::env::set_var(
             "APPDATA",
-            std::env::temp_dir().join("svn_manager_home_style_test"),
+            std::env::temp_dir().join("repo_manager_home_style_test"),
         );
         let mut stage = Stage::new(false);
         let texts = stage.step(None);
@@ -1507,6 +1954,7 @@ mod tests {
                 url: "https://github.com/demo/demo.git".to_owned(),
                 repos_root: "https://github.com/demo/demo.git".to_owned(),
                 revision: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_owned(),
+                branch: "git-backend".to_owned(),
                 node_kind: "dir".to_owned(),
                 last_rev: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_owned(),
                 last_author: "dev".to_owned(),
@@ -1520,6 +1968,7 @@ mod tests {
         });
         let texts = stage.step(None);
         for label in [
+            "git-backend",
             "本地 a1b2c3d4",
             "远端 f0e1d2c3（可更新 2 个提交）",
             "待提交 1 项",
@@ -1652,7 +2101,7 @@ mod tests {
             })
             .map(|(rect, _, _, _)| *rect)
             .collect();
-        assert_eq!(cards.len(), 8, "四张卡片各一个填充 + 一个描边");
+        assert_eq!(cards.len(), 12, "四张卡片各一个填充 + 一个描边 + 一层投影");
         let mut squares: Vec<egui::Rect> = cards.clone();
         squares.sort_by_key(|rect| rect.left() as i32);
         squares.dedup();
@@ -1767,6 +2216,66 @@ mod tests {
         assert_eq!(found("远端 r128").2, warn, "有可更新项时远端行要走警告色");
         assert_eq!(found("本地 r120").2, found("远端 r44").2, "没得更新时两行同为弱色");
         assert_ne!(found("远端 r44").2, warn, "另一张卡片没待更新项，不该跟着变黄");
+    }
+
+    /// 标记胶囊按标记文字收口。以前交给 `Frame` 画在竖排居中的子 Ui 里，成员被沿横轴
+    /// 拉满整宽，胶囊就成了一个和卡片等宽的空盒子，把名称的视觉重量全抢走了
+    #[test]
+    fn compact_tag_pill_hugs_its_text() {
+        let mut stage = Stage::new(true);
+        stage.app.cfg.dirs[0].tag = "Java8".to_owned();
+        stage.app.cfg.dirs[0].tag_color = "#B03A2E".to_owned();
+        let Stage { ctx, app } = &mut stage;
+        let mut out = ctx.run_ui(base_input(), |ui| app.main_page(ui));
+        // 没有渲染器，字体增量不应用就得显式丢弃，否则 epaint 在 Drop 时 panic
+        out.textures_delta.clear();
+        let rects: Vec<(egui::Rect, u8)> = out
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Rect(rect) => Some((rect.rect, rect.corner_radius.nw)),
+                _ => None,
+            })
+            .collect();
+        let pills: Vec<egui::Rect> = rects
+            .iter()
+            .filter(|(_, radius)| *radius == 9)
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert_eq!(pills.len(), 1, "只有挂了标记的那张卡片该有胶囊");
+        let pill = pills[0];
+        let texts = stage.step(None);
+        let text = Stage::rect_of(&texts, "Java8").expect("标记文字要画出来");
+        assert!(
+            pill.width() - text.width() < 20.0,
+            "胶囊要贴着标记文字：框 {} 宽，字 {} 宽",
+            pill.width(),
+            text.width()
+        );
+        let card = rects
+            .iter()
+            .find(|(rect, radius)| {
+                *radius == 10
+                    && (rect.width() - CARD_SIZE).abs() < 0.6
+                    && rect.contains_rect(pill)
+            })
+            .map(|(rect, _)| *rect)
+            .expect("胶囊所在的那张卡片");
+        assert!(
+            (card.center().x - pill.center().x).abs() < 2.0,
+            "胶囊要跟着名称横排居中：卡片中心 {}，胶囊中心 {}",
+            card.center().x,
+            pill.center().x
+        );
+        assert!(card.contains_rect(pill), "胶囊不许画出卡片");
+        assert!(
+            !Stage::rect_of(&texts, "HRP")
+                .expect("卡片名称")
+                .intersects(text),
+            "胶囊压在名称上：名称 {}，标记 {}",
+            Stage::rect_of(&texts, "HRP").unwrap(),
+            text
+        );
     }
 
     /// 计数标记是实心色块，深浅两套主题都得是同一块色，而且数字不能和底色撞在一起
@@ -1964,7 +2473,7 @@ mod tests {
     }
 
     /// 详细行的计数措辞：工作副本侧是「待提交 N 项」/「无待提交项」，本地侧比完没有差异就是
-    /// 「本地无差异」，两组之间用一根竖线隔开。只有「未核对」没比完时不能报无差异——
+    /// 「本地无差异」，两组之间用一个中点隔开。只有「未核对」没比完时不能报无差异——
     /// 那样看着像已经确认过了
     #[test]
     fn detailed_row_counts_read_as_todo_and_local_difference() {
@@ -1979,7 +2488,7 @@ mod tests {
         assert!(shows("待提交 3 项"), "第一行没写待提交：{texts:?}");
         assert!(shows("无待提交项"), "第二行没写无待提交项：{texts:?}");
         assert!(shows("本地无差异"), "比完没差异要写本地无差异：{texts:?}");
-        assert!(shows("|"), "两组计数之间没有竖线：{texts:?}");
+        assert!(shows("·"), "两组计数之间没有分隔中点：{texts:?}");
         assert!(!shows("本地差异 0 项"), "{texts:?}");
 
         // 只剩「没核对」的：总数是 0，但内容没读完就不能报无差异
@@ -2097,9 +2606,10 @@ mod tests {
     /// 点一下标题就收起、再点一下就展开，收起状态写进配置文件
     #[test]
     fn clicking_group_header_toggles_and_persists() {
+        let _appdata = crate::testbed::lock_appdata();
         std::env::set_var(
             "APPDATA",
-            std::env::temp_dir().join("svn_manager_group_toggle_test"),
+            std::env::temp_dir().join("repo_manager_group_toggle_test"),
         );
         let mut stage = Stage::new(false);
         stage.app.cfg.dirs[0].group = "生产".to_owned();
@@ -2171,5 +2681,255 @@ mod tests {
         assert!(Stage::rect_of(&texts, "▶ 生产（2）").is_some());
         assert!(Stage::rect_of(&texts, "HRP").is_none(), "收起的组卡片不画");
         assert!(Stage::rect_of(&texts, "empty").is_some(), "未分组的卡片照常画");
+    }
+
+    /// 同名组散落在列表各处也只归并出一枚标题（显示层拉同组），未分组行插空照画；
+    /// 组内行比未分组行整体右缩一截
+    #[test]
+    fn interleaved_same_name_groups_merge_into_one_header() {
+        let mut stage = Stage::new(false);
+        // dirs[0]=HRP（生产） dirs[1]=CRM（未分组） dirs[2]=empty（生产）
+        stage.app.cfg.dirs[0].group = "生产".to_owned();
+        stage.app.cfg.dirs[2].group = "生产".to_owned();
+        let texts = stage.step(None);
+        let headers = texts
+            .iter()
+            .filter(|(text, _)| text == "▼ 生产（2）")
+            .count();
+        assert_eq!(
+            headers, 1,
+            "同名组只该有一枚标题，实际有：{:?}",
+            texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        let hrp = Stage::rect_of(&texts, "HRP").expect("HRP 行");
+        let empty = Stage::rect_of(&texts, "empty").expect("empty 行");
+        let crm = Stage::rect_of(&texts, "CRM").expect("CRM 行");
+        assert!(
+            hrp.top() < empty.top() && empty.top() < crm.top(),
+            "拉同组后该按 HRP → empty → CRM 显示：HRP={hrp:?} empty={empty:?} CRM={crm:?}"
+        );
+        assert!(
+            hrp.left() - crm.left() >= 8.0,
+            "组内行要比未分组行右缩一截：HRP={:?} CRM={crm:?}",
+            hrp.left()
+        );
+    }
+
+    /// 拉同组之后配置顺序 ≠ 显示顺序，上移/下移要按看到的顺序换邻居
+    #[test]
+    fn move_follows_display_order() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_move_display_test"),
+        );
+        let mut stage = Stage::new(false);
+        // dirs[0]=HRP（旧） dirs[1]=CRM（未分组） dirs[2]=empty（旧）→ 显示 HRP → empty → CRM
+        stage.app.cfg.dirs[0].group = "旧".to_owned();
+        stage.app.cfg.dirs[2].group = "旧".to_owned();
+        let texts = stage.step(None);
+        let hrp = Stage::rect_of(&texts, "HRP").expect("HRP 行");
+        let empty = Stage::rect_of(&texts, "empty").expect("empty 行");
+        let crm = Stage::rect_of(&texts, "CRM").expect("CRM 行");
+        assert!(
+            hrp.top() < empty.top() && empty.top() < crm.top(),
+            "先确认显示顺序是 HRP → empty → CRM"
+        );
+
+        // empty（配置里的第 3 行）在显示上紧挨着 HRP：上移该跟 HRP 换位，而不是没反应
+        stage.app.move_directory(2, -1);
+        assert_eq!(stage.app.selected, Some(0), "选中该跟着换过去的邻居走");
+        let texts = stage.step(None);
+        let hrp = Stage::rect_of(&texts, "HRP").expect("HRP 行");
+        let empty = Stage::rect_of(&texts, "empty").expect("empty 行");
+        let crm = Stage::rect_of(&texts, "CRM").expect("CRM 行");
+        assert!(
+            empty.top() < hrp.top() && hrp.top() < crm.top(),
+            "上移后 empty 应排到 HRP 前面：HRP={hrp:?} empty={empty:?} CRM={crm:?}"
+        );
+    }
+
+    /// 走一遍完整手势：按下 → 挪出 6 像素 → 移到落点 → 松手。
+    /// 无头跑帧的 predicted_dt 是 0，i.time 不会自己走，所以每帧把时刻显式喂进去：
+    /// 「按住够 1 秒」这条判据只有推了时间才测得到
+    fn drag_gesture(stage: &mut Stage, from: Pos2, to: Pos2, hold: f64) {
+        let press = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        stage.timed(0.0, vec![egui::Event::PointerMoved(from), press(from, true)]);
+        stage.timed(
+            hold * 0.2,
+            vec![egui::Event::PointerMoved(from + Vec2::new(0.0, 12.0))],
+        );
+        stage.timed(hold * 0.9, vec![egui::Event::PointerMoved(to)]);
+        stage.timed(hold, vec![egui::Event::PointerMoved(to), press(to, false)]);
+    }
+
+    /// 从上一帧登记的落点里取一块的中心；没登记就直接失败，免得测试悄悄跑空
+    fn zone_center(app: &RepoApp, want: &DropZone) -> Pos2 {
+        app.drop_zones
+            .iter()
+            .find(|(zone, _)| zone == want)
+            .map(|(_, rect)| rect.center())
+            .unwrap_or_else(|| panic!("没有登记落点 {want:?}，实际有 {:?}", app.drop_zones))
+    }
+
+    /// 详细模式：把 HRP 拖到 CRM 的下半区 = 插到 CRM 之后。
+    /// HRP 本来在「旧」组里、CRM 没分组，所以这一次落点同时把它移出分组
+    #[test]
+    fn dragging_a_row_below_another_reorders_and_adopts_its_group() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_drag_row_test"),
+        );
+        let mut stage = Stage::new(false);
+        stage.app.cfg.dirs[0].group = "旧".to_owned();
+        stage.run(vec![]);
+        let from = zone_center(&stage.app, &DropZone::Row(0, Edge::Before));
+        let to = zone_center(&stage.app, &DropZone::Row(1, Edge::After));
+        drag_gesture(&mut stage, from, to, 1.2);
+
+        let paths: Vec<String> = stage.app.cfg.dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![r"C:\wc\crm", r"C:\wc\hrp", r"C:\wc\empty", r"C:\wc\long"],
+            "该把 HRP 插到 CRM 之后"
+        );
+        assert!(stage.app.cfg.dirs[1].group.is_empty(), "落到未分组的 CRM 后面就该移出分组");
+        assert_eq!(stage.app.selected, Some(1), "选中要跟着搬走的那行");
+        assert_eq!(stage.app.dirs[0].remote_rev, "200", "视图状态没跟着行走");
+        assert_eq!(stage.app.dirs[1].remote_rev, "128", "视图状态没跟着行走");
+        assert!(stage.app.drag.is_none(), "松手之后拖动状态要清掉");
+        let tail = stage.app.log_tail();
+        assert!(tail.contains("移出分组"), "要在日志里说清动了什么：{tail}");
+    }
+
+    /// 拖到分组标题条上 = 并入那一组、排到同组末尾；收着的组接住落点要顺手展开，
+    /// 否则刚拖进去的行看不见，像是拖失败了
+    #[test]
+    fn dragging_a_row_onto_a_group_header_joins_and_expands_it() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_drag_header_test"),
+        );
+        let mut stage = Stage::new(false);
+        stage.app.cfg.dirs[1].group = "后端".to_owned();
+        stage.app.cfg.dirs[2].group = "后端".to_owned();
+        stage.app.cfg.collapsed_groups = vec!["后端".to_owned()];
+        stage.run(vec![]);
+        let from = zone_center(&stage.app, &DropZone::Row(0, Edge::Before));
+        let to = zone_center(&stage.app, &DropZone::Header("后端".to_owned()));
+        drag_gesture(&mut stage, from, to, 1.2);
+
+        let paths: Vec<String> = stage.app.cfg.dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![r"C:\wc\crm", r"C:\wc\empty", r"C:\wc\hrp", r"C:\wc\long"],
+            "并入的组要排在同组末尾"
+        );
+        assert_eq!(stage.app.cfg.dirs[2].group, "后端", "分组要跟着落点改");
+        assert!(stage.app.cfg.collapsed_groups.is_empty(), "落进收起的组该把它展开");
+        let texts = stage.step(None);
+        assert!(Stage::rect_of(&texts, "HRP").is_some(), "展开后这一行要看得见");
+        let tail = stage.app.log_tail();
+        assert!(tail.contains("并入分组"), "要在日志里说清动了什么：{tail}");
+    }
+
+    /// 简约形态一样能拖：卡片按左、右半区判定，把第一张拖到第二张的右半边 = 排到它后面
+    #[test]
+    fn dragging_a_card_to_the_right_of_another_reorders_them() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_drag_card_test"),
+        );
+        let mut stage = Stage::new(true);
+        stage.run(vec![]);
+        let from = zone_center(&stage.app, &DropZone::Row(0, Edge::Before));
+        let to = zone_center(&stage.app, &DropZone::Row(1, Edge::After));
+        drag_gesture(&mut stage, from, to, 1.2);
+
+        let paths: Vec<String> = stage.app.cfg.dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![r"C:\wc\crm", r"C:\wc\hrp", r"C:\wc\empty", r"C:\wc\long"],
+            "卡片拖到右半边该换到它后面"
+        );
+    }
+
+    /// 没按住 1 秒就松手 = 只当点了一下：顺序、分组都不该动
+    #[test]
+    fn releasing_before_the_hold_is_only_a_click() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_drag_short_test"),
+        );
+        let mut stage = Stage::new(false);
+        stage.run(vec![]);
+        let from = zone_center(&stage.app, &DropZone::Row(0, Edge::Before));
+        let to = zone_center(&stage.app, &DropZone::Row(1, Edge::After));
+        drag_gesture(&mut stage, from, to, 0.4);
+
+        let paths: Vec<String> = stage.app.cfg.dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![r"C:\wc\hrp", r"C:\wc\crm", r"C:\wc\empty", r"C:\wc\long"],
+            "按住不够久不该真的拖动"
+        );
+        assert!(stage.app.drag.is_none(), "拖动状态没起来");
+        assert!(stage.app.drag_pending.is_none(), "松手要把按下记录清掉");
+    }
+
+    /// 弹层压在卡片身上时长按，不该把底下那张卡片拽走（他报的「在弹出窗口的地方长按会触发目录拖动」）
+    #[test]
+    fn holding_inside_a_card_menu_does_not_drag_the_card_behind_it() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_drag_popup_test"),
+        );
+        let mut stage = Stage::new(true);
+        // 卡片网格一行七张，多加四个把网格顶出第二行：弹层才会压在卡片身上
+        for index in 0..4 {
+            stage.app.cfg.dirs.push(config::DirConfig {
+                path: format!(r"C:\wc\extra{index}"),
+                label: format!("补{index}"),
+                ..Default::default()
+            });
+            stage.app.dirs.push(DirView::default());
+        }
+        let texts = stage.run(vec![]);
+        let plus = Stage::rect_of(&texts, "+").expect("卡片右下角的「+」");
+        stage.step(Some(plus.center()));
+        // 弹层要第二帧才画得出来
+        let texts = stage.step(None);
+        // 按第二项：它往下挪了一档，纵向正好压在第二行那张卡片上
+        let item = Stage::rect_of(&texts, "↑ 上传").expect("卡片菜单里的「↑ 上传」");
+        assert!(
+            stage
+                .app
+                .drop_zones
+                .iter()
+                .any(|(_, zone)| zone.contains(item.center())),
+            "菜单项 {item:?} 没压在任何一张卡片上，这一测等于空跑"
+        );
+
+        let press = |pressed: bool| egui::Event::PointerButton {
+            pos: item.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        stage.timed(0.0, vec![egui::Event::PointerMoved(item.center()), press(true)]);
+        stage.timed(1.2, vec![egui::Event::PointerMoved(item.center())]);
+        // 只按不放：松手会真点了这一项，而起不起拖在两帧里就看得出来
+        assert!(stage.app.drag_pending.is_none(), "按在弹层上不该登记拖动按下");
+        assert!(stage.app.drag.is_none(), "按在弹层上满 1 秒也不该起拖");
     }
 }

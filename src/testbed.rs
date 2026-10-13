@@ -1,4 +1,4 @@
-//! 无头跑帧用的测试台：一个不启动任何 svn 任务的 `SvnApp`，外加把真实页面跑一帧、
+//! 无头跑帧用的测试台：一个不启动任何 svn 任务的 `RepoApp`，外加把真实页面跑一帧、
 //! 把画出来的文字与矩形收下来的小驱动器。只有测试用得到，整个模块挂在 cfg(test) 下。
 
 use std::path::PathBuf;
@@ -9,15 +9,25 @@ use egui::{Pos2, RawInput, Rect, ThemePreference, Vec2};
 use crate::config::{Config, DirConfig};
 use crate::jobs::Pool;
 use crate::svn::{Svn, WcInfo};
-use crate::{DirView, Page, SvnApp};
+use crate::{DirView, Page, RepoApp};
+
+/// 按 APPDATA 读写用户数据的用例都要先拿这把锁跑完整段：环境变量是进程级的，
+/// 十几个用例各自 `set_var("APPDATA", 临时目录)`，并行时会把别人正在读的那份顶掉
+/// （表现是「配置写进去了却读不到」这类莫名其妙的红）。
+/// 锁被前面的 panic 弄脏也照常发出去，一个用例失败不该连累排队的其它用例。
+pub(crate) fn lock_appdata() -> std::sync::MutexGuard<'static, ()> {
+    static APPDATA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    APPDATA_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// 只填字段、不起任何 svn 任务的 app。卡片渲染和点击链要在无头里跑，就得先有个能用的实例。
-pub fn stub_app(compact: bool) -> SvnApp {
+pub fn stub_app(compact: bool) -> RepoApp {
     let info = |url: &str, revision: &str| WcInfo {
         is_wc: true,
         url: url.to_owned(),
         repos_root: url.to_owned(),
         revision: revision.to_owned(),
+        branch: String::new(),
         node_kind: "dir".to_owned(),
         last_rev: revision.to_owned(),
         last_author: "dev".to_owned(),
@@ -72,12 +82,15 @@ pub fn stub_app(compact: bool) -> SvnApp {
             ..Default::default()
         },
     ];
-    SvnApp {
+    RepoApp {
         bc: PathBuf::new(),
         version: None,
         candidates: Vec::new(),
         probing: false,
         refresh_after_detect: false,
+        // 无头跑帧没有真窗口，DWM 那条路直接跳过
+        hwnd: None,
+        caption_dark: None,
         svn_user: "dev".to_owned(),
         user_probed: true,
         pool: Pool::default(),
@@ -85,7 +98,6 @@ pub fn stub_app(compact: bool) -> SvnApp {
         page: Page::Main,
         commit: None,
         history: None,
-        stats: None,
         file_diff: None,
         file_log: None,
         selected: None,
@@ -103,12 +115,17 @@ pub fn stub_app(compact: bool) -> SvnApp {
         edit_tag: None,
         tag_buf: String::new(),
         tag_focus: false,
+        drag: None,
+        drag_pending: None,
+        drag_pos: None,
+        drag_target: None,
+        drop_zones: Vec::new(),
         relocate: None,
         upload_all: None,
         batch_relocate: None,
+        batch_label: None,
         rollback: None,
         show_settings: false,
-        hint: String::new(),
         confirm_remove: None,
         auto_scroll: true,
         next_refresh: Instant::now(),
@@ -128,6 +145,8 @@ pub fn stub_app(compact: bool) -> SvnApp {
         ai_extra: String::new(),
         ai_result: String::new(),
         ai_error: String::new(),
+        // 无头跑帧没有渲染器，贴图不加载（None = 不画）
+        mascot: None,
         cfg,
         svn: Svn::default(),
         git: crate::git::Git::default(),
@@ -149,7 +168,7 @@ pub fn base_input() -> RawInput {
 /// 点下去那一帧还画不出弹层，要多跑一帧稳定的空帧才有。
 pub struct Stage {
     pub ctx: egui::Context,
-    pub app: SvnApp,
+    pub app: RepoApp,
 }
 
 impl Stage {
@@ -183,9 +202,23 @@ impl Stage {
     }
 
     pub fn run(&mut self, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
-        let Stage { ctx, app } = self;
         let mut input = base_input();
         input.events = events;
+        self.frame_runner(input)
+    }
+
+    /// 指定这一帧的输入时刻（`RawInput.time`）再跑一帧。
+    /// `base_input()` 的 predicted_dt 是 0，egui 的 i.time 不会自己往前走，
+    /// 「按住满 1 秒才算拖动」这类按时间判定的行为只能这样喂时间
+    pub fn timed(&mut self, time: f64, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        let mut input = base_input();
+        input.time = Some(time);
+        input.events = events;
+        self.frame_runner(input)
+    }
+
+    fn frame_runner(&mut self, input: egui::RawInput) -> Vec<(String, Rect)> {
+        let Stage { ctx, app } = self;
         let mut out = ctx.run_ui(input, |ui| app.main_page(ui));
         // 测试里没有渲染器，字体增量不应用就得显式丢弃，否则 epaint 在 Drop 时 panic
         out.textures_delta.clear();

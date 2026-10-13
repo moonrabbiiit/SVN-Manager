@@ -1,7 +1,7 @@
 //! Regression test for the exe icon (`build.rs` + `icon/`).
 //!
 //! `build.rs` hands `icon/app.rc` to windres and passes the resulting object to the
-//! linker, so the shipped `icon/svn_manager.ico` has to stay a valid multi-size ICO:
+//! linker, so the shipped `icon/repo-manager.ico` has to stay a valid multi-size ICO:
 //! a truncated file still builds, but Windows then silently falls back to the default
 //! application icon. `icon/make_ico.ps1` regenerates it from `rabbit.png`.
 
@@ -25,18 +25,18 @@ fn u32_le(bytes: &[u8], at: usize) -> u32 {
 fn resource_script_references_the_committed_icon() {
     let text = std::fs::read_to_string(repo_file("icon/app.rc")).expect("icon/app.rc");
     assert!(
-        text.contains("1 ICON \"svn_manager.ico\""),
-        "icon/app.rc must embed icon/svn_manager.ico, got: {text}"
+        text.contains("1 ICON \"repo-manager.ico\""),
+        "icon/app.rc must embed icon/repo-manager.ico, got: {text}"
     );
     assert!(
-        std::fs::metadata(repo_file("icon/svn_manager.ico")).is_ok(),
-        "icon/svn_manager.ico is missing, run icon/make_ico.ps1"
+        std::fs::metadata(repo_file("icon/repo-manager.ico")).is_ok(),
+        "icon/repo-manager.ico is missing, run icon/make_ico.ps1"
     );
 }
 
 #[test]
 fn icon_directory_points_inside_the_file() {
-    let bytes = std::fs::read(repo_file("icon/svn_manager.ico")).expect("icon/svn_manager.ico");
+    let bytes = std::fs::read(repo_file("icon/repo-manager.ico")).expect("icon/repo-manager.ico");
     assert!(bytes.len() > 6 + 16, "ico too short: {}", bytes.len());
     assert_eq!(u16_le(&bytes, 0), 0, "reserved must be 0");
     assert_eq!(u16_le(&bytes, 2), 1, "resource type must be 1 (icon)");

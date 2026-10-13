@@ -1,5 +1,5 @@
 //! Regression test for the hover-only 「查看提交记录」 button on the rows of the
-//! 「涉及文件」 list in `SvnApp::history_page`.
+//! 「涉及文件」 list in `RepoApp::history_page`.
 //!
 //! The button is placed with `Ui::put` *after* the row has been laid out, so three
 //! things can silently break: it can land outside the row (unreachable), the hover

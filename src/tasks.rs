@@ -1,8 +1,8 @@
 //! 每个 svn 动作的发起点：起后台任务（检测 / 更新 / 提交 / 日志 / 维护 / relocate）、
 //! 目录的增删移，以及各页面之间的跳转。
 
-use crate::{Level, Maintain, Page, Relocate, Rollback, SvnApp};
-use crate::{stats, svn, update};
+use crate::{Level, Maintain, Page, Relocate, Rollback, RepoApp};
+use crate::{daterange, svn, update};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use chrono::NaiveDate;
@@ -13,7 +13,7 @@ use crate::jobs::{Data, Kind};
 use crate::repo::RepoKind;
 use crate::svn::{LogEntry, LogPath};
 
-impl SvnApp {
+impl RepoApp {
     // ------------------------------------------------------------ 后台任务
 
     pub fn spawn_detect(&mut self) {
@@ -770,7 +770,7 @@ impl SvnApp {
             None if unlimited => 0,
             None => self.cfg.log_limit.clamp(1, 2000),
         };
-        let spec = stats::revspec(range);
+        let spec = daterange::revspec(range);
         let author = if mine { self.svn_user.clone() } else { String::new() };
         let label = self.dir_label(index);
         self.pool
@@ -1549,12 +1549,26 @@ impl SvnApp {
     }
 
     pub fn move_directory(&mut self, index: usize, delta: isize) {
-        let Some(target) = self.selected_target(index, delta) else {
+        // 上移 / 下移按「显示顺序」走：分组会把同名组的行拉到一起渲染，
+        // 配置顺序 ≠ 看到的顺序，直接交换配置相邻行会出现「点了没反应」或跳位。
+        // 在显示序列里找邻居，交换两者在配置里的位置，下一帧重算显示就是这两行互换
+        let seq: Vec<usize> = self
+            .group_segments()
+            .into_iter()
+            .flat_map(|(_, rows)| rows)
+            .collect();
+        let Some(pos) = seq.iter().position(|i| *i == index) else {
             return;
         };
-        self.cfg.dirs.swap(index, target);
-        self.dirs.swap(index, target);
-        if self.relocate.as_ref().is_some_and(|d| d.dir == index || d.dir == target) {
+        let target_pos = pos as isize + delta;
+        if target_pos < 0 || target_pos as usize >= seq.len() {
+            return;
+        }
+        let from = seq[pos];
+        let target = seq[target_pos as usize];
+        self.cfg.dirs.swap(from, target);
+        self.dirs.swap(from, target);
+        if self.relocate.as_ref().is_some_and(|d| d.dir == from || d.dir == target) {
             self.relocate = None;
         }
         self.selected = Some(target);
@@ -1565,13 +1579,80 @@ impl SvnApp {
         self.persist();
     }
 
-    fn selected_target(&self, index: usize, delta: isize) -> Option<usize> {
-        let target = index as isize + delta;
-        if target < 0 || target as usize >= self.cfg.dirs.len() {
-            None
-        } else {
-            Some(target as usize)
+    /// 拖动落点用的搬运：把第 `from` 行挪到 `insert`（先摘掉 `from`、再数出来的位），
+    /// 顺带把分组改写成 `group`（None = 分组不动）。
+    /// 行序一变，各处指着 cfg.dirs 的下标都要跟着换算——视图状态、还开着的窗口、
+    /// 批量窗口的勾选表，漏一处就会让提交页悄悄换成别的目录。
+    pub fn shift_directory(&mut self, from: usize, insert: usize, group: Option<String>) {
+        let len = self.cfg.dirs.len();
+        if from >= len || insert >= len {
+            return;
         }
+        if from == insert {
+            if let Some(group) = group {
+                self.cfg.dirs[from].group = group;
+                self.persist();
+            }
+            return;
+        }
+        // 旧下标 → 新下标：from 与 insert 之间那一段整体左移一位，反向那段整体右移一位
+        let remap = |index: usize| -> usize {
+            if index == from {
+                insert
+            } else if from < index && index < insert {
+                index - 1
+            } else if insert <= index && index < from {
+                index + 1
+            } else {
+                index
+            }
+        };
+        let mut moved = self.cfg.dirs.remove(from);
+        if let Some(group) = group {
+            moved.group = group;
+        }
+        self.cfg.dirs.insert(insert, moved);
+        if from < self.dirs.len() {
+            let view = self.dirs.remove(from);
+            self.dirs.insert(insert.min(self.dirs.len()), view);
+        }
+        self.selected = Some(insert);
+        self.edit_label = None;
+        self.edit_filter = None;
+        self.edit_group = None;
+        self.edit_tag = None;
+        if let Some(page) = self.commit.as_mut() {
+            page.dir = remap(page.dir);
+        }
+        if let Some(page) = self.history.as_mut() {
+            page.dir = remap(page.dir);
+        }
+        if let Some(dialog) = self.relocate.as_mut() {
+            dialog.dir = remap(dialog.dir);
+        }
+        if let Some(dialog) = self.rollback.as_mut() {
+            dialog.dir = remap(dialog.dir);
+        }
+        for (dir, _) in &mut self.pending_refresh {
+            *dir = remap(*dir);
+        }
+        // 勾选表与 cfg.dirs 一行一位，那一行搬走，勾也要一起搬
+        let shift_flags = |flags: &mut Vec<bool>| {
+            if from < flags.len() {
+                let checked = flags.remove(from);
+                flags.insert(insert.min(flags.len()), checked);
+            }
+        };
+        if let Some(window) = self.upload_all.as_mut() {
+            shift_flags(&mut window.checked);
+        }
+        if let Some(window) = self.batch_relocate.as_mut() {
+            shift_flags(&mut window.checked);
+        }
+        if let Some(window) = self.batch_label.as_mut() {
+            shift_flags(&mut window.checked);
+        }
+        self.persist();
     }
 
     pub fn open_folder(&self, index: usize) {
@@ -1598,12 +1679,6 @@ impl SvnApp {
     }
 
     pub fn open_history(&mut self, index: usize) {
-        self.open_history_in(index, None);
-    }
-
-    /// 打开「提交记录」页并按日期区间读服务器（`None` = 照旧按条数读最近 N 条）。
-    /// 统计图下钻走这里：点某天就直接落在那天的记录上。
-    pub fn open_history_in(&mut self, index: usize, range: Option<(NaiveDate, NaiveDate)>) {
         if self.dir_kind(index) == RepoKind::Git {
             if self.git_or_none().is_none() {
                 return;
@@ -1622,19 +1697,11 @@ impl SvnApp {
             self.svn_user.clone()
         };
         let only_mine = self.cfg.history_only_mine;
-        let mut page = HistoryPage::new(index, label, limit, user, only_mine);
-        if let Some((from, to)) = range {
-            // 下钻带进来的区间要在控件上看得见：落到「自定义」并把两个框填成那两天，
-            // 用户一眼知道现在读的是哪段，也能就地改
-            page.preset = Some(stats::RangePreset::Custom);
-            page.custom_from = from.format("%Y-%m-%d").to_string();
-            page.custom_to = to.format("%Y-%m-%d").to_string();
-        }
-        page.range = range;
+        let page = HistoryPage::new(index, label, limit, user, only_mine);
         self.history = Some(page);
         self.page = Page::History;
         let mine = self.history.as_ref().is_some_and(|page| page.mine);
-        self.spawn_log_in(index, mine, false, range);
+        self.spawn_log_in(index, mine, false, None);
     }
 
     pub fn back_to_main(&mut self) {

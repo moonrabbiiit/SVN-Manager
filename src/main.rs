@@ -6,6 +6,7 @@ mod bcompare;
 mod commit;
 mod compare;
 mod config;
+mod daterange;
 mod dialogs;
 mod fonts;
 mod git;
@@ -16,7 +17,6 @@ mod jobs;
 mod localdiff;
 mod repo;
 mod settings;
-mod stats;
 mod svn;
 mod tasks;
 mod ui;
@@ -35,15 +35,17 @@ use crate::commit::CommitPage;
 use crate::config::Config;
 use crate::history::{FileDiff, FileLog, HistoryPage};
 use crate::jobs::Pool;
-use crate::stats::StatsPage;
 use crate::svn::{Svn, WcInfo};
 
-// 通用绘制工具搬到 ui.rs，这里转出一层，history / commit / stats 里的 crate::ink 照旧可用
-pub use ui::{highlight, highlight_with, ink, Search};
+// 通用绘制工具搬到 ui.rs，这里转出一层，history / commit / daterange 里的 crate::ink 照旧可用
+pub use ui::{
+    field_margin, highlight, highlight_with, ink, pale, pane_fill, pane_hover, pane_stroke, quiet,
+    Search, INK, AMBER, DANGER_FILL, DANGER_TEXT, ERR, OK,
+};
 
 pub const APP_TITLE: &str = "仓库管理器";
 /// 程序版本号，由 build.rs 从根目录 version.txt 注入；发布新版本时只改那个文件
-pub const APP_VERSION: &str = env!("SVN_MANAGER_VERSION");
+pub const APP_VERSION: &str = env!("REPO_MANAGER_VERSION");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -61,9 +63,9 @@ impl Level {
             match self {
                 Self::Info => Color32::from_gray(200),
                 Self::Command => Color32::from_rgb(120, 190, 240),
-                Self::Success => Color32::from_rgb(80, 200, 120),
-                Self::Warning => Color32::from_rgb(240, 190, 70),
-                Self::Error => Color32::from_rgb(240, 100, 100),
+                Self::Success => crate::ui::OK,
+                Self::Warning => crate::ui::AMBER,
+                Self::Error => crate::ui::ERR,
             },
         )
     }
@@ -96,14 +98,14 @@ pub struct UploadAll {
     pub detail: Option<usize>,
 }
 
-/// 「批量改地址」窗口状态：多个目录共用一对前缀，各自起一个改地址任务。
+/// 「批量修改仓库」窗口状态：多个目录共用一对前缀，各自起一个改地址任务。
 #[derive(Clone, Default)]
 pub struct BatchRelocate {
     /// 要替换掉的旧地址前缀
     pub from: String,
     /// 新地址前缀
     pub to: String,
-    /// 每个目录是否参与本次批量改地址（与 cfg.dirs 对齐）
+    /// 每个目录是否参与本次批量修改仓库（与 cfg.dirs 对齐）
     pub checked: Vec<bool>,
     /// from 上一次的值：变了就按新前缀重算一遍默认勾选
     pub last_from: String,
@@ -111,6 +113,22 @@ pub struct BatchRelocate {
     pub focus: bool,
     /// 第一下只是把按钮变成「确认」，再点一次才真的发任务
     pub confirm: bool,
+}
+
+/// 「批量分组 / 标记」窗口状态：给勾选的目录统一设置分组或标记。
+/// 两个动作互不牵连，改的是本地配置、随时能改回，不做两步确认
+#[derive(Clone, Default)]
+pub struct BatchLabel {
+    /// 每个目录是否参与（与 cfg.dirs 对齐，默认全不勾）
+    pub checked: Vec<bool>,
+    /// 要统一设置的分组名（空 = 清除所选目录的分组）
+    pub group: String,
+    /// 要统一设置的标记文字（空 = 清除标记）
+    pub tag: String,
+    /// 标记颜色，形如 "#RRGGBB"；空 = 按默认蓝显示（解析口径同 tag_color_rgb）
+    pub tag_hex: String,
+    /// 打开时抢一下分组输入框的焦点
+    pub focus: bool,
 }
 
 /// 「回退到某个版本」确认窗口：把整个目录或单个文件倒回所选版本，改动先落在本地。
@@ -173,8 +191,6 @@ pub enum Page {
     Main,
     Commit,
     History,
-    /// 个人提交文件数量统计（整页，图表要地方铺）
-    Stats,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,9 +214,13 @@ impl Maintain {
     }
 }
 
-pub struct SvnApp {
+pub struct RepoApp {
     pub cfg: Config,
     pub svn: Svn,
+    /// 主窗口的 HWND（启动时取一次，给 DWM 设标题栏配色用）；拿不到就是 None
+    pub hwnd: Option<isize>,
+    /// 上一次写给原生标题栏的深浅态，只有它变了才重设一次 DWM 属性
+    pub caption_dark: Option<bool>,
     /// Git 命令行（git.exe），给 .git 目录行用
     pub git: crate::git::Git,
     /// git.exe 的版本号（设置窗口与状态行显示）
@@ -220,8 +240,6 @@ pub struct SvnApp {
     pub page: Page,
     pub commit: Option<CommitPage>,
     pub history: Option<HistoryPage>,
-    /// 个人提交统计页的状态（None = 没开过；退出页面时清掉，下次进来回到默认条件）
-    pub stats: Option<StatsPage>,
     /// 双击历史页「涉及文件」后打开的逐行改动窗口（左右分栏）
     pub file_diff: Option<FileDiff>,
     /// 点「查看提交记录」后打开的单个文件提交记录窗口
@@ -246,16 +264,28 @@ pub struct SvnApp {
     pub edit_tag: Option<usize>,
     pub tag_buf: String,
     pub tag_focus: bool,
+    /// 正在被拖动的目录行（None = 没在拖）。拖到哪、插在哪都靠下面几项判
+    pub drag: Option<usize>,
+    /// 按下的候选行（第 1 个 = 哪一行，第 2 个 = 按下时的 i.time）：按住够久才转成 drag
+    pub drag_pending: Option<(usize, f64)>,
+    /// 拖动中的指针位置：幽灵标签跟着它走
+    pub drag_pos: Option<egui::Pos2>,
+    /// 指针当前命中的落点，只用来画插入线和把标题条点亮
+    pub drag_target: Option<home::DropZone>,
+    /// 上一帧画出来的落点区域（全局坐标）：分组标题条整条、目录行或卡片各切两半。
+    /// 反查用上一帧的：拖动过程中列表一行都不挪，坐标照样准，而本帧的要等画完才齐
+    pub drop_zones: Vec<(home::DropZone, egui::Rect)>,
     /// 正在修改仓库地址的目录（None = 窗口关闭）
     pub relocate: Option<Relocate>,
     /// 正在批量上传的目录清单（None = 窗口关闭）
     pub upload_all: Option<UploadAll>,
-    /// 「批量改地址」窗口（None = 窗口关闭）
+    /// 「批量修改仓库」窗口（None = 窗口关闭）
     pub batch_relocate: Option<BatchRelocate>,
+    /// 「批量分组 / 标记」窗口（None = 窗口关闭）
+    pub batch_label: Option<BatchLabel>,
     /// 正在确认的版本回退（None = 窗口关闭）
     pub rollback: Option<Rollback>,
     pub show_settings: bool,
-    pub hint: String,
     pub confirm_remove: Option<usize>,
     pub auto_scroll: bool,
     pub next_refresh: Instant,
@@ -291,15 +321,21 @@ pub struct SvnApp {
     pub ai_result: String,
     /// AI 工作日志：最近一次生成失败的原因
     pub ai_error: String,
+    /// 右下角那张贴图：启动时把嵌进 exe 的 PNG 解一次，解不出来就一直是 None（不画）
+    pub mascot: Option<egui::TextureHandle>,
 }
 
-/// 取 icon/svn_manager.ico 里 48px 那张当窗口图标（标题栏 + 任务栏）。
-/// 直接读嵌进 exe 的同一个 ico，图标就只有 rabbit.png -> svn_manager.ico 这一条来源；
-/// ico 里的图是 32bpp 未压缩位图，像素自下而上存、字节序 BGRA，所以要翻转并换成 RGBA。
+/// 取 icon/repo-manager.ico 里 48px 那张当窗口图标（标题栏 + 任务栏）。
+/// 直接读嵌进 exe 的同一个 ico，图标就只有 rabbit.png -> repo-manager.ico 这一条来源。
 /// 解析不出来就返回 None，让 eframe 用它的默认图标，不影响启动。
 fn window_icon() -> Option<egui::IconData> {
+    icon_rgba(include_bytes!("../icon/repo-manager.ico"))
+}
+
+/// 从 ico 字节里解出 48px 那张。ico 里的图是 32bpp 未压缩位图，像素自下而上存、
+/// 字节序 BGRA，所以要翻转并换成 RGBA。
+fn icon_rgba(ico: &[u8]) -> Option<egui::IconData> {
     const EDGE: usize = 48;
-    let ico = include_bytes!("../icon/svn_manager.ico");
     let count = u16::from_le_bytes(ico.get(4..6)?.try_into().ok()?) as usize;
     for index in 0..count {
         let entry = ico.get(6 + index * 16..22 + index * 16)?;
@@ -337,6 +373,9 @@ fn window_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result {
+    // 机器名从 svn_manager 换成 repo-manager：先搬家再接管，下面才有人读配置与自启状态
+    config::migrate_legacy_dir();
+    autostart::adopt_legacy();
     // 界面程序没有控制台，异常信息写入配置文件同目录的 panic.log 便于排查
     let panic_log = config::config_file().with_file_name("panic.log");
     std::panic::set_hook(Box::new(move |info| {
@@ -366,21 +405,98 @@ fn main() -> eframe::Result {
         centered: true,
         ..Default::default()
     };
-    eframe::run_native(APP_TITLE, options, Box::new(|cc| Ok(Box::new(SvnApp::new(cc)))))
+    eframe::run_native(APP_TITLE, options, Box::new(|cc| Ok(Box::new(RepoApp::new(cc)))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 一张自己造的 48×48：逻辑顶行红、底行蓝、中间绿。
+    /// 按 ico 的存法写进去 —— 行自下而上、字节 BGRA，所以翻转或换序都会让上下两沿对调
+    fn striped_48() -> Vec<u8> {
+        const E: usize = 48;
+        let mut px = vec![0u8; E * E * 4];
+        for row in 0..E {
+            let bgra = if row == 0 {
+                [0, 0, 255, 255]
+            } else if row == E - 1 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 255, 0, 255]
+            };
+            let stored = E - 1 - row;
+            for col in 0..E {
+                px[stored * E * 4 + col * 4..stored * E * 4 + col * 4 + 4].copy_from_slice(&bgra);
+            }
+        }
+        px
+    }
+
+    /// 拼一个最小 ico 文件：目录项 + 若干张 (边长, 像素)，每张前面 40 字节 DIB 头
+    fn ico_with(images: &[(usize, Vec<u8>)]) -> Vec<u8> {
+        let mut table = Vec::new();
+        let mut offset = 6 + 16 * images.len();
+        for (edge, px) in images {
+            let size = 40 + px.len();
+            table.push((*edge, size, offset));
+            offset += size;
+        }
+        let mut out: Vec<u8> = vec![0, 0, 1, 0, 0, 0];
+        out[4] = images.len() as u8;
+        for (edge, size, at) in &table {
+            out.extend_from_slice(&[*edge as u8, *edge as u8, 0, 0]);
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&32u16.to_le_bytes());
+            out.extend_from_slice(&(*size as u32).to_le_bytes());
+            out.extend_from_slice(&(*at as u32).to_le_bytes());
+        }
+        for (edge, px) in images {
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&(*edge as u32).to_le_bytes());
+            out.extend_from_slice(&((*edge * 2) as u32).to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&32u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(px.len() as u32).to_le_bytes());
+            out.extend_from_slice(&[0u8; 16]);
+            out.extend_from_slice(px);
+        }
+        out
+    }
+
+    /// 解码器的正事：挑对 48 那张、行翻成自上而下、BGRA 换成 RGBA。
+    /// 靠真实画稿上某个恰好是白色的像素来验太脆，换一版图就得改断言，所以喂自己造的图
     #[test]
-    fn window_icon_is_a_non_blank_rgba_48() {
-        let icon = window_icon().expect("icon/svn_manager.ico 里应能解析出 48px 的图");
+    fn icon_decoder_picks_48_and_keeps_rows_and_channels() {
+        let file = ico_with(&[(16, vec![255; 16 * 16 * 4]), (48, striped_48())]);
+        let icon = icon_rgba(&file).expect("该从里面解出 48px 那张");
+        assert_eq!((icon.width, icon.height), (48, 48), "前面那张 16px 该跳过去");
+        let px = |x: usize, y: usize| &icon.rgba[(y * 48 + x) * 4..(y * 48 + x) * 4 + 4];
+        assert_eq!(px(0, 0), &[255, 0, 0, 255], "顶行不是红的：行序翻了或 B/R 写反了");
+        assert_eq!(px(47, 47), &[0, 0, 255, 255], "底行不是蓝的");
+        assert_eq!(px(20, 20), &[0, 255, 0, 255]);
+    }
+
+    /// 没有能用的那张就得返回 None，让 eframe 用它自己的默认图标
+    #[test]
+    fn icon_decoder_needs_a_32bpp_48_entry() {
+        assert!(icon_rgba(&ico_with(&[(16, vec![255; 16 * 16 * 4])])).is_none());
+        assert!(icon_rgba(&[]).is_none());
+    }
+
+    /// 内嵌那张只查「解得出 48px、不是一张空图」，画成什么样跟着设计走
+    #[test]
+    fn embedded_window_icon_is_not_blank() {
+        let icon = window_icon().expect("icon/repo-manager.ico 里应能解析出 48px 的图");
         assert_eq!((icon.width, icon.height), (48, 48));
         assert_eq!(icon.rgba.len(), 48 * 48 * 4);
-        // 四角是透明的，中心是兔子身上的白色；行序翻转错了这两处就会反过来
-        assert_eq!(&icon.rgba[0..4], &[0, 0, 0, 0]);
-        let center = (24 * 48 + 24) * 4;
-        assert_eq!(&icon.rgba[center..center + 4], &[255, 255, 255, 255]);
+        let opaque = icon.rgba.chunks(4).filter(|p| p[3] > 8).count();
+        assert!(
+            opaque * 10 >= 48 * 48,
+            "图标几乎是空的：不透明只占 {} / {}",
+            opaque,
+            48 * 48
+        );
     }
 }

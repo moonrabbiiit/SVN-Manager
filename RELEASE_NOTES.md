@@ -1,4 +1,4 @@
-# SVN Manager 更新说明（V1.2.5）
+# repo-manager 更新说明（V1.2.5）
 
 ## 主页样式：详细 / 简约
 

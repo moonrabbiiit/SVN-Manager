@@ -1,10 +1,10 @@
 //! Beyond Compare：定位程序、按本机对比记录挑出该开哪一组、把差异窗口拉起来。
 
-use crate::{Level, SvnApp};
+use crate::{Level, RepoApp};
 use crate::bcompare;
 use std::path::{Path, PathBuf};
 
-impl SvnApp {
+impl RepoApp {
     pub fn reset_bc(&mut self) {
         for note in bcompare::reset_cache() {
             self.push(Level::Info, note);
@@ -238,7 +238,7 @@ impl SvnApp {
             return;
         };
         let mirror = std::env::temp_dir()
-            .join("SVNManager")
+            .join("RepoManager")
             .join("BASE")
             .join(relative);
         if let Some(parent) = mirror.parent() {

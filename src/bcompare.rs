@@ -22,7 +22,7 @@ const SETTINGS_ROOT: &str = "Scooter Software";
 /// 依次按 环境变量 → PATH → 注册表 App Paths → 各磁盘常见安装目录 查找 BCompare.exe。
 pub fn candidates() -> Vec<PathBuf> {
     let mut found = Vec::new();
-    if let Some(custom) = env_path("SVN_MANAGER_BCOMPARE") {
+    if let Some(custom) = env_path("REPO_MANAGER_BCOMPARE") {
         add_path(&mut found, custom.clone());
         add_path(&mut found, custom.join(EXE));
     }
@@ -244,7 +244,7 @@ pub fn set_default_rules(rules: &DefaultRules) -> Result<String, String> {
     let Some(next) = apply_default_rules(&text, rules) else {
         return Err("会话存储里找不到「新建文件夹比较」的默认值节点，先在 Beyond Compare 里做一次文件夹对比再试".to_owned());
     };
-    let backup = file.with_file_name("BCSessions.xml.svnmanager.bak");
+    let backup = file.with_file_name("BCSessions.xml.repomanager.bak");
     std::fs::copy(&file, &backup).map_err(|e| format!("备份失败：{e}"))?;
     std::fs::write(&file, next.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
     let mut on = Vec::new();
@@ -555,6 +555,7 @@ mod tests {
     /// 每条文件夹记录都应该能按自己的左右路径找回来（没装就直接跳过）。
     #[test]
     fn real_records_match_their_own_paths() {
+        let _appdata = crate::testbed::lock_appdata();
         let Some(appdata) = std::env::var_os("APPDATA") else {
             return;
         };
@@ -591,6 +592,7 @@ mod tests {
     /// 以前少拼了 Scooter Software 一层，记录一条都读不到，症状就是 BC 打开了却没有任何条件。
     #[test]
     fn real_name_filters_are_all_parsed() {
+        let _appdata = crate::testbed::lock_appdata();
         let Some(appdata) = std::env::var_os("APPDATA") else {
             return;
         };

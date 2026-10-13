@@ -5,7 +5,8 @@ use egui::{Align, Button, Color32, FontId, Frame, Layout, RichText, ScrollArea, 
 use crate::jobs::{Data, Kind, Sink};
 use crate::repo::RepoKind;
 use crate::svn::{blocked_count, Item, StatusEntry, Svn};
-use crate::{highlight, ink, Level, Maintain, SvnApp};
+use crate::{highlight, ink, Level, Maintain, RepoApp};
+use crate::ui::{AlignedRow, field_margin};
 
 /// 「上传 / 提交」页面状态。
 ///
@@ -138,7 +139,7 @@ pub struct CommitPlan {
     pub deletes: Vec<String>,
 }
 
-impl SvnApp {
+impl RepoApp {
     /// 上传前「还没更新到最新」的提醒文案：最近一次检测读到服务器上还有没拉到本地的新改动
     /// （`svn status -u` 的口径，见 `DirView::out_of_date`）时给一句，否则 `None`。
     /// 还没读到（断网、刚启动还没检测）就不给——无从判断，宁可不说，也不能把「不知道」当「未更新」。
@@ -348,7 +349,7 @@ impl SvnApp {
         let reading = self.pool.has(Kind::Status, page.dir);
         let diffing = self.pool.has(Kind::Diff, page.dir);
 
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             if ui.button("← 返回目录").clicked() {
                 self.back_to_main();
                 self.commit = None;
@@ -430,7 +431,7 @@ impl SvnApp {
                 );
             }
         });
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
             // 「全选」是字面意义全勾（含冲突）；计数只认能提交的条目，冲突等特殊状态
             // 勾上了也不会进提交——默认进场就是按 uploadable 勾好的，一般用不着它
             if ui
@@ -506,9 +507,11 @@ impl SvnApp {
                 }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_sized(
-                    Vec2::new(210.0, 22.0),
-                    TextEdit::singleline(&mut page.filter).hint_text("按名称过滤（命中处高亮）"),
+                ui.add(
+                    TextEdit::singleline(&mut page.filter)
+                        .hint_text("按名称过滤（命中处高亮）")
+                        .margin(field_margin(ui))
+                        .desired_width(210.0),
                 );
             });
         });
@@ -539,9 +542,12 @@ impl SvnApp {
         // 勾选里的未版本化 / 已丢失条目：提交时先自动 svn add / svn delete，再和修改一起提交
         let adds = page.selected_targets(Maintain::Add);
         let deletes = page.selected_targets(Maintain::Delete);
-        ui.horizontal(|ui| {
+        // 备注框和右边的提交按钮共用这一个高度，两边都按它 sizing，底部才对得齐
+        let note_height = 60.0;
+        ui.aligned_row(|ui| {
             let width = (ui.available_width() - 140.0).max(240.0);
-            ui.add(
+            ui.add_sized(
+                Vec2::new(width, note_height),
                 TextEdit::multiline(&mut page.message)
                     .desired_width(width)
                     .desired_rows(3)
@@ -589,7 +595,7 @@ impl SvnApp {
                 let button =
                     egui::Button::new(RichText::new(caption).size(14.0).strong().color(text))
                         .fill(fill);
-                let response = ui.add_sized(Vec2::new(126.0, 60.0), button);
+                let response = ui.add_sized(Vec2::new(126.0, note_height), button);
                 if response.clicked() {
                     match blocked {
                         Some(why) => self.hint(why),
@@ -637,7 +643,7 @@ impl SvnApp {
                 }
                 if armed && blocked.is_none() {
                     // 拦住的这一下要给退路：要么先更新到最新，要么明确放弃
-                    ui.horizontal(|ui| {
+                    ui.aligned_row(|ui| {
                         let tool = if git_kind { "git pull" } else { "svn update" };
                         if ui
                             .button("先更新到最新")
@@ -708,7 +714,7 @@ impl SvnApp {
                                 Color32::TRANSPARENT
                             })
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                ui.aligned_row(|ui| {
                                     let mut checked = entry.checked;
                                     if ui.checkbox(&mut checked, "").on_hover_text("勾选后提交该项").changed() {
                                         page.entries[index].checked = checked;
@@ -792,7 +798,7 @@ impl SvnApp {
                 let target = page.entries.get(picked).map(|e| (e.path.clone(), e.item));
                 if let Some((target_path, item)) = target {
                     columns[0].add_enabled_ui(!(diffing || writing), |ui| {
-                        ui.horizontal(|ui| {
+                        ui.aligned_row(|ui| {
                             if ui.button("查看该项差异").clicked() {
                                 if item == Item::Unversioned || item == Item::Ignored {
                                     page.diff = "该条目尚未加入版本控制，没有差异可比对。".to_owned();
@@ -1209,7 +1215,7 @@ mod tests {
     }
 
     /// 提交页跑一帧，收下画出来的「文字 + 矩形」（同 testbed 里主页那套收法）。
-    fn commit_frame(ctx: &egui::Context, app: &mut SvnApp) -> Vec<(String, egui::Rect)> {
+    fn commit_frame(ctx: &egui::Context, app: &mut RepoApp) -> Vec<(String, egui::Rect)> {
         let out = ctx.run_ui(crate::testbed::base_input(), |ui| app.commit_page(ui));
         commit_drawn(out)
     }
@@ -1217,7 +1223,7 @@ mod tests {
     /// 在提交页上点一下（位置由上一帧的矩形给），再收一帧。
     fn commit_click(
         ctx: &egui::Context,
-        app: &mut SvnApp,
+        app: &mut RepoApp,
         pos: egui::Pos2,
     ) -> Vec<(String, egui::Rect)> {
         let press = |pressed: bool| egui::Event::PointerButton {
@@ -1304,7 +1310,7 @@ mod tests {
         let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "提交 1 项").center());
         assert!(app.commit.as_ref().unwrap().confirm_outdated, "第一下该只拦住");
         assert!(!app.pool.has(Kind::Commit, 0), "拦住的这一下不能起提交任务");
-        assert!(app.hint.contains("再点一次"), "{}", app.hint);
+        assert!(app.log_tail().contains("再点一次"), "{}", app.log_tail());
 
         // 按钮文案与退路按钮要再跑一帧才画得出来：这一帧的文案是帧首算好的
         let drawn = commit_frame(&ctx, &mut app);
@@ -1321,7 +1327,7 @@ mod tests {
             "放行时要往输出记录留痕：{:?}",
             app.output.iter().map(|line| line.text.clone()).collect::<Vec<_>>()
         );
-        assert!(app.hint.contains("无法提交"), "第二下该越过拦截：{}", app.hint);
+        assert!(app.log_tail().contains("无法提交"), "第二下该越过拦截：{}", app.log_tail());
         assert!(!app.commit.as_ref().unwrap().confirm_outdated, "放行后确认态要清掉");
     }
 

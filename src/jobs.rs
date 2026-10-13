@@ -20,11 +20,6 @@ pub enum Kind {
     CheckUpdate,
     /// AI 生成工作日志（把勾选的提交记录发给 AI，整块结果一次性回传，dir 恒为 usize::MAX）
     AiLog,
-    /// 个人提交统计：按目录各起一个读日志的任务，一次查询同时有几个在跑。
-    /// 池里的 dir 恒为 usize::MAX：`is_busy` 只比目录编号不比种类，用真实编号会把那个
-    /// 目录的「提交 / 更新 / relocate」按钮一起按住，而统计只是读数据，不该妨碍干活。
-    /// 真实目录编号在 `Data::Stats.dir` 里带回来。
-    Stats,
     /// 下载新版本 exe 到临时目录（下载与校验都在程序内完成）
     DownloadUpdate,
     Update,
@@ -69,15 +64,6 @@ pub enum Data {
     AiLog {
         ok: bool,
         content: String,
-        message: String,
-    },
-    /// 个人提交统计：一个目录在指定区间内的本人提交记录。
-    /// `epoch` 是发起这次查询时代页面上的代号，对不上说明用户中途换了条件，结果直接丢。
-    Stats {
-        dir: usize,
-        epoch: u64,
-        entries: Vec<LogEntry>,
-        ok: bool,
         message: String,
     },
     Wc {

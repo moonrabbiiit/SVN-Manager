@@ -1,5 +1,5 @@
-# Build icon/svn_manager.ico from rabbit.png (16/24/32/48/64/128/256 px).
-# build.rs feeds that .ico to windres, so it is what svn_manager.exe shows in
+# Build icon/repo-manager.ico from rabbit.png (16/24/32/48/64/128/256 px).
+# build.rs feeds that .ico to windres, so it is what repo-manager.exe shows in
 # Explorer, on the taskbar and in the title bar. To change the exe icon:
 # replace rabbit.png, then run
 #   powershell -NoProfile -ExecutionPolicy Bypass -File icon\make_ico.ps1
@@ -8,7 +8,7 @@
 Add-Type -AssemblyName System.Drawing
 $root = Split-Path -Parent $PSScriptRoot
 $src = Join-Path $root "rabbit.png"
-$out = Join-Path $PSScriptRoot "svn_manager.ico"
+$out = Join-Path $PSScriptRoot "repo-manager.ico"
 if (-not (Test-Path $src)) { "[!] source image not found: $src"; exit 1 }
 $sizes = 16, 24, 32, 48, 64, 128, 256
 $image = [Drawing.Image]::FromFile($src)

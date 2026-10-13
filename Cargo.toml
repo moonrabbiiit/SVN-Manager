@@ -1,8 +1,8 @@
 ﻿[package]
-name = "svn_manager"
-version = "1.2.6"
+name = "repo-manager"
+version = "2.0.0"
 edition = "2021"
-description = "SVN 管理器 (SVN working-copy manager)"
+description = "仓库管理器 (repo-manager, SVN/Git working-copy manager)"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -16,9 +16,16 @@ encoding_rs = "0.8.35"
 rfd = "0.17.2"
 regex = "1.13.1"
 
-# 开机自启：直接写 HKCU Run 键（rfd 已带入 0.60，不再多拉依赖）
+# 右下角那张贴图：解嵌进 exe 的 mascot.png。image 本来就在依赖树里（eframe / arboard 带的），
+# 这里只是直拿一次，只开 png 一种格式，不多拉下载
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# 开机自启：直接写 HKCU Run 键（rfd 已带入 0.60，不再多拉依赖）；
+# Dwm 那组给原生标题栏上主题色用（DwmSetWindowAttribute）
+# raw-window-handle 本来就在依赖树里（eframe 依赖），这里只是要它的 HasWindowHandle trait 取 HWND
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Graphics_Dwm", "Win32_System_Registry"] }
+raw-window-handle = "0.6"
 
 [profile.release]
 opt-level = 2

@@ -1,21 +1,374 @@
 //! 各处共用的绘制小工具。`main.rs` 把它们 `pub use` 出去，所以其它模块照旧写 `crate::ink`。
 
 use egui::text::LayoutJob;
-use egui::{Color32, FontId, TextFormat, Ui, Vec2};
+use egui::{Color32, FontId, NumExt, TextFormat, Ui, Vec2};
 
-/// 样式微调：`SvnApp::new` 对深浅两套样式各调一次（两套各自独立，主题切换后照样生效）。
+// ------------------------------------------------------------ 语义色板
+//
+// 界面里反复出现的几种颜色收成常量：新代码一律用常量，不再各处散 Color32::from_rgb。
+// 存量代码里的字面量不动（值本来就一致，机械替换没有视觉收益）。
+
+/// 主色（靛蓝）：选中、链接、焦点、active 态这类「主色调」的地方。
+/// 用户可在设置页换掉（配置里存 "#RRGGBB"），所以界面取色走 `RepoApp::accent`，
+/// 这支只是默认值与读不出配置时的兜底；白底那一档由 [`on_white`] 换算，不再另存常量。
+pub const ACCENT: Color32 = Color32::from_rgb(108, 140, 255);
+/// 成功 / 正常（状态绿灯、已是最新）
+pub const OK: Color32 = Color32::from_rgb(80, 200, 120);
+/// 待处理提醒（可更新、待提交、忙碌）
+pub const AMBER: Color32 = Color32::from_rgb(240, 190, 70);
+/// 错误 / 冲突
+pub const ERR: Color32 = Color32::from_rgb(240, 100, 100);
+/// 两步确认红按钮的底与字（碰服务器、删东西之前那一下）
+pub const DANGER_FILL: Color32 = Color32::from_rgb(150, 60, 60);
+pub const DANGER_TEXT: Color32 = Color32::from_rgb(255, 240, 240);
+/// 浅色主题的正文黑。egui 的 `.strong()` 取的是 `widgets.active.fg_stroke`，
+/// 那个位置一旦涂成主色，全页面所有粗体字会一起变蓝——所以「active」只由
+/// 底色和描边表达，粗体字始终留在这支近黑上。
+pub const INK: Color32 = Color32::from_rgb(24, 27, 34);
+
+// ------------------------------------------------------------ 主题色（可换）
+
+/// 配置里存的 "#RRGGBB" → 主色；留空或读不出来都回退默认那支靛蓝
+pub fn accent_rgb(hex: &str) -> [u8; 3] {
+    let text = hex.trim().trim_start_matches('#');
+    if text.len() == 6 {
+        if let Ok(value) = u32::from_str_radix(text, 16) {
+            return [
+                (value >> 16) as u8,
+                (value >> 8) as u8,
+                value as u8,
+            ];
+        }
+    }
+    let [r, g, b, _] = ACCENT.to_array();
+    [r, g, b]
+}
+
+/// 取色器吐出的 [r, g, b] → 配置里存的 "#RRGGBB"
+pub fn accent_hex(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+/// 对纯白的对比度（1 = 白对白，21 = 黑对白）。ecolor 没带现成的亮度 / 对比度 API，这里自算
+fn contrast_on_white(color: Color32) -> f32 {
+    let [r, g, b, _] = color.to_array();
+    let channel = |value: u8| {
+        let c = value as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let l = 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+    1.05 / (l + 0.05)
+}
+
+/// 浅色主题（白底）用的那一档：饱和度提半成、亮度压一成。
+/// 默认那支靛蓝按这条规则换算得 #5275E5，和原来手调的 #546CE6 基本重合。
+/// 在 sRGB 伽马空间里做，跟眼睛看到的明暗一致
+pub fn on_white(accent: Color32) -> Color32 {
+    let mut hsv = egui::ecolor::HsvaGamma::from(accent);
+    hsv.s = (hsv.s * 1.05).min(1.0);
+    hsv.v *= 0.90;
+    // 主题色由用户自己挑，挑到很淡的一档时压一成还不够——描边和链接在白底上要看得见，
+    // 于是接着按档压暗，直到对纯白有 3:1（非文字元素的最低对比度）
+    let mut color = Color32::from(hsv);
+    while contrast_on_white(color) < 3.0 && hsv.v > 0.05 {
+        hsv.v *= 0.9;
+        color = Color32::from(hsv);
+    }
+    color
+}
+
+/// 白底上的极浅主色面：主色占 `keep` 那一成，其余是白（keep 越小越接近白）
+pub fn pale(color: Color32, keep: f32) -> Color32 {
+    let [r, g, b, _] = color.to_array();
+    let mix = |channel: u8| (255.0 - (255.0 - channel as f32) * keep) as u8;
+    Color32::from_rgb(mix(r), mix(g), mix(b))
+}
+
+/// 主色的淡底：只换个 alpha，比另算一档实色更跟手
+pub fn tint(color: Color32, alpha: u8) -> Color32 {
+    let [r, g, b, _] = color.to_array();
+    Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
+/// 弹窗摆位：中心点对齐屏幕中心。
 ///
-/// 排版部分与主题无关。文字颜色只动深色主题：egui 默认的深色正文是 gray(140)、弱化系数
-/// 0.6（≈gray(84)），而面板底色是 gray(27)，弱化文字只有 2.4:1 的对比度——输出区的普通行、
-/// 各处说明文字这些灰字在深色下基本看不清。这里把正文抬到 gray(160)、系数抬到 0.8
-/// （≈gray(128)，4.4:1）：层次还在，两种字都读得下来。
-/// 浅色主题的正文是 gray(80) 打底（弱化后 12:1 以上），本来就够，不动。
-pub fn tune_style(style: &mut egui::Style) {
-    style.spacing.item_spacing = Vec2::new(7.0, 5.0);
-    style.spacing.button_padding = Vec2::new(8.0, 3.0);
-    if style.visuals.dark_mode {
-        style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(160);
-        style.visuals.weak_text_alpha = 0.8;
+/// 只锚打开的头两帧——第一帧 egui 在做 sizing pass（窗口不可见、尺寸是估的），
+/// 居中要等第二帧那个量准的尺寸。第三帧起撤锚：位置留在正中，标题栏也重新能拖，
+/// 不至于为了居中把弹窗钉死在屏幕上。
+///
+/// 顺带给窗口一个稳定 id：标题里带目录名 / 版本号的弹窗，换 target 重开时才算同一个窗口。
+pub trait WindowCentered {
+    fn centered(self, ctx: &egui::Context, slug: &'static str) -> Self;
+}
+
+impl WindowCentered for egui::Window<'_> {
+    fn centered(self, ctx: &egui::Context, slug: &'static str) -> Self {
+        let id = egui::Id::new(slug);
+        let layer = egui::LayerId::new(egui::Order::Middle, id);
+        // 上一帧没画过 = 这一帧刚出现（含关掉后重开），计数从头再来
+        let held = if ctx.memory(|m| m.areas().visible_last_frame(&layer)) {
+            ctx.data(|d| d.get_temp::<u8>(id)).unwrap_or(0)
+        } else {
+            0
+        };
+        if held < 2 {
+            ctx.data_mut(|d| d.insert_temp(id, held + 1));
+            self.id(id).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        } else {
+            self.id(id)
+        }
+    }
+}
+
+/// 有固定默认尺寸的窗口用的居中矩形：这类窗口（改动明细 / 提交记录）的位置由 `Zoom`
+/// 自己记账，还要留最大化—还原，所以只把它的默认矩形摆正，不上 anchor。
+pub fn centered_rect(ctx: &egui::Context, size: Vec2) -> egui::Rect {
+    let area = ctx.content_rect();
+    egui::Rect::from_center_size(area.center(), size.at_most(area.size()))
+}
+
+impl crate::RepoApp {
+    /// 当前主题色（深色主题直接用这支，浅色主题用 `on_white` 压暗的那档）
+    pub fn accent(&self) -> Color32 {
+        let [r, g, b] = accent_rgb(&self.cfg.accent);
+        Color32::from_rgb(r, g, b)
+    }
+
+    /// 主色在白底上的版本：各处描边、拖拽高亮、选中文字都取这一档
+    pub fn accent_ink(&self) -> Color32 {
+        on_white(self.accent())
+    }
+
+    /// 换色要立刻见效：深浅两套样式各重调一遍。两套都得调——
+    /// 现在用的是其中一套，切主题时切的是另一套，漏掉它就还是旧色
+    pub fn apply_accent(&self, ctx: &egui::Context) {
+        let accent = self.accent();
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            ctx.style_mut_of(theme, |style| tune_style(style, accent));
+        }
+        ctx.request_repaint();
+    }
+}
+
+/// 样式微调：`RepoApp::new` 与换主题色时各调一次，深浅两套都要调。
+///
+/// 这是一次集中换肤：egui 默认皮只调了两行间距，按钮、窗口、选区全是出厂样，
+/// 这里统一接管——控件圆角、三态观感、窗口阴影、面板分层、字号层级都在这一处定。
+///
+/// 观感目标是「干净的扁平底 + 看得见的边界」：底是纯白 / 冷黑，不铺渐变也不做玻璃；
+/// 分层全靠发丝描边、极浅的一档表面色和柔和投影。文字全部走中性色，
+/// 主色只留给选中态、焦点框和小标记。
+///
+/// `accent` 是用户选的主题色（默认那支靛蓝），浅色主题另用 [`on_white`] 压暗一档。
+pub fn tune_style(style: &mut egui::Style, accent: Color32) {
+    let dark = style.visuals.dark_mode;
+    // 白底主题的主色档：同一色相压暗一成、饱和度提一档
+    let ink = on_white(accent);
+
+    // 间距：按钮更饱满、留白更松，滚动条收细
+    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+    style.spacing.button_padding = Vec2::new(10.0, 5.0);
+    style.spacing.scroll.bar_width = 8.0;
+
+    // 字号层级：正文与按钮抬到 13（各处显式 .size() 的地方不受影响）
+    for (text_style, size) in [
+        (egui::TextStyle::Body, 13.0),
+        (egui::TextStyle::Button, 13.0),
+        (egui::TextStyle::Small, 12.0),
+    ] {
+        if let Some(font) = style.text_styles.get_mut(&text_style) {
+            font.size = size;
+        }
+    }
+
+    // 控件三态：圆角统一、不外扩。描边留着——上一版把 bg_stroke 全抹成 NONE，
+    // 结果浅底上按钮只剩一层淡灰、读不出边界，这里改回「浅底 + 发丝描边」
+    let w = &mut style.visuals.widgets;
+    w.noninteractive.corner_radius = 5.into();
+    for state in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        state.corner_radius = 7.into();
+        state.expansion = 0.0;
+    }
+
+    // 窗口与弹层：圆角 + 柔和投影，让弹窗浮在面板上，而不是和底色平贴
+    let v = &mut style.visuals;
+    v.window_corner_radius = 10.into();
+    v.menu_corner_radius = 8.into();
+
+    if dark {
+        // 深色：底是冷黑，控件是一块半透明石板
+        v.panel_fill = Color32::from_rgb(17, 19, 26);
+        v.window_fill = Color32::from_rgba_unmultiplied(32, 37, 50, 236);
+        v.extreme_bg_color = Color32::from_rgba_unmultiplied(9, 11, 17, 190);
+        v.window_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30));
+        v.window_shadow = egui::Shadow {
+            offset: [0, 14],
+            blur: 32,
+            spread: 2,
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+        };
+        v.popup_shadow = egui::Shadow {
+            offset: [0, 6],
+            blur: 16,
+            spread: 1,
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, 110),
+        };
+        v.selection.bg_fill = tint(accent, 78);
+        v.selection.stroke = egui::Stroke::new(1.0, accent);
+        v.hyperlink_color = accent;
+        v.text_cursor.stroke.color = accent;
+        // 弱化字给死色，不走 weak_text_alpha：那个系数是 gamma_multiply（直接乘通道），
+        // 只会把字越乘越黑，浅色主题想要的是「更淡」，正好反了
+        v.weak_text_color = Some(Color32::from_rgb(146, 154, 172));
+
+        let w = &mut v.widgets;
+        w.noninteractive.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(200, 206, 218));
+        w.noninteractive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 34));
+        w.inactive.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(216, 222, 234));
+        w.inactive.weak_bg_fill = Color32::from_rgba_unmultiplied(150, 165, 205, 34);
+        w.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 38));
+        w.hovered.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(238, 242, 250));
+        w.hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(160, 176, 216, 60);
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 76));
+        w.active.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(244, 246, 252));
+        w.active.weak_bg_fill = tint(accent, 92);
+        w.active.bg_stroke = egui::Stroke::new(1.0, accent);
+        // open 态那一档 egui 是给「活动窗口的标题栏」用的（Window 的 header frame），
+        // 顺带也是展开的菜单 / 折叠头：染一层主色淡底，标题栏就不再是一条死灰带
+        w.open.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(232, 236, 246));
+        w.open.weak_bg_fill = tint(accent, 44);
+        w.open.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 44));
+    } else {
+        // 浅色：底就是纯白，一档灰都不掺；分层全靠描边、极浅的表面色和投影
+        v.panel_fill = Color32::from_rgb(255, 255, 255);
+        v.window_fill = Color32::from_rgb(255, 255, 255);
+        v.extreme_bg_color = Color32::from_rgb(255, 255, 255);
+        v.window_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(96, 118, 168, 84));
+        v.window_shadow = egui::Shadow {
+            offset: [0, 12],
+            blur: 30,
+            spread: 1,
+            color: Color32::from_rgba_unmultiplied(58, 76, 126, 52),
+        };
+        v.popup_shadow = egui::Shadow {
+            offset: [0, 5],
+            blur: 14,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(58, 76, 126, 40),
+        };
+        v.selection.bg_fill = tint(accent, 62);
+        v.selection.stroke = egui::Stroke::new(1.0, ink);
+        v.hyperlink_color = ink;
+        v.text_cursor.stroke.color = ink;
+        v.weak_text_color = Some(Color32::from_rgb(96, 104, 120));
+
+        // 底是纯白，控件平时也是一块白，边界只能由描边来说——所以描边比深色主题更实一点。
+        // 悬停必须换成一档看得见的冷灰：白底上「白变白」等于没有反馈。
+        let w = &mut v.widgets;
+        w.noninteractive.fg_stroke = egui::Stroke::new(1.0, INK);
+        w.noninteractive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(196, 204, 222));
+        w.inactive.fg_stroke = egui::Stroke::new(1.0, INK);
+        w.inactive.weak_bg_fill = Color32::from_rgb(255, 255, 255);
+        w.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(172, 182, 206));
+        w.hovered.fg_stroke = egui::Stroke::new(1.0, INK);
+        w.hovered.weak_bg_fill = Color32::from_rgb(238, 243, 251);
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(126, 140, 176));
+        // 粗体字取的就是这一档：留回近黑。「按下 / 选中」交给底色和主色描边去说
+        w.active.fg_stroke = egui::Stroke::new(1.0, INK);
+        w.active.weak_bg_fill = pale(accent, 0.20);
+        w.active.bg_stroke = egui::Stroke::new(1.0, ink);
+        w.open.fg_stroke = egui::Stroke::new(1.0, INK);
+        w.open.weak_bg_fill = pale(accent, 0.12);
+        w.open.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(172, 182, 206));
+    }
+}
+
+/// 轻量按钮：只把「平时」那一层底调薄一档，发丝描边保留。
+/// 上一版这里连描边一起抹了，结果行内、顶栏一排按钮在浅底上
+/// 完全看不出边界——现在要的是「淡但不隐形」。悬停 / 按下仍走全局三态。
+/// 不新建子 Ui（那会改变控件在当前布局里的分配矩形），只是加这一个控件期间临时改样式。
+pub fn quiet<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let dark = ui.visuals().dark_mode;
+    let previous = ui.style_mut().visuals.widgets.inactive.weak_bg_fill;
+    ui.style_mut().visuals.widgets.inactive.weak_bg_fill = if dark {
+        Color32::from_rgba_unmultiplied(150, 165, 205, 20)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let result = add(ui);
+    ui.style_mut().visuals.widgets.inactive.weak_bg_fill = previous;
+    result
+}
+
+/// 按钮那一档的高度：一行正文 + 上下 `button_padding`（实测默认按钮 26、输入框 20）。
+/// 输入框、取色块、以及整行的垂直居中都以它为准，缩放时跟着 spacing 一起放大。
+pub fn control_height(ui: &Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Body) + 2.0 * ui.spacing().button_padding.y
+}
+
+/// 单行输入框要和同一行的按钮一样高：TextEdit 自带上下 2 像素，按钮吃的是 `button_padding`
+/// （实测默认框高 20、按钮 26），所以纵向按按钮那一档补齐。
+/// 取整得四舍五入：字号「大」时 button_padding.y 是 5.75，直接截断成 5 会让框比按钮矮一截
+pub fn field_margin(ui: &Ui) -> egui::Margin {
+    egui::Margin::symmetric(4, ui.spacing().button_padding.y.round() as i8)
+}
+
+/// 取色块。egui 的 color_button 按 `interact_size` 精确分配大小（出厂 40×18），
+/// 既不吃 add_sized 也不吃 margin，只能在这一格里把纵向垫到按钮那一档，画完立刻还原
+pub fn color_swatch(ui: &mut Ui, rgb: &mut [u8; 3]) -> egui::Response {
+    let previous = ui.spacing().interact_size;
+    ui.spacing_mut().interact_size.y = control_height(ui);
+    let response = ui.color_edit_button_srgb(rgb);
+    ui.spacing_mut().interact_size = previous;
+    response
+}
+
+/// 行高按「加进来那一刻」定档，后面更高的按钮不会把先加的小字带下来，文字就浮在按钮上沿。
+/// 替 `Ui::horizontal` 用：先把整行垫到按钮那一档，行里所有东西按同一档垂直居中
+/// （这一档正是按钮本来就撑起来的高度，所以行高本身不变）
+pub trait AlignedRow {
+    fn aligned_row<R>(&mut self, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R>;
+}
+
+impl AlignedRow for Ui {
+    fn aligned_row<R>(&mut self, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+        let tall = control_height(self);
+        self.horizontal(|ui| {
+            ui.set_min_height(tall);
+            add(ui)
+        })
+    }
+}
+
+/// 面板 / 目录行 / 卡片共用的表面色，一处定档，分层关系才不会各处各调一遍。
+/// 浅色主题不能再用半透明白——纯白底上「白叠白」看不出来，得是一档极浅的冷灰
+pub fn pane_fill(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgba_unmultiplied(150, 165, 205, 26)
+    } else {
+        Color32::from_rgb(248, 250, 253)
+    }
+}
+
+/// 表面被悬停时：同一块面再深一档（比全局按钮的 hover 更克制，整行悬停不该抢眼睛）
+pub fn pane_hover(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgba_unmultiplied(160, 176, 216, 46)
+    } else {
+        Color32::from_rgb(238, 243, 251)
+    }
+}
+
+/// 表面的边界：浅色主题是一支冷灰线，深色主题是白色高光，都只有一像素的存在感
+pub fn pane_stroke(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 34)
+    } else {
+        Color32::from_rgb(228, 232, 240)
     }
 }
 
@@ -306,14 +659,14 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
-    /// 深色主题的灰字要看得清：调过样式后，弱化文字与正文对面板底色都得到 4:1 以上，
-    /// 且正文仍比弱文字亮（层次不能丢）。浅色主题本来就够，不许动。
+    /// 两套主题的灰字都要看得清：弱化文字与正文对面板底色各自达到门槛，且正文比弱文字亮。
+    /// 浅色主题另加两条：底色是纯白，粗体字与正文同色（近黑，不许是主色）。
     #[test]
-    fn dark_gray_text_is_readable() {
+    fn gray_text_is_readable() {
         let ctx = Context::default();
         let before = ctx.style_of(egui::Theme::Dark).visuals.weak_text_color();
-        ctx.style_mut_of(egui::Theme::Dark, tune_style);
-        ctx.style_mut_of(egui::Theme::Light, tune_style);
+        ctx.style_mut_of(egui::Theme::Dark, |style| crate::ui::tune_style(style, crate::ui::ACCENT));
+        ctx.style_mut_of(egui::Theme::Light, |style| crate::ui::tune_style(style, crate::ui::ACCENT));
         let dark = ctx.style_of(egui::Theme::Dark).visuals.clone();
         let weak = dark.weak_text_color();
         assert!(
@@ -335,11 +688,68 @@ mod tests {
             "egui 默认的灰字本来就低（2.3:1），这条是这次要改的理由"
         );
         let light = ctx.style_of(egui::Theme::Light).visuals.clone();
-        assert_eq!(light.weak_text_alpha, 0.6, "浅色主题的弱化系数不该被改");
+        assert_eq!(
+            light.weak_text_color,
+            Some(Color32::from_rgb(96, 104, 120)),
+            "浅色主题的弱化文字是写死的，不走 weak_text_alpha（那是乘法，只会把灰字压得更淡）"
+        );
         assert!(
             contrast(light.weak_text_color(), light.panel_fill) >= 5.0,
-            "浅色主题的灰字本来就够看"
+            "浅色主题的灰字：{:?} 对 {:?} 只有 {:.1}:1",
+            light.weak_text_color(),
+            light.panel_fill,
+            contrast(light.weak_text_color(), light.panel_fill)
         );
+        assert_eq!(
+            light.panel_fill,
+            Color32::from_rgb(255, 255, 255),
+            "浅色主题的底色就是纯白，一档灰都不掺：{:?}",
+            light.panel_fill
+        );
+        assert_eq!(
+            light.strong_text_color(),
+            light.text_color(),
+            "粗体字走的是 widgets.active 的前景，一旦涂成主色全页面粗体一起变蓝"
+        );
+        assert!(
+            contrast(light.strong_text_color(), light.window_fill) >= 8.0,
+            "浅色主题的正文要贴近黑"
+        );
+    }
+
+    /// 主题色：配置里存的是 "#RRGGBB"，读不出来一律回退默认靛蓝；
+    /// 白底那一档由 on_white 换算，默认色落在 #5275E5（原来手调的是 #546CE6，差在色相没跟着漂）
+    #[test]
+    fn accent_parsing_and_the_white_theme_variant() {
+        assert_eq!(accent_rgb(""), [108, 140, 255], "留空回退默认靛蓝");
+        assert_eq!(accent_rgb("#ff8040"), [255, 128, 64]);
+        assert_eq!(accent_rgb("zz"), [108, 140, 255], "坏值也是默认");
+        assert_eq!(accent_hex([255, 128, 64]), "#FF8040");
+        assert_eq!(
+            on_white(ACCENT).to_array(),
+            [82, 117, 229, 255],
+            "默认色的白底档变了：说明 on_white 的倍率被动过"
+        );
+        // 用户能挑到的几档典型颜色：淡黄最容易在白底上看不见
+        for pick in [
+            Color32::from_rgb(255, 128, 64),
+            Color32::from_rgb(120, 220, 200),
+            Color32::from_rgb(250, 240, 150),
+            Color32::from_rgb(230, 160, 220),
+        ] {
+            let ink = on_white(pick);
+            let [_, _, _, a] = ink.to_array();
+            assert_eq!(a, 255, "只该动明暗，不能把颜色变成半透明");
+            assert!(
+                luminance(ink) <= luminance(pick),
+                "{pick:?} 的白底档 {ink:?} 反而更亮了"
+            );
+            assert!(
+                contrast(ink, Color32::WHITE) >= 3.0,
+                "{pick:?} 的白底档 {ink:?} 对白只有 {:.1}:1，描边和链接会看不见",
+                contrast(ink, Color32::WHITE)
+            );
+        }
     }
 
     #[test]

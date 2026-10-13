@@ -393,7 +393,7 @@ mod tests {
     }
 
     fn tree(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("svn_manager_localdiff_{name}"));
+        let root = std::env::temp_dir().join(format!("repo_manager_localdiff_{name}"));
         let local = root.join("local");
         let server = root.join("server");
         let _ = fs::remove_dir_all(&root);
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn unreadable_target_is_an_error_not_zero() {
-        let root = std::env::temp_dir().join("svn_manager_localdiff_missing");
+        let root = std::env::temp_dir().join("repo_manager_localdiff_missing");
         let server = root.join("server");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&server).unwrap();

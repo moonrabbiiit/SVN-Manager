@@ -68,6 +68,9 @@ pub struct WcInfo {
     pub url: String,
     pub repos_root: String,
     pub revision: String,
+    /// Git 目录的当前分支（`rev-parse --abbrev-ref HEAD`，分离头指针时是 "HEAD"）；
+    /// SVN 没有分支概念，恒为空
+    pub branch: String,
     pub node_kind: String,
     pub last_rev: String,
     pub last_author: String,
@@ -239,6 +242,7 @@ pub fn parse_info(xml: &str) -> Option<WcInfo> {
         url: first_text(&doc, "url"),
         repos_root: first_text(&doc, "root"),
         revision: entry.attribute("revision").unwrap_or("").to_owned(),
+        branch: String::new(),
         node_kind: entry.attribute("kind").unwrap_or("").to_owned(),
         last_rev: commit
             .as_ref()
@@ -613,7 +617,7 @@ impl Svn {
     }
 
     /// 同 `log`，但由调用方给出版本区间（`revspec`，如 `HEAD:1` 或 `{2026-09-11}:{2026-09-04}`）。
-    /// 按日期查统计时必须走这里：`log` 固定的 `HEAD:1` 无法限定区间。
+    /// 按日期区间读提交记录时必须走这里：`log` 固定的 `HEAD:1` 无法限定区间。
     /// `revspec` 一律写成「新 → 旧」：`-r` 是正序时 `-l` 会保留区间里**最旧**的 N 条，
     /// 所以日期区间这里不限制条数（`limit` 传 0），只靠区间本身收口。
     pub fn log_in(&self, target: &str, revspec: &str, limit: i64, author: &str) -> (Vec<LogEntry>, Run) {
@@ -797,7 +801,7 @@ impl Svn {
         let width: usize = targets.iter().map(|t| t.chars().count() + 3).sum();
         let mut args = head;
         if width > 12_000 {
-            let file = temp_file("svn_manager_targets");
+            let file = temp_file("repo_manager_targets");
             let body = targets.join("\r\n");
             if fs::write(&file, GBK.encode(&body).0.as_ref()).is_ok() {
                 args.push("--targets".to_owned());
@@ -826,7 +830,7 @@ impl Svn {
         message: &str,
         on_line: &dyn Fn(&str),
     ) -> Run {
-        let message_file = temp_file("svn_manager_log");
+        let message_file = temp_file("repo_manager_log");
         if fs::write(&message_file, message.as_bytes()).is_err() {
             return Run::error("无法写入提交说明临时文件");
         }
@@ -928,7 +932,7 @@ fn registry_candidates() -> Vec<PathBuf> {
 
 fn known_locations() -> Vec<PathBuf> {
     let mut found = Vec::new();
-    if let Some(custom) = env_path("SVN_MANAGER_SVN") {
+    if let Some(custom) = env_path("REPO_MANAGER_SVN") {
         add_path(&mut found, custom);
     }
     for name in ["SVN_ROOT", "SVN_HOME", "Subversion_Home"] {
