@@ -66,12 +66,12 @@ use crate::svn::CREATE_NO_WINDOW;
 use serde::{Deserialize, Serialize};
 
 /// 官方源仓库（GitHub）
-pub const OFFICIAL_REPO: &str = "moonrabbiiit/SVN-Manager";
+pub const OFFICIAL_REPO: &str = "moonrabbiiit/repo-manager";
 /// 最新发布：`releases/latest` 自动排除草稿与预发布，也不按时间排序取，交给 GitHub 判
-pub const OFFICIAL_API: &str = "https://api.github.com/repos/moonrabbiiit/SVN-Manager/releases/latest";
+pub const OFFICIAL_API: &str = "https://api.github.com/repos/moonrabbiiit/repo-manager/releases/latest";
 /// 测试分支：`releases` 列表按创建时间倒序返回，预发布也在里面，取最新一条非草稿的
-pub const OFFICIAL_TEST_API: &str = "https://api.github.com/repos/moonrabbiiit/SVN-Manager/releases?per_page=30";
-pub const OFFICIAL_PAGE: &str = "https://github.com/moonrabbiiit/SVN-Manager";
+pub const OFFICIAL_TEST_API: &str = "https://api.github.com/repos/moonrabbiiit/repo-manager/releases?per_page=30";
+pub const OFFICIAL_PAGE: &str = "https://github.com/moonrabbiiit/repo-manager";
 
 /// 更新源（写在配置的 `update_source` 里）：官方 GitHub 发布 / GitHub 预发布（测试分支）/
 /// 自建服务端 latest.json
