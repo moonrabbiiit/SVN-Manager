@@ -1390,7 +1390,7 @@ impl RepoApp {
             job.wrap = egui::text::TextWrapping::truncate_at_width(max_width - 12.0);
             let galley = ui.painter().layout_job(job);
             let pill = egui::Rect::from_center_size(
-                egui::pos2(card.center().x, card.center().y + 17.0),
+                egui::pos2(card.center().x, card.center().y + 22.0),
                 Vec2::new((galley.size().x + 12.0).min(max_width), 18.0),
             );
             ui.painter().rect_stroke(
