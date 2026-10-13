@@ -90,15 +90,26 @@ impl Summary {
 /// Beyond Compare 名称筛选的排除条件。
 #[derive(Clone, Debug, Default)]
 pub struct Excludes {
+    /// 任意层级都命中的目录名（末级名匹配）
     dirs: Vec<String>,
+    /// 只在根目录命中的目录相对路径（BC 写法 `.\.idea\` / `\.idea\`）
+    root_dirs: Vec<String>,
+    /// 任意层级都命中的文件名模式
     files: Vec<Regex>,
+    /// 只在根目录命中的文件相对路径模式（BC 写法 `.\auth.json` / `\auth.json`）
+    root_files: Vec<Regex>,
 }
 
 impl Excludes {
     /// 解析 `DirConfig::bc_filter`。真实形态（本机配置解码后）：
-    /// `-*.iml;-.project;-log4j2.xml;-.\.idea\;-bin\;-web\`
-    /// 分号分隔；只有 `-` 前缀是排除；结尾带 `\` 的是目录名，按末级名在任意层级命中；
-    /// 其余按文件名匹配（前导点属于名字本身，`.project`、`.classpath` 都是文件不是相对路径）。
+    /// `-*.iml;-.project;-log4j2.xml;-.\.idea\;-bin\;-web\`，vue 这边还有
+    /// `-package-lock.json;-.\__base_hrformat.vue;-.\auth.json;…`
+    /// 分号分隔；只有 `-` 前缀是排除；结尾带 `\` 的是目录名。
+    /// 带 `.\` 或 `\` 前缀的是「锚定根目录」：只排除最外层那一份，子目录里的同名
+    /// 文件 / 目录照常参与比较——以前把 `.\名字` 当文件名字面量去匹配，永远打不中，
+    /// 根目录的排除全部失效，主页就比 BC 多报出两个「只在本地开发侧」。
+    /// 不带路径前缀的目录按末级名在任意层级命中，文件按文件名任意层级命中
+    /// （前导点属于名字本身，`.project`、`.classpath` 都是文件不是相对路径）。
     /// `+` 前缀和无前缀的包含模式这里不支持：差异口径要和他用同一份筛选打开的 BC 对得上，
     /// 而 BC 那边包含条件是记在会话里的，我们只有这份排除串。
     pub fn parse(raw: &str) -> Self {
@@ -113,33 +124,77 @@ impl Excludes {
             if pattern.is_empty() {
                 continue;
             }
-            // 结尾的 `\` 是 BC 里「目录名」的写法，取末级名即可在任意层级命中
-            if let Some(dir) = pattern.strip_suffix('\\') {
-                let name = dir.rsplit('\\').next().unwrap_or("").trim_matches('\\');
-                if !name.is_empty() {
-                    out.dirs.push(name.to_ascii_lowercase());
+            // `.\名字`（BC 面板里填 `.\xxx` 的写法）和 `\名字` 都锚定根目录；
+            // 相对路径统一按 `/` 存，和 walk 产出的 rel 一致
+            let (root_only, pattern) = match pattern
+                .strip_prefix(".\\")
+                .or_else(|| pattern.strip_prefix("./"))
+                .or_else(|| pattern.strip_prefix('\\'))
+            {
+                Some(rest) => (true, rest),
+                None => (false, pattern),
+            };
+            let pattern = pattern.replace('\\', "/");
+            // 结尾的 `/` 是 BC 里「目录名」的写法：锚定根目录时整段按相对路径算，
+            // 不锚定时取末级名在任意层级命中
+            if let Some(dir) = pattern.strip_suffix('/') {
+                if root_only {
+                    let path = dir.trim_matches('/').to_ascii_lowercase();
+                    if !path.is_empty() {
+                        out.root_dirs.push(path);
+                    }
+                } else {
+                    let name = dir.rsplit('/').next().unwrap_or("").trim_matches('/');
+                    if !name.is_empty() {
+                        out.dirs.push(name.to_ascii_lowercase());
+                    }
                 }
                 continue;
             }
-            if let Some(re) = glob_to_regex(pattern) {
-                out.files.push(re);
+            if let Some(re) = glob_to_regex(&pattern) {
+                if root_only {
+                    out.root_files.push(re);
+                } else {
+                    out.files.push(re);
+                }
             }
         }
         out
     }
 
-    fn skips_dir(&self, name: &str) -> bool {
+    /// rel 是相对根目录的 `/` 分隔路径，顺带告诉筛选项是不是落在根目录
+    fn skips_dir(&self, name: &str, rel: &str) -> bool {
         let lower = name.to_ascii_lowercase();
-        self.dirs.iter().any(|d| *d == lower) || self.matches_file(&lower)
+        if self.dirs.iter().any(|d| *d == lower) || self.matches_file(&lower) {
+            return true;
+        }
+        at_root(rel) && self.root_hit(rel)
     }
 
-    fn skips_file(&self, name: &str) -> bool {
-        self.matches_file(&name.to_ascii_lowercase())
+    fn skips_file(&self, name: &str, rel: &str) -> bool {
+        if self.matches_file(&name.to_ascii_lowercase()) {
+            return true;
+        }
+        at_root(rel) && self.root_hit(rel)
+    }
+
+    /// 根目录锚定的那些条目：rel（已统一小写）正好等于模式或多段模式的前缀才算
+    fn root_hit(&self, rel: &str) -> bool {
+        let lower = rel.to_ascii_lowercase();
+        self.root_dirs
+            .iter()
+            .any(|d| lower == *d || lower.starts_with(&format!("{d}/")))
+            || self.root_files.iter().any(|re| re.is_match(&lower))
     }
 
     fn matches_file(&self, lower: &str) -> bool {
         self.files.iter().any(|re| re.is_match(lower))
     }
+}
+
+/// 根目录判定：rel 里没有分隔符就是在根上
+fn at_root(rel: &str) -> bool {
+    !rel.contains('/')
 }
 
 /// 把 BC 的名称模式编译成整串匹配的正则（`*` → `.*`、`?` → `.`、其余逐字符转义，统一小写）。
@@ -250,11 +305,11 @@ fn walk(root: &Path, dir: &Path, ex: &Excludes, depth: usize, sink: &mut dyn FnM
         let Ok(rest) = child.strip_prefix(root) else { continue };
         let rel = rest.display().to_string().replace('\\', "/");
         if file_type.is_dir() {
-            if ex.skips_dir(&name) {
+            if ex.skips_dir(&name, &rel) {
                 continue;
             }
             walk(root, &child, ex, depth + 1, sink);
-        } else if file_type.is_file() && !ex.skips_file(&name) {
+        } else if file_type.is_file() && !ex.skips_file(&name, &rel) {
             let Ok(meta) = item.metadata() else { continue };
             sink(&rel, meta.len(), mtime_secs(&meta));
         }
@@ -893,6 +948,44 @@ mod tests {
         let s = compare(&local, &server, filter).unwrap();
         assert_eq!(s.only_local, 0, "被筛掉的都该不算差异");
         assert_eq!((s.only_server, s.differing), (1, 0), "筛选没命中的服务器端项照报");
+    }
+
+    /// BC 的 `.\名字` 只排除根目录那一份（vue_new 这台机器的真实场景：
+    /// `.\__base_hrformat.vue`、`.\auth.json` 排除不掉，主页就比 BC 多报两个
+    /// 「只在本地开发侧」）。子目录里的同名文件 / 目录不能被根目录锚定的模式带走。
+    #[test]
+    fn dot_slash_patterns_anchor_to_root_only() {
+        let (local, server) = tree("root_anchor");
+        let t = 1_700_000_000;
+        let filter = r"-package-lock.json;-.\__base_hrformat.vue;-.\auth.json;-.\.idea\;-bin\";
+        put(&local, "__base_hrformat.vue", b"x", t); // 根目录，被排除
+        put(&local, "auth.json", b"x", t); // 根目录，被排除
+        put(&local, "bin/a.class", b"x", t); // 任意层级目录 bin，被排除
+        put(&local, ".idea/work.xml", b"x", t); // 根下 .idea，被排除
+        put(&local, "src/auth.json", b"x", t); // 子目录同名文件，不该被带走
+        put(&local, "src/.idea/work.xml", b"x", t); // 子目录 .idea，不该被带走
+        put(&server, "keep.java", b"x", t);
+        let s = compare(&local, &server, filter).unwrap();
+        assert_eq!(s.only_local, 2, "只剩子目录里的两个该算差异");
+        assert_eq!(s.only_server, 1);
+        assert!(s.samples.contains(&"src/auth.json".to_owned()), "{:?}", s.samples);
+        assert!(s.samples.contains(&"src/.idea/work.xml".to_owned()), "{:?}", s.samples);
+    }
+
+    /// `\名字` 与 `.\名字` 同义，都锚定根目录；子目录里的照常比较
+    #[test]
+    fn leading_backslash_also_anchors_to_root() {
+        let (local, server) = tree("backslash_anchor");
+        let t = 1_700_000_000;
+        let filter = r"-\auth.json;-\notes\";
+        put(&local, "auth.json", b"x", t); // 根目录，被排除
+        put(&local, "notes/a.md", b"x", t); // 根下 notes，被排除
+        put(&local, "sub/auth.json", b"x", t); // 子目录同名，照常算
+        put(&local, "sub/notes/b.md", b"x", t); // 子目录同名目录，照常算
+        let s = compare(&local, &server, filter).unwrap();
+        assert_eq!(s.only_local, 2, "{:?}", s.samples);
+        assert!(s.samples.contains(&"sub/auth.json".to_owned()), "{:?}", s.samples);
+        assert!(s.samples.contains(&"sub/notes/b.md".to_owned()), "{:?}", s.samples);
     }
 
     #[test]
