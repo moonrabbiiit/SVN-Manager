@@ -116,6 +116,8 @@ pub struct Config {
     pub ai_tone: String,
     /// 主页里收起的分组名列表（按名字记，组删了残留也无害）
     pub collapsed_groups: Vec<String>,
+    /// 日志面板是否收起：None = 用户没手动动过，跟着主页样式走（简约收起、详细展开）
+    pub log_collapsed: Option<bool>,
 }
 
 impl Default for Config {
@@ -159,6 +161,8 @@ impl Default for Config {
             ai_tone: String::new(),
             // 分组默认全展开：组名一个都不在折叠列表里
             collapsed_groups: Vec::new(),
+            // 收起状态没被手动动过：默认跟随主页样式
+            log_collapsed: None,
         }
     }
 }

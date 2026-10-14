@@ -4,7 +4,7 @@
 
 use crate::config;
 use crate::{APP_TITLE, APP_VERSION, DirView, Level, OutLine, Page, RepoApp};
-use crate::{bcompare, fonts, pane_fill, pane_stroke, quiet, update};
+use crate::{bcompare, fonts, ink, pane_fill, pane_stroke, quiet, update};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,7 +12,6 @@ use egui::{Align, Layout, RichText, ScrollArea, Ui};
 use crate::config::Config;
 use crate::jobs::{Data, Kind, Pool};
 use crate::svn::Svn;
-use crate::ui::AlignedRow;
 
 impl RepoApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -150,6 +149,7 @@ impl RepoApp {
             ai_result: String::new(),
             ai_error: String::new(),
             mascot: mascot_texture(&cc.egui_ctx),
+            logo: logo_texture(&cc.egui_ctx),
             icons: Some(icons),
         };
         app.push(Level::Info, format!("{APP_TITLE} 已启动（配置：{}）", config::config_file().display()));
@@ -789,27 +789,168 @@ impl RepoApp {
 
     // ------------------------------------------------------------ 底部输出面板
 
+    /// 收起时面板的总高（含面板 frame 上下各 2 的边距）：顶行 28 + 4
+    const LOG_COLLAPSED_HEIGHT: f32 = 32.0;
+
+    /// 日志面板当前是否收起：用户手动切过就按手动来，没动过则跟随主页样式（简约收起、详细展开）
+    pub fn log_collapsed(&self) -> bool {
+        self.cfg.log_collapsed.unwrap_or(self.cfg.home_compact)
+    }
+
+    /// 切换收起状态并落盘；没变化就不写配置
+    fn set_log_collapsed(&mut self, collapsed: bool) {
+        if self.cfg.log_collapsed != Some(collapsed) {
+            self.cfg.log_collapsed = Some(collapsed);
+            self.persist();
+        }
+    }
+
+    /// 组建底部日志面板：收起时锁死一行高并关掉拖拽，展开时恢复默认高度。
+    /// 收起那阵子 exact_size 会把面板高度写进状态存成一行高，直接放开会沿用那个
+    /// 矮尺寸，展开前量一眼上次的实际高度，太矮就抬回默认
+    fn output_panel_builder(&self, ui: &Ui) -> egui::Panel {
+        let collapsed = self.log_collapsed();
+        let mut panel = egui::Panel::bottom("output");
+        if collapsed {
+            panel = panel.exact_size(Self::LOG_COLLAPSED_HEIGHT).resizable(false);
+        } else {
+            let last = egui::PanelState::load(ui.ctx(), egui::Id::new("output"))
+                .map(|state| state.size().y)
+                .unwrap_or(190.0);
+            panel = if last < Self::LOG_COLLAPSED_HEIGHT + 8.0 {
+                panel.exact_size(190.0)
+            } else {
+                panel.default_size(190.0)
+            };
+            panel = panel.resizable(true);
+        }
+        panel
+    }
+
     fn output_panel(&mut self, ui: &mut Ui) {
         let count = self.output.len();
-        ui.aligned_row(|ui| {
-            ui.label(RichText::new(format!("输出运行（{count} 行）")).strong().size(13.0));
-            if quiet(ui, |ui| ui.button("清空")).clicked() {
-                self.output.clear();
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let mut auto_scroll = self.auto_scroll;
-                ui.checkbox(&mut auto_scroll, "自动滚动");
-                self.auto_scroll = auto_scroll;
-                if quiet(ui, |ui| ui.button("打开配置目录")).clicked() {
-                    let dir = config::config_file()
-                        .parent()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
-                }
-            });
+        // 连接状态从顶栏搬到这里：与标题、操作键同一行，占中间位置
+        let (color, conn_text, conn_reason) = self.connection();
+        let color = ink(ui, color);
+        let running = self.pool.running();
+        let busy_label = self
+            .selected
+            .and_then(|index| self.pool.busy_label(index))
+            .or_else(|| if running > 0 { Some("任务执行中".into()) } else { None });
+        // 顶行三块：左 = 标题 + 清空，中 = 连接状态（含任务占用提示），右 = 配置入口与自动滚动；
+        // 行高取控件自然高略放一档（28），三块各自在行内垂直居中
+        let full = ui.available_rect_before_wrap();
+        let row = egui::Rect::from_min_size(full.min, egui::Vec2::new(full.width(), 28.0));
+        ui.allocate_rect(row, egui::Sense::hover());
+        let mut left = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("output_bar_left")
+                .max_rect(row)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        left.label(RichText::new(format!("输出运行（{count} 行）")).strong().size(13.0));
+        if quiet(&mut left, |ui| ui.button("清空")).clicked() {
+            self.output.clear();
+        }
+        let left_end = left.min_rect().max.x;
+        drop(left);
+        // 中段：嵌套 horizontal 会把水平对齐重置回贴左，直接套居中布局套不住它。
+        // 先量出「转圈 + 状态文字 + 任务提示」的自然总宽，再以行中心为锚、
+        // 用左对齐布局从算好的起点画，两头的宽度不够时各自留 8pt 间隙让位
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("output_bar_right")
+                .max_rect(row)
+                .layout(Layout::right_to_left(Align::Center)),
+        );
+        // 收起 / 展开键放在最右：right_to_left 布局先画的占最右位
+        let collapsed = self.log_collapsed();
+        let toggle_label = if collapsed { "展开" } else { "收起" };
+        let mut toggle_to = None;
+        if quiet(&mut right, |ui| ui.button(toggle_label)).clicked() {
+            toggle_to = Some(!collapsed);
+        }
+        let mut auto_scroll = self.auto_scroll;
+        right.checkbox(&mut auto_scroll, "自动滚动");
+        self.auto_scroll = auto_scroll;
+        if quiet(&mut right, |ui| ui.button("打开配置目录")).clicked() {
+            let dir = config::config_file()
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let _ = std::process::Command::new("explorer").arg(dir).spawn();
+        }
+        if let Some(to) = toggle_to {
+            self.set_log_collapsed(to);
+        }
+        let right_start = right.min_rect().min.x;
+        drop(right);
+        let gap = ui.spacing().item_spacing.x;
+        let body_size = ui
+            .style()
+            .text_styles
+            .get(&egui::TextStyle::Body)
+            .map(|f| f.size)
+            .unwrap_or(13.0);
+        let conn = format!("● {conn_text}");
+        let conn_w = ui
+            .painter()
+            .layout_no_wrap(conn.clone(), egui::FontId::proportional(body_size), color)
+            .size()
+            .x;
+        let busy_text = busy_label
+            .as_ref()
+            .map(|label| format!("{running} 个任务：{label}"));
+        let busy_w = busy_text.as_ref().map_or(0.0, |text| {
+            ui.painter()
+                .layout_no_wrap(text.clone(), egui::FontId::proportional(12.0), egui::Color32::WHITE)
+                .size()
+                .x
         });
-        ui.separator();
+        let spinner_w = if running > 0 { Some(14.0) } else { None };
+        let mut total = conn_w + busy_w;
+        if busy_text.is_some() {
+            total += gap;
+        }
+        if spinner_w.is_some() {
+            total += 14.0 + gap;
+        }
+        let mid_left = (row.center().x - total / 2.0)
+            .max(left_end + gap)
+            .min((right_start - gap - total).max(left_end + gap));
+        let mut mid = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("output_bar_conn")
+                .max_rect(egui::Rect::from_min_size(
+                    egui::pos2(mid_left, row.min.y),
+                    egui::Vec2::new(row.right() - mid_left, row.height()),
+                ))
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        if running > 0 {
+            mid.add(egui::Spinner::new().size(14.0));
+        }
+        mid.label(RichText::new(&conn).color(color).strong()).on_hover_text(conn_reason);
+        if let Some(text) = &busy_text {
+            mid.label(RichText::new(text).weak().size(12.0));
+        }
+        drop(mid);
+        // 收起状态下面板只剩顶行：分隔线和日志主体都不画，行高刚好撑满面板
+        if collapsed {
+            return;
+        }
+        // 子 Ui 不推父级光标，这里自己把顶行的高度吃掉。
+        // 分隔线前的 item_spacing.y（8px）要清掉：不然空隙全落在行的下方，
+        // 行内容虽然居中，看起来却整体偏上（下方留白明显大于上方）
+        // 子 Ui 不推父级光标，这里自己把顶行的高度吃掉。
+        // advance 和分隔线都会各自加一道 item_spacing.y，空隙全落在行的下方——
+        // 行内容虽然居中，看起来却整体偏上（下方留白明显大于上方）。
+        // 所以先清零再 advance，分隔线也收窄到 1px 贴住行底，画完恢复原间距
+        let row_gap = ui.spacing_mut().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.advance_cursor_after_rect(row);
+        ui.add(egui::Separator::default().spacing(1.0));
+        ui.spacing_mut().item_spacing.y = row_gap;
         let auto_scroll = self.auto_scroll;
         let output = self.output.clone();
         ScrollArea::vertical()
@@ -896,6 +1037,18 @@ fn mascot_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     Some(ctx.load_texture("mascot", image, egui::TextureOptions::LINEAR))
 }
 
+/// 顶栏标题左边的软件标志：与窗口图标同一来源（rabbit.png）
+fn logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let rgba = image::load_from_memory(include_bytes!("../rabbit.png"))
+        .ok()?
+        .to_rgba8();
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    Some(ctx.load_texture("app-logo", image, egui::TextureOptions::LINEAR))
+}
+
 /// 贴在日志面板的右下角。只画不注册感应区，所以既不吃点击也不抢日志行的选中
 fn paint_mascot(ui: &Ui, tex: &egui::TextureHandle) {
     let outer = ui.max_rect();
@@ -951,16 +1104,16 @@ impl eframe::App for RepoApp {
         }
         // 提交页自动收起底部日志面板：改动列表要占满整窗高度，回主页 / 历史页自动恢复
         if self.page != Page::Commit {
-            egui::Panel::bottom("output")
-                .default_size(190.0)
-                .resizable(true)
-                .show(ui, |ui| {
-                    self.output_panel(ui);
-                    // 贴图压在日志之上，右下角贴边（0.2 不透明度，字照样读得清）
+            let collapsed = self.log_collapsed();
+            self.output_panel_builder(ui).show(ui, |ui| {
+                self.output_panel(ui);
+                // 贴图压在日志之上，右下角贴边（0.2 不透明度，字照样读得清）；收起时不画
+                if !collapsed {
                     if let Some(tex) = self.mascot.as_ref() {
                         paint_mascot(ui, tex);
                     }
-                });
+                }
+            });
         }
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default().show(ui, |ui| {
@@ -990,6 +1143,86 @@ mod tests {
     use crate::testbed::{base_input, stub_app};
     use egui::{Context, ThemePreference};
 
+    /// 工具栏内容要在 40 高的标题栏里垂直居中：内容贴顶时底下空出一大截，
+    /// 看着就像工具栏和添加目录栏之间隔了一条缝（2026-10-14 用户点名）；
+    /// 添加栏的顶边也要贴着标题栏的发丝线，中间不再叠别的空隙
+    #[test]
+    fn header_content_is_centered_and_the_add_bar_hugs_it() {
+        let ctx = Context::default();
+        ctx.set_theme(ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = stub_app(false);
+        let mut input = base_input();
+        let mut found = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::Panel::top("header")
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 0)))
+                    .show(ui, |ui| app.header(ui));
+                let (fill, line) = (crate::ui::pane_fill(ui), crate::ui::pane_stroke(ui));
+                egui::Panel::top("add_dir_bar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .stroke(egui::Stroke::new(1.0, line)),
+                    )
+                    .show(ui, |ui| app.add_dir_bar(ui));
+            });
+            input = base_input();
+            out.textures_delta.clear();
+            found = out
+                .shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::Text(text) => {
+                        let string = text.galley.text();
+                        if string.contains(crate::APP_TITLE) {
+                            Some(("title", text.pos.y + text.galley.size().y / 2.0))
+                        } else if string.contains("添加仓库目录") {
+                            Some(("add", text.pos.y))
+                        } else {
+                            None
+                        }
+                    }
+                    egui::Shape::LineSegment { points, .. } => {
+                        let (a, b) = (points[0], points[1]);
+                        if (b.y - a.y).abs() < 0.5 && b.x - a.x > 800.0 {
+                            Some(("hairline", a.y))
+                        } else {
+                            None
+                        }
+                    }
+                    egui::Shape::Rect(rect) => {
+                        (rect.stroke.width > 0.0 && rect.rect.width() > 800.0)
+                            .then(|| ("bar_border", rect.rect.top()))
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
+        let pick = |kind: &str| {
+            found
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("一帧里找不到 {kind}：{found:?}"))
+        };
+        // 标题（工具栏里最高的那件内容之一）的中心要落在标题栏中线附近
+        let title_center = pick("title");
+        assert!(
+            (title_center - 20.0).abs() <= 2.0,
+            "工具栏内容要垂直居中（40 高的栏，中线 20），现在中心在 {title_center:.1}"
+        );
+        // 添加栏的顶边贴着发丝线：中间不许再有空隙
+        let gap = pick("bar_border") - pick("hairline");
+        assert!(
+            (-1.0..=1.5).contains(&gap),
+            "添加栏顶边要贴着标题栏的发丝线，现在隔了 {gap:.1}"
+        );
+        let _ = pick("add");
+    }
+
     /// 嵌进 exe 的右下角贴图：解不出来只是少一枚贴图，跑起来才看得见，所以在测试里先解一次。
     /// 只验「解得开、不是全透明」，不去比具体像素
     #[test]
@@ -1006,6 +1239,117 @@ mod tests {
             "贴图是竖构图才按高度铺得好看：实际 {}×{}",
             rgba.width(),
             rgba.height()
+        );
+    }
+
+    /// 连接状态搬到日志面板顶行中间后，不许再和左区的「输出运行（N 行）/清空」叠在一起
+    #[test]
+    fn connection_status_in_the_middle_does_not_overlap_the_left_zone() {
+        let ctx = Context::default();
+        ctx.set_theme(ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = stub_app(false);
+        // 让顶行带上任务提示：挂一个忙碌任务 + 输出若干行
+        app.hint("制造一些日志行");
+        let mut input = base_input();
+        let mut texts: Vec<(String, egui::Rect)> = Vec::new();
+        // 两帧：第一帧布局，第二帧确认稳定
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(input, |ui| app.output_panel(ui));
+            input = base_input();
+            out.textures_delta.clear();
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_string(),
+                        item.shape.visual_bounding_rect(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+        }
+        let find = |needle: &str| {
+            texts
+                .iter()
+                .find(|(text, _)| text.contains(needle))
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("顶行里找不到「{needle}」：{texts:?}"))
+        };
+        let title = find("输出运行");
+        let conn = find("●");
+        // 与左区在水平方向上没有交叠
+        assert!(
+            conn.min.x > title.max.x + 4.0,
+            "连接状态（{conn:?}）和左区（{title:?}）水平重叠了"
+        );
+        // 中段真的落在行的中部（测试窗口 1200 宽，中心应落在 25%~75% 之间）
+        assert!(
+            conn.center().x > 300.0 && conn.center().x < 900.0,
+            "连接状态要落在行的中部，跑偏了：{conn:?}"
+        );
+    }
+
+    /// 顶行与分隔线之间不能有 item_spacing 空隙：空隙全落在行下方时整行看起来偏上
+    #[test]
+    fn output_row_separator_hugs_the_row() {
+        let ctx = Context::default();
+        ctx.set_theme(ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = stub_app(false);
+        app.hint("制造一些日志行");
+        let mut input = base_input();
+        let mut lines: Vec<f32> = Vec::new();
+        let mut texts: Vec<(String, egui::Rect)> = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(input, |ui| app.output_panel(ui));
+            input = base_input();
+            out.textures_delta.clear();
+            lines = out
+                .shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::LineSegment { points, .. } => {
+                        let (a, b) = (points[0], points[1]);
+                        // 横跨大半窗口的水平线才是分隔线
+                        ((a.y - b.y).abs() <= 0.5 && (a.x - b.x).abs() > 500.0)
+                            .then(|| (a.y + b.y) / 2.0)
+                    }
+                    _ => None,
+                })
+                .collect();
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_string(),
+                        item.shape.visual_bounding_rect(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+        }
+        // 顶行高 28：分隔线必须贴着行底（y≈28），掉到 30 开外就是空隙没清掉
+        let sep_y = lines.first().copied().unwrap_or_else(|| {
+            panic!("顶行下没画横线：{lines:?}")
+        });
+        assert!(
+            (sep_y - 28.0).abs() <= 2.0,
+            "分隔线要贴着顶行底（y≈28），现在落在 y={sep_y:.1}，行下方留了空隙"
+        );
+        // 行内容（连接状态）在行内垂直居中
+        let conn = texts
+            .iter()
+            .find(|(text, _)| text.contains('●'))
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("顶行里找不到连接状态：{texts:?}"));
+        let top_gap = conn.min.y;
+        let bottom_gap = 28.0 - conn.max.y;
+        assert!(
+            (top_gap - bottom_gap).abs() <= 1.5,
+            "连接状态要垂直居中：上留白 {top_gap:.1} / 下留白 {bottom_gap:.1}"
         );
     }
 
@@ -1090,5 +1434,130 @@ mod tests {
                 .checked_duration_since(Instant::now())
                 .map_or(0.0, |d| d.as_secs_f64()),
         );
+    }
+
+    /// 日志面板收起 / 展开：点顶行最右的「收起」后整条只剩一行（没有分隔线、没有日志
+    /// 主体，面板高度锁在 32），状态写进配置下次启动生效；再点「展开」回到原样
+    #[test]
+    fn log_panel_collapse_toggles_and_persists() {
+        // 切换会 persist 写 config.json，别碰用户真实配置
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_log_collapse_test"),
+        );
+        let ctx = Context::default();
+        ctx.set_theme(ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = stub_app(false);
+        app.hint("制造一些日志行");
+        assert!(!app.log_collapsed(), "详细样式下没动过就该展开");
+
+        // 跑一帧完整面板（构建 + 顶行 + 主体），返回这一帧画出的形状
+        let frame = |app: &mut RepoApp, click: Option<egui::Pos2>| {
+            let mut input = base_input();
+            if let Some(pos) = click {
+                let press = |pressed: bool| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                input.events = vec![egui::Event::PointerMoved(pos), press(true), press(false)];
+            }
+            let mut out = ctx.run_ui(input, |ui| {
+                app.output_panel_builder(ui).show(ui, |ui| app.output_panel(ui));
+            });
+            out.textures_delta.clear();
+            out
+        };
+        let text_rects = |out: &egui::FullOutput| {
+            out.shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_string(),
+                        item.shape.visual_bounding_rect(),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // 第一帧布局，找出「收起」键的位置
+        let out = frame(&mut app, None);
+        let toggle = text_rects(&out)
+            .into_iter()
+            .find(|(text, _)| text == "收起")
+            .map(|(_, rect)| rect.center())
+            .expect("展开状态下顶行最右应有「收起」键");
+
+        // 点下去：状态落配置
+        let _ = frame(&mut app, Some(toggle));
+        assert_eq!(app.cfg.log_collapsed, Some(true), "收起状态要写进配置");
+        assert!(app.log_collapsed());
+
+        // 收起后的画面：键变「展开」，连接状态还在顶行，分隔线和日志主体都不画
+        let out = frame(&mut app, None);
+        let texts = text_rects(&out);
+        assert!(texts.iter().any(|(t, _)| t == "展开"), "收起后键要变成「展开」");
+        assert!(texts.iter().any(|(t, _)| t.contains('●')), "连接状态要留在顶行");
+        assert!(
+            !texts.iter().any(|(t, _)| t.contains("制造一些日志行")),
+            "收起后日志主体不该画出来"
+        );
+        // 顶行下面再没有别的内容：分隔横线只许有一道（面板自己的上边缘线），
+        // 展开时顶行下还有一道顶行分隔线 + 日志文本
+        let sep_lines = out
+            .shapes
+            .iter()
+            .filter(|item| match &item.shape {
+                egui::Shape::LineSegment { points, .. } => {
+                    let (a, b) = (points[0], points[1]);
+                    (a.y - b.y).abs() <= 0.5 && (a.x - b.x).abs() > 500.0
+                }
+                _ => false,
+            })
+            .count();
+        assert!(sep_lines <= 1, "收起后顶行下的分隔线不该再画：{sep_lines} 道");
+
+        // 面板高度锁在顶行一行：32 = 行 28 + frame 上下各 2
+        let height = egui::PanelState::load(&ctx, egui::Id::new("output"))
+            .map(|state| state.size().y)
+            .unwrap_or_default();
+        assert!(
+            (height - RepoApp::LOG_COLLAPSED_HEIGHT).abs() <= 1.0,
+            "收起面板高度应为一行（{}），实际 {height:.1}",
+            RepoApp::LOG_COLLAPSED_HEIGHT
+        );
+
+        // 再点「展开」：状态同样落配置
+        let toggle = text_rects(&frame(&mut app, None))
+            .into_iter()
+            .find(|(text, _)| text == "展开")
+            .map(|(_, rect)| rect.center())
+            .expect("收起状态下顶行最右应有「展开」键");
+        let _ = frame(&mut app, Some(toggle));
+        assert_eq!(app.cfg.log_collapsed, Some(false), "展开状态也要落配置");
+    }
+
+    /// 简约样式默认收起日志面板：没手动动过（None）时跟着主页样式走；手动切过（Some）
+    /// 就以手动为准，换样式也不变。老配置没有这个字段，读出来是 None，向后兼容
+    #[test]
+    fn compact_home_defaults_to_collapsed_log() {
+        let app = stub_app(true);
+        assert!(app.log_collapsed(), "简约样式没动过就该收起");
+        let mut app = stub_app(false);
+        assert!(!app.log_collapsed(), "详细样式没动过就该展开");
+
+        app.cfg.log_collapsed = Some(true);
+        assert!(app.log_collapsed(), "手动收起后换了样式也保持收起");
+        app.cfg.home_compact = true;
+        app.cfg.log_collapsed = Some(false);
+        assert!(!app.log_collapsed(), "手动展开后换了样式也保持展开");
+
+        let parsed: config::Config = serde_json::from_str(r#"{"home_compact":true}"#).unwrap();
+        assert_eq!(parsed.log_collapsed, None, "老配置缺字段应读成 None");
+        assert!(parsed.log_collapsed.unwrap_or(parsed.home_compact));
     }
 }

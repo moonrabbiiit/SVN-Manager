@@ -3,6 +3,7 @@
 mod app;
 mod autostart;
 mod bcompare;
+mod childproc;
 mod commit;
 mod compare;
 mod config;
@@ -331,6 +332,8 @@ pub struct RepoApp {
     pub ai_error: String,
     /// 右下角那张贴图：启动时把嵌进 exe 的 PNG 解一次，解不出来就一直是 None（不画）
     pub mascot: Option<egui::TextureHandle>,
+    /// 顶栏标题左边的软件标志：与窗口图标同源（rabbit.png），解不出来就不画
+    pub logo: Option<egui::TextureHandle>,
     /// 右上角与窗口控制键的 SVG 图标（启动时栅格化一次；无头测试里 None = 不画按钮区）
     pub icons: Option<crate::icons::IconSet>,
 }

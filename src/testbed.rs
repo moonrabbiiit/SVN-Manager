@@ -149,6 +149,7 @@ pub fn stub_app(compact: bool) -> RepoApp {
         ai_error: String::new(),
         // 无头跑帧没有渲染器，贴图不加载（None = 不画）
         mascot: None,
+        logo: None,
         // 同理：SVG 图标也不加载，顶栏按钮区整块跳过
         icons: None,
         cfg,

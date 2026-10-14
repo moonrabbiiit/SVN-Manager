@@ -67,13 +67,25 @@ impl Git {
     }
 
     fn capture(&self, args: &[String], cwd: Option<&Path>) -> Run {
-        match self.command(args, cwd).output() {
-            Ok(output) => Run {
-                ok: output.status.success(),
-                code: output.status.code().unwrap_or(-1),
-                out: decode_bytes(&output.stdout),
-                err: decode_bytes(&output.stderr),
-            },
+        match self
+            .command(args, cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => {
+                // 挂进主程序的任务对象：程序退出时这条 git 命令会被内核连带结束
+                crate::childproc::attach(&child);
+                match child.wait_with_output() {
+                    Ok(output) => Run {
+                        ok: output.status.success(),
+                        code: output.status.code().unwrap_or(-1),
+                        out: decode_bytes(&output.stdout),
+                        err: decode_bytes(&output.stderr),
+                    },
+                    Err(e) => Run::error(format!("等待 {} 结束失败：{}", self.exe.display(), e)),
+                }
+            }
             Err(e) => Run::error(format!("无法启动 {}：{}", self.exe.display(), e)),
         }
     }
@@ -86,7 +98,11 @@ impl Git {
             .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(child) => child,
+            Ok(child) => {
+                // 同 capture：挂进任务对象，主程序退出时连带结束
+                crate::childproc::attach(&child);
+                child
+            }
             Err(e) => return Run::error(format!("无法启动 {}：{}", self.exe.display(), e)),
         };
         let stderr = child.stderr.take();
@@ -407,10 +423,20 @@ impl Git {
             .to_string_lossy()
             .replace('\\', "/");
         // 写原始字节：show 输出的就是对象库里的原样内容，不能过 decode_bytes（二进制会坏）
-        let output = self
+        let output = match self
             .command(&["show".to_owned(), format!("HEAD:{rel}")], Some(&root))
-            .output()
-            .map_err(|e| format!("无法启动 {}：{}", self.exe.display(), e))?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => {
+                crate::childproc::attach(&child);
+                child
+                    .wait_with_output()
+                    .map_err(|e| format!("等待 {} 结束失败：{}", self.exe.display(), e))?
+            }
+            Err(e) => return Err(format!("无法启动 {}：{}", self.exe.display(), e)),
+        };
         if !output.status.success() {
             return Err(decode_bytes(&output.stderr).trim().to_owned());
         }

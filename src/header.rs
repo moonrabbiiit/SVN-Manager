@@ -8,7 +8,7 @@
 
 use crate::icons;
 use crate::repo::RepoKind;
-use crate::{APP_TITLE, DirView, RepoApp, ink};
+use crate::{APP_TITLE, DirView, RepoApp};
 use egui::{Align, Color32, Layout, RichText, Ui, Vec2};
 use crate::jobs::Kind;
 use crate::ui::AlignedRow;
@@ -20,7 +20,9 @@ const CAPTION_SIZE: Vec2 = Vec2::new(34.0, 26.0);
 impl RepoApp {
     // ------------------------------------------------------------ 顶部状态栏
 
-    fn connection(&self) -> (Color32, String, String) {
+    /// 连接状态的三元组：颜色 / 一句话 / 悬停原因。顶栏不再展示它，
+    /// 由 app.rs 的输出面板顶行显示（所以开放给同 crate 的 app 模块调用）
+    pub(crate) fn connection(&self) -> (Color32, String, String) {
         let green = crate::ui::OK;
         let amber = crate::ui::AMBER;
         let red = crate::ui::ERR;
@@ -72,30 +74,32 @@ impl RepoApp {
 
     pub(crate) fn header(&mut self, ui: &mut Ui) {
         let icons = self.icons.clone();
-        let (color, text, reason) = self.connection();
-        let color = ink(ui, color);
-        let running = self.pool.running();
-        let busy_label = self
-            .selected
-            .and_then(|index| self.pool.busy_label(index))
-            .or_else(|| if running > 0 { Some("任务执行中".into()) } else { None });
         // 整条顶栏就是标题栏：高度定成 40，比普通控件行高一档才有标题栏的样子
         ui.set_min_height(40.0);
+        // 内容在 40 高的栏里垂直居中：不垫这一段，行会贴着窗口上沿，
+        // 底下空出一大截，看着就像工具栏和添加目录栏之间隔了一条缝
+        let top_pad = ((40.0 - crate::ui::control_height(ui)) / 2.0).max(0.0);
+        ui.add_space(top_pad);
         // 右侧按钮区的左缘（逻辑点）：每放一枚按钮就往左推一次，最后整批写给原生侧
         let mut buttons_left = f32::INFINITY;
         ui.aligned_row(|ui| {
-            ui.label(RichText::new(APP_TITLE).size(19.0).strong());
-            ui.separator();
-            if running > 0 {
-                ui.spinner();
+            // 不贴窗口左缘：面板自带 10pt 边距，这里再让出一点呼吸位
+            ui.add_space(4.0);
+            // 软件标志：与窗口图标同一来源的兔子图，解不出来就只留标题
+            if let Some(tex) = self.logo.as_ref() {
+                let h = 18.0;
+                let w = h * tex.aspect_ratio();
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::hover());
+                ui.painter().image(
+                    tex.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
             }
-            ui.label(
-                RichText::new(format!("● {text}")).color(color).strong(),
-            )
-            .on_hover_text(reason);
-            if let Some(label) = busy_label {
-                ui.label(RichText::new(format!("{running} 个任务：{label}")).weak().size(12.0));
-            }
+            ui.label(RichText::new(APP_TITLE).size(16.0).strong());
+            // 连接状态搬去了日志面板顶行的中间，这里直接接右侧按钮区
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let Some(set) = icons.as_ref() else {
                     // 无头测试没有贴图：按钮区整个跳过（工具键与窗口控制全在这里）

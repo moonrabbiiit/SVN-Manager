@@ -90,10 +90,17 @@ impl Summary {
 /// Beyond Compare 名称筛选的排除条件。
 #[derive(Clone, Debug, Default)]
 pub struct Excludes {
-    /// 任意层级都命中的目录名（末级名匹配）
+    /// 任意层级都命中的目录名（末级名精确匹配）
     dirs: Vec<String>,
-    /// 只在根目录命中的目录相对路径（BC 写法 `.\.idea\` / `\.idea\`）
+    /// 任意层级都命中的目录名模式（名字里带 `*` `?` 的，整名匹配）
+    dir_globs: Vec<Regex>,
+    /// 只在根目录命中的目录相对路径（BC 写法 `.\.idea\` / `\.idea\`，字面量）
     root_dirs: Vec<String>,
+    /// 根目录锚定的目录路径模式（BC 写法 `.\*\.settings\`：`*` 匹配一段路径、不跨级）。
+    /// 对相对路径整段匹配，目录本身命中即整枝排除——issue #3 的根因：这类带通配符的
+    /// 模式以前被当字面量存进 root_dirs，`*` 永远打不中，bin/.settings 整片漏排，
+    /// 差异数被上万条构建产物淹没，真实差异在抽样里根本翻不到
+    root_dir_globs: Vec<Regex>,
     /// 任意层级都命中的文件名模式
     files: Vec<Regex>,
     /// 只在根目录命中的文件相对路径模式（BC 写法 `.\auth.json` / `\auth.json`）
@@ -110,6 +117,8 @@ impl Excludes {
     /// 根目录的排除全部失效，主页就比 BC 多报出两个「只在本地开发侧」。
     /// 不带路径前缀的目录按末级名在任意层级命中，文件按文件名任意层级命中
     /// （前导点属于名字本身，`.project`、`.classpath` 都是文件不是相对路径）。
+    /// 名字与路径里的 `*` `?` 都按通配符算（issue #3：`.\*\.settings\` 这种
+    /// 「根目录下任意一段路径 + 固定目录名」的 BC 写法必须展开，否则永不命中）。
     /// `+` 前缀和无前缀的包含模式这里不支持：差异口径要和他用同一份筛选打开的 BC 对得上，
     /// 而 BC 那边包含条件是记在会话里的，我们只有这份排除串。
     pub fn parse(raw: &str) -> Self {
@@ -136,17 +145,31 @@ impl Excludes {
             };
             let pattern = pattern.replace('\\', "/");
             // 结尾的 `/` 是 BC 里「目录名」的写法：锚定根目录时整段按相对路径算，
-            // 不锚定时取末级名在任意层级命中
+            // 不锚定时取末级名在任意层级命中；带通配符的分别进对应的 glob 列表
             if let Some(dir) = pattern.strip_suffix('/') {
                 if root_only {
                     let path = dir.trim_matches('/').to_ascii_lowercase();
-                    if !path.is_empty() {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    if path.contains('*') || path.contains('?') {
+                        if let Some(re) = root_dir_glob_regex(&path) {
+                            out.root_dir_globs.push(re);
+                        }
+                    } else {
                         out.root_dirs.push(path);
                     }
                 } else {
                     let name = dir.rsplit('/').next().unwrap_or("").trim_matches('/');
                     if !name.is_empty() {
-                        out.dirs.push(name.to_ascii_lowercase());
+                        let name = name.to_ascii_lowercase();
+                        if name.contains('*') || name.contains('?') {
+                            if let Some(re) = glob_to_regex(&name) {
+                                out.dir_globs.push(re);
+                            }
+                        } else {
+                            out.dirs.push(name);
+                        }
                     }
                 }
                 continue;
@@ -165,10 +188,19 @@ impl Excludes {
     /// rel 是相对根目录的 `/` 分隔路径，顺带告诉筛选项是不是落在根目录
     fn skips_dir(&self, name: &str, rel: &str) -> bool {
         let lower = name.to_ascii_lowercase();
-        if self.dirs.iter().any(|d| *d == lower) || self.matches_file(&lower) {
+        if self.dirs.iter().any(|d| *d == lower)
+            || self.dir_globs.iter().any(|re| re.is_match(&lower))
+            || self.matches_file(&lower)
+        {
             return true;
         }
-        at_root(rel) && self.root_hit(rel)
+        if at_root(rel) && self.root_hit(rel) {
+            return true;
+        }
+        // 根目录锚定的路径模式自带层级信息（`*` 匹配一段路径），不受 at_root 限制
+        self.root_dir_globs
+            .iter()
+            .any(|re| re.is_match(&rel.to_ascii_lowercase()))
     }
 
     fn skips_file(&self, name: &str, rel: &str) -> bool {
@@ -197,18 +229,30 @@ fn at_root(rel: &str) -> bool {
     !rel.contains('/')
 }
 
-/// 把 BC 的名称模式编译成整串匹配的正则（`*` → `.*`、`?` → `.`、其余逐字符转义，统一小写）。
+/// 把 BC 的名称模式编译成整串匹配的正则（`*` → 一段内任意字符、`?` → 单字符、
+/// 其余逐字符转义，统一小写）。`*` 不跨 `/`：路径模式里它按「一段路径」算，
+/// 文件名模式匹配的本来就是裸文件名，两种口径在这里汇合成同一个实现。
 /// 不含通配符的模式同样走这里——`.project`、`log4j2.xml` 就是要按字面名精确命中。
 fn glob_to_regex(pattern: &str) -> Option<Regex> {
+    Regex::new(&format!("^{}$", glob_body(pattern))).ok()
+}
+
+/// 根目录锚定的目录路径模式：既匹配目录本身，也匹配它下面的任意内容
+fn root_dir_glob_regex(pattern: &str) -> Option<Regex> {
+    Regex::new(&format!("^{}(/.*)?$", glob_body(pattern))).ok()
+}
+
+/// 模式的正则主体（不带锚点）：`*` → `[^/]*`、`?` → `[^/]`、其余转义，统一小写
+fn glob_body(pattern: &str) -> String {
     let mut body = String::with_capacity(pattern.len() * 2);
     for ch in pattern.to_ascii_lowercase().chars() {
         match ch {
-            '*' => body.push_str(".*"),
-            '?' => body.push('.'),
+            '*' => body.push_str("[^/]*"),
+            '?' => body.push_str("[^/]"),
             _ => body.push_str(&regex::escape(&ch.to_string())),
         }
     }
-    Regex::new(&format!("^{body}$")).ok()
+    body
 }
 
 #[derive(Clone)]
@@ -243,13 +287,17 @@ fn compare_with(local: &Path, server: &Path, filter: &str, limits: &Limits) -> R
 
     let mut summary = Summary::default();
     let mut verified = 0usize;
+    // 抽样分两堆：内容不同的排前面，单侧缺失的排后面——上万的单侧缺失不该把
+    // 真差异挤出抽样上限（issue #3：50 条抽样全是 bin 构建产物，真差异翻不到）
+    let mut diff_samples: Vec<String> = Vec::new();
+    let mut other_samples: Vec<String> = Vec::new();
     let local_owned = local.to_owned();
     walk(local, local, &ex, 0, &mut |rel, size, modified| {
         let key = rel.to_ascii_lowercase();
         let matched = index.remove(&key);
         let Some(entry) = matched else {
             summary.only_local += 1;
-            push_sample(&mut summary, rel);
+            push_capped(&mut other_samples, rel);
             return;
         };
         if entry.size == size && entry.modified == modified {
@@ -270,23 +318,28 @@ fn compare_with(local: &Path, server: &Path, filter: &str, limits: &Limits) -> R
             Content::Equivalent => summary.trivial += 1,
             Content::Different => {
                 summary.differing += 1;
-                push_sample(&mut summary, rel);
+                push_capped(&mut diff_samples, rel);
             }
         }
     });
 
     summary.only_server = index.len();
     for entry in index.values() {
-        push_sample(&mut summary, &entry.rel);
+        push_capped(&mut other_samples, &entry.rel);
     }
-    summary.samples.sort();
-    summary.samples.truncate(SAMPLE_MAX);
+    diff_samples.sort();
+    other_samples.sort();
+    summary.samples = diff_samples
+        .into_iter()
+        .chain(other_samples)
+        .take(SAMPLE_MAX)
+        .collect();
     Ok(summary)
 }
 
-fn push_sample(summary: &mut Summary, rel: &str) {
-    if summary.samples.len() < SAMPLE_MAX {
-        summary.samples.push(rel.to_owned());
+fn push_capped(list: &mut Vec<String>, rel: &str) {
+    if list.len() < SAMPLE_MAX {
+        list.push(rel.to_owned());
     }
 }
 
@@ -459,7 +512,8 @@ enum Inspect {
     /// 二进制内容不同
     Binary { first: Option<usize> },
     /// 文本内容不同：first 是第一个差异字节的位置，lines 是开头几对不同的行
-    Text { first: usize, lines: Vec<(usize, String, String)> },
+    ///（本地行号、服务器行号、本地摘录、服务器摘录——两侧行号分开算，插入删除对不上号）
+    Text { first: usize, lines: Vec<(usize, usize, String, String)> },
 }
 
 /// 两棵树都再走一遍，把判定逐项展开成报告文本。
@@ -606,9 +660,9 @@ pub fn diagnose(local: &Path, server: &Path, filter: &str) -> Result<String, Str
                     }
                     if !lines.is_empty() {
                         out.push_str("    内容摘录（转义显示，\\r 回车 \\t 制表；行号按换行计）：\r\n");
-                        for (no, left, right) in lines {
-                            out.push_str(&format!("      本地   第 {} 行: {left}\r\n", no + 1));
-                            out.push_str(&format!("      服务器 第 {} 行: {right}\r\n", no + 1));
+                        for (ln, rn, left, right) in lines {
+                            out.push_str(&format!("      本地   第 {} 行: {left}\r\n", ln + 1));
+                            out.push_str(&format!("      服务器 第 {} 行: {right}\r\n", rn + 1));
                         }
                     }
                     out.push_str("\r\n");
@@ -773,17 +827,21 @@ fn trivial_reason(x: &[u8], y: &[u8]) -> String {
 /// 开头几对不同的行：两边同步往前走，行一样就各进一步；
 /// 行不一样时在小窗口里找下一次对齐的位置，对齐前的行都算差异对。
 /// 这不是完整 diff，只是给报告摘开头几处，够看出改了什么。
-fn differing_lines(x: &[u8], y: &[u8]) -> Vec<(usize, String, String)> {
+/// 行号按换行计（0 基，打印时 +1）——以前这里给的是行首字节偏移，
+/// 大文件就摘出「第 2127 行」这种怪行号（issue #3）。
+fn differing_lines(x: &[u8], y: &[u8]) -> Vec<(usize, usize, String, String)> {
     fn split(v: &[u8]) -> Vec<(usize, &[u8])> {
         let mut lines = Vec::new();
         let mut start = 0usize;
+        let mut no = 0usize;
         for (i, b) in v.iter().enumerate() {
             if *b == b'\n' {
-                lines.push((start, &v[start..i]));
+                lines.push((no, &v[start..i]));
+                no += 1;
                 start = i + 1;
             }
         }
-        lines.push((start, &v[start..]));
+        lines.push((no, &v[start..]));
         lines
     }
     let (la, lb) = (split(x), split(y));
@@ -813,7 +871,7 @@ fn differing_lines(x: &[u8], y: &[u8]) -> Vec<(usize, String, String)> {
                 break;
             }
             if la[a].1 != lb[b].1 {
-                found.push((la[a].0, excerpt(la[a].1), excerpt(lb[b].1)));
+                found.push((la[a].0, lb[b].0, excerpt(la[a].1), excerpt(lb[b].1)));
             }
         }
         i = ni;
@@ -1081,12 +1139,94 @@ mod tests {
         assert!(report.contains("内容不同 1"), "{report}");
         assert!(report.contains("src/Real.java"));
         assert!(report.contains("第一个差异字节"), "真差异要有字节位置：{report}");
-        assert!(report.contains("第 1 行"), "行摘录要带行号：{report}");
+        assert!(report.contains("本地   第 2 行"), "行摘录两侧都要带真实行号：{report}");
+        assert!(report.contains("服务器 第 2 行"), "两侧行号分开算：{report}");
         assert!(report.contains("只差行尾"), "Equivalent 要写明原因：{report}");
         assert!(report.contains("stamp.txt"), "只差时间戳的要单独列出：{report}");
         assert!(report.contains("gone.txt"), "只在本地侧的要列出：{report}");
         assert!(report.contains("extra.txt"), "只在服务器侧的要列出：{report}");
         assert!(report.contains("汇总：内容不同 1 · 只在本地开发侧 1 · 只在服务器端 1 · 一致 1"), "汇总数要和主页口径一致：{report}");
+    }
+
+    /// 行摘录的行号必须是行号不是字节偏移：前面垫 100 行无关内容，
+    /// 真差异在第 101 行——以前这里打印的是行首字节偏移（700 多），
+    /// 大文件就摘出「第 2127 行」这种怪行号（issue #3 报告里可见）。
+    #[test]
+    fn report_line_numbers_count_lines_not_bytes() {
+        let (local, server) = tree("line_numbers");
+        let filler = "filler line\r\n".repeat(100);
+        put(&local, "deep.txt", format!("{filler}mine\r\n").as_bytes(), 1_700_000_000);
+        put(&server, "deep.txt", format!("{filler}yours\r\n").as_bytes(), 1_700_000_007);
+        let report = diagnose(&local, &server, "").unwrap();
+        assert!(report.contains("本地   第 101 行"), "行号按换行计：{report}");
+        assert!(report.contains("服务器 第 101 行"), "行号按换行计：{report}");
+        // 第一个差异字节在 1300（100 行 × 13 字节），不许混进行号
+        assert!(report.contains("第 1300 字节"), "字节位置照常报：{report}");
+        assert!(!report.contains("第 1300 行"), "字节偏移不许冒充行号：{report}");
+    }
+
+    /// issue #3 根因回归：BC 写法的根目录锚定目录模式里带 `*`（`.\*\.settings\`、
+    /// `.\*\bin\`），`*` 匹配一段路径——以前被当字面量存起来永不命中，
+    /// bin / .settings 整片漏排，上万条构建产物把真差异淹没。
+    #[test]
+    fn wildcard_dir_patterns_exclude_at_any_single_level() {
+        let (local, server) = tree("issue3_wildcard");
+        let t = 1_700_000_000;
+        // 真差异：该被数出来
+        put(&local, "HRP.GL/config/keep.xml", b"mine", t);
+        put(&server, "HRP.GL/config/keep.xml", b"yours", t);
+        // 该被 `.\*\.settings\` / `.\*\bin\` 排除的：一段路径 + 固定目录名
+        put(&local, "HRP.DRUG/.settings/prefs.xml", b"x", t);
+        put(&local, "HRP.DRUG/bin/Drug.class", b"x", t);
+        put(&server, "HRP.DRUG/.settings/server_only.xml", b"x", t);
+        put(&server, "HRP.WA/bin/Wa.class", b"x", t);
+        // 两层深的同名目录：`*` 只匹配一段路径，这里保守地继续比较
+        //（宁可多报一项，也不要把 BC 里没排除的判漏）
+        put(&local, "a/b/.settings/deep.xml", b"x", t);
+        let s = compare(&local, &server, r#"-.\*\.settings\;-.\*\bin\"#).unwrap();
+        assert_eq!(
+            (s.differing, s.only_local, s.only_server),
+            (1, 1, 0),
+            "单段通配要排掉各模块下的 bin / .settings，两层深的保守保留：samples={:?}",
+            s.samples
+        );
+        assert_eq!(
+            s.samples,
+            vec!["HRP.GL/config/keep.xml".to_owned(), "a/b/.settings/deep.xml".to_owned()]
+        );
+    }
+
+    /// 目录名里带通配符的模式（如 `-*build\`）按整名匹配、任意层级命中
+    #[test]
+    fn wildcard_dir_names_exclude_at_any_depth() {
+        let (local, server) = tree("dir_name_glob");
+        let t = 1_700_000_000;
+        put(&local, "web/x.html", b"x", t);
+        put(&local, "src/sub/web/y.html", b"x", t);
+        put(&server, "keep.java", b"x", t);
+        let s = compare(&local, &server, r"-*web\").unwrap();
+        assert_eq!((s.only_local, s.only_server), (0, 1), "{:?}", s.samples);
+    }
+
+    /// 真差异该排在抽样最前面：上万个单侧缺失不许把内容不同的文件挤出上限
+    #[test]
+    fn differing_files_come_first_in_samples() {
+        let (local, server) = tree("sample_priority");
+        let t = 1_700_000_000;
+        put(&local, "real_diff.txt", b"mine", t);
+        put(&server, "real_diff.txt", b"yours", t);
+        // 按字母序排在 real_diff 前面的一大波单侧缺失
+        for i in 0..60 {
+            put(&local, &format!("aaa_only/f{i:03}.bin"), b"x", t);
+        }
+        let s = compare(&local, &server, "").unwrap();
+        assert_eq!(s.differing, 1);
+        assert_eq!(
+            s.samples.first().map(String::as_str),
+            Some("real_diff.txt"),
+            "真差异要排最前：{:?}",
+            s.samples
+        );
     }
 
     /// 被 IDEA / 编译 / 杀毒独占打开的文件，常规比对按「不同」算——

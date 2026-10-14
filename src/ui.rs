@@ -217,7 +217,10 @@ pub fn tune_style(style: &mut egui::Style, accent: Color32) {
             spread: 1,
             color: Color32::from_rgba_unmultiplied(0, 0, 0, 110),
         };
-        v.selection.bg_fill = tint(accent, 78);
+        // 选中底色：主题色往暗底上叠。透明度不能太低——低到三成时主题色被近黑的
+        // 底色吃掉大半，选中态呈发闷的深蓝，看上去比设置里选的主题色深一大截；
+        // 提到四成半，色相能读得出来，又仍够暗、压得住上面的浅色文字
+        v.selection.bg_fill = tint(accent, 118);
         v.selection.stroke = egui::Stroke::new(1.0, accent);
         v.hyperlink_color = accent;
         v.text_cursor.stroke.color = accent;

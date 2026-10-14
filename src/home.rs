@@ -881,7 +881,9 @@ impl RepoApp {
             egui::StrokeKind::Inside,
         );
         let current = cell_rect(on as usize);
-        painter.rect_filled(current, 5.0, tint(accent, if dark { 64 } else { 34 }));
+        // 选中格：深色档与 selection.bg_fill 同口径（主题色占比四成上下），
+        // 透明度太低会显得比主题色深一截
+        painter.rect_filled(current, 5.0, tint(accent, if dark { 104 } else { 34 }));
         painter.rect_stroke(
             current,
             5.0,
