@@ -20,6 +20,45 @@ pub struct DirConfig {
     pub tag: String,
     /// 标记颜色，形如 "#RRGGBB"；空或解析失败时按默认蓝 #5AA0F0 显示
     pub tag_color: String,
+    /// 更新通知订阅：开启后自动检测发现该目录在服务器上有新版本时，发送一次 Windows 系统通知
+    pub notify: bool,
+    /// 上一次已通知过的远端版本号（SVN 为 revision，Git 为上游 tip 提交 SHA）。
+    /// 与当前远端版本相同就不再通知，保证同一个版本只通知一次（跨重启仍然有效）
+    pub notified_rev: String,
+}
+
+/// 简约卡片上显示哪些内容：设置页逐项开关，四块区域共用这一份配置
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CardShow {
+    /// 检测状态灯（●）
+    pub lamp: bool,
+    /// 目录标记胶囊
+    pub tag: bool,
+    /// 本地版本号
+    pub ver_local: bool,
+    /// 远端版本号
+    pub ver_remote: bool,
+    /// 服务器可更新数
+    pub pending: bool,
+    /// 本地待提交数
+    pub changed: bool,
+    /// 本地端差异数（只对绑定过对比对象的目录生效）
+    pub diff: bool,
+}
+
+impl Default for CardShow {
+    fn default() -> Self {
+        Self {
+            lamp: true,
+            tag: true,
+            ver_local: true,
+            ver_remote: true,
+            pending: true,
+            changed: true,
+            diff: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -63,8 +102,10 @@ pub struct Config {
     pub update_after_commit: bool,
     /// 开机自动启动（实际生效写在注册表 HKCU Run 键里，这里只做记录）
     pub auto_start: bool,
-    /// 主页目录列表的样式：false = 详细（整行 + 一排按钮），true = 简约（正方形卡片 + 「+」菜单）
+    /// 主页目录列表的样式：false = 详细（整行 + 一排按钮），true = 简约（宽行卡片 + 「+」菜单）
     pub home_compact: bool,
+    /// 简约卡片显示哪些内容（状态灯 / 标记 / 版本 / 计数 / 「+」），设置页逐项开关
+    pub card_show: CardShow,
     /// AI 生成工作日志：接口地址（OpenAI 兼容的 /chat/completions 完整地址）
     pub ai_url: String,
     /// AI 生成工作日志：接口密钥（明文保存在本机配置文件）
@@ -107,6 +148,8 @@ impl Default for Config {
             auto_start: false,
             // 默认详细样式：老用户升级后看到的列表跟以前一样，要卡片自己切过去
             home_compact: false,
+            // 卡片内容默认全显示：新样式刚上手时和旧版信息量对齐，想精简自己在设置里关
+            card_show: CardShow::default(),
             ui_font: crate::fonts::AUTO.to_owned(),
             ui_scale: crate::fonts::SCALE_STANDARD.to_owned(),
             // AI 日志的地址 / 密钥 / 模型都由用户自己提供，默认全空
@@ -131,7 +174,7 @@ fn app_data_base() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-fn config_dir() -> PathBuf {
+pub fn config_dir() -> PathBuf {
     app_data_base().join(APP_DIR)
 }
 
@@ -250,6 +293,11 @@ mod tests {
                 .unwrap()
                 .home_compact
         );
+        // 卡片内容开关是后加的设置：老配置没有要按「全显示」补齐，写了 false 才隐藏
+        assert!(parsed.card_show == CardShow::default());
+        let hidden: Config = serde_json::from_str(r#"{"card_show":{"tag":false}}"#).unwrap();
+        assert!(!hidden.card_show.tag);
+        assert!(hidden.card_show.lamp && hidden.card_show.ver_local);
         // AI 日志是后加的设置：老配置没有也要按空值补齐
         assert!(parsed.ai_url.is_empty());
         assert!(parsed.ai_key.is_empty());
@@ -268,6 +316,9 @@ mod tests {
         assert!(parsed.dirs[0].group.is_empty());
         assert!(parsed.dirs[0].tag.is_empty());
         assert!(parsed.dirs[0].tag_color.is_empty());
+        // 更新通知订阅是后加的目录属性：老配置没有要按默认值（关闭、无已通知版本）补齐
+        assert!(!parsed.dirs[0].notify);
+        assert!(parsed.dirs[0].notified_rev.is_empty());
         // 分组折叠列表是后加的全局设置：老配置没有要按空列表补齐
         assert!(parsed.collapsed_groups.is_empty());
     }

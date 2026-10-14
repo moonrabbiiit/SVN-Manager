@@ -69,12 +69,23 @@ impl RepoApp {
         };
         #[cfg(not(windows))]
         let hwnd = None;
+        // 自绘标题栏：抹掉系统标题栏，天区 / 缩放 / 按钮命中全由界面层接管
+        //（顶栏绘制在 header.rs，命中的原生半边在 titlebar.rs）
+        #[cfg(windows)]
+        if let Some(hwnd) = hwnd {
+            crate::titlebar::install(hwnd);
+        }
+        // 通知身份：注册自己的 AUMID（显示名 + 图标），系统通知显示本程序而非借用的 PowerShell
+        crate::notify::ensure_identity();
+        // 右上角与窗口控制键的 SVG 图标：启动时栅格化一次，之后每帧只是贴图
+        let icons = crate::icons::IconSet::load(&cc.egui_ctx);
         let mut app = Self {
             dirs: vec![DirView::default(); cfg.dirs.len()],
             probing: false,
             refresh_after_detect: true,
             hwnd,
             caption_dark: None,
+            corner_maximized: None,
             version,
             candidates: Vec::new(),
             cfg,
@@ -121,6 +132,7 @@ impl RepoApp {
             auto_scroll: true,
             next_refresh: Instant::now() + Duration::from_secs(4),
             pending_refresh: Vec::new(),
+            notify_queue: Vec::new(),
             font_note,
             update_info: None,
             update_ready: false,
@@ -138,6 +150,7 @@ impl RepoApp {
             ai_result: String::new(),
             ai_error: String::new(),
             mascot: mascot_texture(&cc.egui_ctx),
+            icons: Some(icons),
         };
         app.push(Level::Info, format!("{APP_TITLE} 已启动（配置：{}）", config::config_file().display()));
         // 后端要在任何检测之前定下来：sync_views 之前每个 DirView 的 kind 还是默认的 Svn，
@@ -303,7 +316,7 @@ impl RepoApp {
         // 后台线程没回传结果就没了（svn 线程 panic、起线程失败）：必须说出来，否则界面就是「点了没反应」
         for (kind, dir, label) in polled.stranded {
             self.push(Level::Error, format!("任务「{label}」异常结束（{kind:?}，目录 #{dir}）"));
-            self.hint(format!("「{label}」异常结束，没有取到结果，请重试"));
+            self.hint(format!("「{label}」异常结束，未取得结果，请重试"));
         }
         for line in polled.lines {
             let level = if line.starts_with('$') || line.starts_with('→') {
@@ -469,6 +482,27 @@ impl RepoApp {
                         view.conflicts = conflicts;
                         view.out_of_date = out_of_date;
                         view.checked_at = chrono::Local::now().format("%H:%M:%S").to_string();
+                    }
+                    // 更新通知订阅：远端可达、确实有未更新项、版本号没通知过才入队；
+                    // 入队即记下该版本，同一帧内重复结果 / 下一轮检测都不会再报
+                    let label = self.dir_label(index);
+                    if let Some(view) = self.dirs.get(index) {
+                        if let Some(dir_cfg) = self.cfg.dirs.get_mut(index) {
+                            if dir_cfg.notify
+                                && view.remote == Some(true)
+                                && view.out_of_date.unwrap_or(0) > 0
+                                && !view.remote_rev.is_empty()
+                                && view.remote_rev != dir_cfg.notified_rev
+                            {
+                                dir_cfg.notified_rev = view.remote_rev.clone();
+                                self.notify_queue.push(crate::notify::UpdateNotice {
+                                    label,
+                                    rev: view.remote_rev.clone(),
+                                    author: view.last_author.clone(),
+                                    behind: view.out_of_date.unwrap_or(0),
+                                });
+                            }
+                        }
                     }
                     if let Some(quiet) = self
                         .pending_refresh
@@ -653,6 +687,23 @@ impl RepoApp {
             }
             busy = true;
         }
+        // 本帧收集齐的更新订阅统一发一条系统通知：多个目录合并为一条，不逐目录连环弹。
+        // 已通知版本号在入队时就写进了配置，这里无论发送成功与否都持久化，避免失败后反复重试弹窗
+        if !self.notify_queue.is_empty() {
+            let items: Vec<_> = self.notify_queue.drain(..).collect();
+            self.persist();
+            match crate::notify::send_update_toast(&items) {
+                Ok(()) => {
+                    let names = items
+                        .iter()
+                        .map(|item| item.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    self.push(Level::Info, format!("已发送更新通知：{names}"));
+                }
+                Err(e) => self.push(Level::Warning, format!("发送系统通知失败：{e}")),
+            }
+        }
         if busy {
             ctx.request_repaint();
         }
@@ -681,6 +732,14 @@ impl RepoApp {
                 style.visuals.panel_fill,
                 style.visuals.widgets.noninteractive.fg_stroke.color,
             );
+        }
+        // 圆角随最大化切换：非最大化四角圆角（Win11），最大化直角；状态变了才发一次
+        let maximized = ctx.input(|i| i.viewport().maximized) == Some(true);
+        if self.corner_maximized != Some(maximized) {
+            self.corner_maximized = Some(maximized);
+            if let Some(hwnd) = self.hwnd {
+                crate::titlebar::refresh_shape(hwnd, maximized);
+            }
         }
         self.drain(ctx);
         self.spawn_auth_user();
@@ -872,9 +931,12 @@ impl eframe::App for RepoApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("header").show(ui, |ui| {
-            self.header(ui);
-        });
+        // 顶栏就是自绘标题栏：左右留出一点呼吸位，高度与分隔线在 header() 里画
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 0)))
+            .show(ui, |ui| {
+                self.header(ui);
+            });
         // 添加目录这条要顶到窗口两边，所以挂在中央面板之外（主页才画）
         if self.page == Page::Main {
             let (fill, line) = (pane_fill(ui), pane_stroke(ui));
@@ -887,16 +949,19 @@ impl eframe::App for RepoApp {
                 )
                 .show(ui, |ui| self.add_dir_bar(ui));
         }
-        egui::Panel::bottom("output")
-            .default_size(190.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                self.output_panel(ui);
-                // 贴图压在日志之上，右下角贴边（0.2 不透明度，字照样读得清）
-                if let Some(tex) = self.mascot.as_ref() {
-                    paint_mascot(ui, tex);
-                }
-            });
+        // 提交页自动收起底部日志面板：改动列表要占满整窗高度，回主页 / 历史页自动恢复
+        if self.page != Page::Commit {
+            egui::Panel::bottom("output")
+                .default_size(190.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    self.output_panel(ui);
+                    // 贴图压在日志之上，右下角贴边（0.2 不透明度，字照样读得清）
+                    if let Some(tex) = self.mascot.as_ref() {
+                        paint_mascot(ui, tex);
+                    }
+                });
+        }
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default().show(ui, |ui| {
             let page = self.page;

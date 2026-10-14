@@ -13,12 +13,15 @@ mod git;
 mod header;
 mod history;
 mod home;
+mod icons;
 mod jobs;
 mod localdiff;
+mod notify;
 mod repo;
 mod settings;
 mod svn;
 mod tasks;
+mod titlebar;
 mod ui;
 mod update;
 mod worklog;
@@ -40,7 +43,7 @@ use crate::svn::{Svn, WcInfo};
 // 通用绘制工具搬到 ui.rs，这里转出一层，history / commit / daterange 里的 crate::ink 照旧可用
 pub use ui::{
     field_margin, highlight, highlight_with, ink, pale, pane_fill, pane_hover, pane_stroke, quiet,
-    Search, INK, AMBER, DANGER_FILL, DANGER_TEXT, ERR, OK,
+    Search, INK, ACCENT, AMBER, DANGER_FILL, DANGER_TEXT, ERR, OK,
 };
 
 pub const APP_TITLE: &str = "仓库管理器";
@@ -221,6 +224,8 @@ pub struct RepoApp {
     pub hwnd: Option<isize>,
     /// 上一次写给原生标题栏的深浅态，只有它变了才重设一次 DWM 属性
     pub caption_dark: Option<bool>,
+    /// 上一次应用圆角时的最大化状态：非最大化四角圆角、最大化直角，变了才发一次 DWM
+    pub corner_maximized: Option<bool>,
     /// Git 命令行（git.exe），给 .git 目录行用
     pub git: crate::git::Git,
     /// git.exe 的版本号（设置窗口与状态行显示）
@@ -291,6 +296,9 @@ pub struct RepoApp {
     pub next_refresh: Instant,
     /// 请求过但当时同目录已有一次检测在跑，等那次落地之后补跑一次
     pub pending_refresh: Vec<(usize, bool)>,
+    /// 更新通知订阅：本帧内检测到「有新版本且未通知过」的目录先收集到这里，
+    /// 帧末合并成一条系统通知发出（不逐目录连环弹），发完即清空
+    pub notify_queue: Vec<crate::notify::UpdateNotice>,
     pub font_note: String,
     /// 最新版本信息（官方 GitHub 发布或自建服务端的 latest.json，检查过更新才有）
     pub update_info: Option<update::UpdateManifest>,
@@ -323,6 +331,8 @@ pub struct RepoApp {
     pub ai_error: String,
     /// 右下角那张贴图：启动时把嵌进 exe 的 PNG 解一次，解不出来就一直是 None（不画）
     pub mascot: Option<egui::TextureHandle>,
+    /// 右上角与窗口控制键的 SVG 图标（启动时栅格化一次；无头测试里 None = 不画按钮区）
+    pub icons: Option<crate::icons::IconSet>,
 }
 
 /// 取 icon/repo-manager.ico 里 48px 那张当窗口图标（标题栏 + 任务栏）。

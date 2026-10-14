@@ -91,6 +91,7 @@ pub fn stub_app(compact: bool) -> RepoApp {
         // 无头跑帧没有真窗口，DWM 那条路直接跳过
         hwnd: None,
         caption_dark: None,
+        corner_maximized: None,
         svn_user: "dev".to_owned(),
         user_probed: true,
         pool: Pool::default(),
@@ -130,6 +131,7 @@ pub fn stub_app(compact: bool) -> RepoApp {
         auto_scroll: true,
         next_refresh: Instant::now(),
         pending_refresh: Vec::new(),
+        notify_queue: Vec::new(),
         font_note: String::new(),
         update_info: None,
         update_ready: false,
@@ -147,6 +149,8 @@ pub fn stub_app(compact: bool) -> RepoApp {
         ai_error: String::new(),
         // 无头跑帧没有渲染器，贴图不加载（None = 不画）
         mascot: None,
+        // 同理：SVG 图标也不加载，顶栏按钮区整块跳过
+        icons: None,
         cfg,
         svn: Svn::default(),
         git: crate::git::Git::default(),
@@ -199,6 +203,17 @@ impl Stage {
     /// 只把指针挪过去、不按：二级菜单靠悬停展开，发点击反而会先把整层菜单收掉
     pub fn hover(&mut self, pos: Pos2) -> Vec<(String, Rect)> {
         self.run(vec![egui::Event::PointerMoved(pos)])
+    }
+
+    /// 右键：卡片菜单现在挂在右键上（「+」按钮已移除）
+    pub fn right_click(&mut self, pos: Pos2) -> Vec<(String, Rect)> {
+        let press = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        self.run(vec![egui::Event::PointerMoved(pos), press(true), press(false)])
     }
 
     pub fn run(&mut self, events: Vec<egui::Event>) -> Vec<(String, Rect)> {

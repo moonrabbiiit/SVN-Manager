@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>简约卡片样式重设计 · 4 版提案</title>
+<style>
+  :root {
+    --bg: #F1F4F9;
+    --card: #FFFFFF;
+    --line: #E4E8F0;
+    --ink: #262A33;
+    --weak: #8A93A6;
+    --accent: #6C8CFF;
+    --ok: #50C878;
+    --amber: #F0BE46;
+    --err: #F06464;
+    --pink: #FF50A0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    color: var(--ink);
+    padding: 32px 40px 80px;
+  }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--weak); font-size: 13px; margin-bottom: 28px; }
+  section { margin-bottom: 44px; }
+  .opt-title { font-size: 15px; font-weight: 700; margin-bottom: 2px; }
+  .opt-title .tagchip {
+    font-size: 11px; font-weight: 400; color: var(--accent);
+    border: 1px solid var(--accent); border-radius: 9px; padding: 1px 8px; margin-left: 8px;
+  }
+  .opt-desc { color: var(--weak); font-size: 12.5px; margin-bottom: 14px; max-width: 760px; line-height: 1.7; }
+  .grid { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
+
+  /* ---------- 卡片公共 ---------- */
+  .card {
+    width: 168px; height: 168px; border-radius: 10px;
+    background: var(--card); border: 1px solid var(--line);
+    box-shadow: 0 2px 10px rgba(58,76,126,.10);
+    position: relative; overflow: hidden;
+  }
+  .card.busy { border-color: var(--amber); }
+  .card.conflict { border-color: var(--pink); border-width: 1.6px; }
+  .lamp { position: absolute; top: 10px; left: 10px; font-size: 12px; line-height: 1; }
+  .lamp.ok { color: var(--ok); } .lamp.err { color: var(--err); } .lamp.off { color: #9AA2B2; }
+  .spin {
+    position: absolute; top: 9px; left: 30px; width: 14px; height: 14px;
+    border: 2px solid var(--amber); border-top-color: transparent; border-radius: 50%;
+    animation: rot .8s linear infinite;
+  }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  .plus {
+    position: absolute; right: 9px; bottom: 9px; width: 28px; height: 28px;
+    border-radius: 14px; background: var(--accent); color: #F6F9FD;
+    font-size: 18px; line-height: 27px; text-align: center; font-weight: 300;
+  }
+
+  /* ---------- 版 A · 数据行卡 ---------- */
+  .a-name { position: absolute; top: 32px; left: 12px; right: 12px;
+    font-size: 13.5px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .a-tag { display: inline-block; margin-top: 4px; font-size: 10.5px; padding: 1px 8px;
+    border: 1px solid var(--accent); color: var(--accent); border-radius: 9px; }
+  .a-stats { position: absolute; top: 74px; left: 12px; right: 12px; display: flex; gap: 6px; }
+  .a-stat { flex: 1; text-align: center; padding: 7px 0 5px; border-radius: 7px; background: #F5F7FC; }
+  .a-stat .num { font-size: 17px; font-weight: 700; line-height: 1.1; }
+  .a-stat .lbl { font-size: 9.5px; color: var(--weak); margin-top: 1px; }
+  .a-stat.hot .num { color: var(--amber); }
+  .a-stat.commit .num { color: var(--accent); }
+  .a-stat.diff .num { color: var(--ok); }
+  .a-stat.zero .num { color: #C3C9D6; }
+  .a-ver { position: absolute; left: 12px; right: 44px; bottom: 10px; font-size: 10.5px;
+    color: var(--weak); line-height: 1.7; }
+  .a-ver .hot { color: var(--amber); }
+
+  /* ---------- 版 B · 极简徽章卡 ---------- */
+  .b-center { position: absolute; inset: 0 0 34px 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 8px; }
+  .b-name { font-size: 13.5px; font-weight: 700; max-width: 140px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .b-tag { font-size: 10.5px; padding: 1px 9px; border: 1px solid var(--accent);
+    color: var(--accent); border-radius: 9px; }
+  .b-ver { position: absolute; left: 0; right: 0; bottom: 34px; text-align: center;
+    font-size: 10.5px; color: var(--weak); }
+  .b-ver .hot { color: var(--amber); }
+  .badge { position: absolute; min-width: 22px; height: 22px; padding: 0 6px;
+    border-radius: 11px; color: #fff; font-size: 11.5px; font-weight: 700;
+    line-height: 22px; text-align: center; }
+  .badge.dn  { top: 8px; right: 8px; background: var(--amber); }
+  .badge.up  { top: 34px; right: 8px; background: var(--accent); }
+  .badge.dif { top: 8px; right: 36px; background: var(--ok); }
+
+  /* ---------- 版 C · 宽行卡 ---------- */
+  .card.wide { width: 264px; height: 92px; display: flex; align-items: center; padding: 0 12px; gap: 12px; }
+  .c-left { flex: 1; min-width: 0; }
+  .c-name { font-size: 13.5px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    display: flex; align-items: center; gap: 6px; }
+  .c-name .lamp { position: static; font-size: 11px; }
+  .c-tags { margin-top: 5px; display: flex; gap: 6px; align-items: center; }
+  .c-tag { font-size: 10px; padding: 0 7px; line-height: 16px; border: 1px solid var(--accent);
+    color: var(--accent); border-radius: 8px; }
+  .c-ver { margin-top: 5px; font-size: 10.5px; color: var(--weak); white-space: nowrap; }
+  .c-ver .hot { color: var(--amber); }
+  .c-pills { display: flex; flex-direction: column; gap: 5px; }
+  .pill { display: flex; align-items: center; gap: 5px; min-width: 64px; height: 22px;
+    padding: 0 8px; border-radius: 11px; font-size: 11px; background: #F5F7FC; color: var(--weak); }
+  .pill b { font-size: 12px; margin-left: auto; }
+  .pill.hot { background: #FDF3DC; color: #B98A18; }
+  .pill.commit { background: #EEF2FF; color: var(--accent); }
+  .pill.diff { background: #E9F8EF; color: #2F9E5E; }
+
+  /* ---------- 版 D · 状态色带头卡 ---------- */
+  .d-band { height: 5px; border-radius: 10px 10px 0 0; }
+  .band-ok { background: var(--ok); } .band-up { background: var(--amber); }
+  .band-cf { background: var(--pink); } .band-off { background: #C3C9D6; }
+  .band-busy { background: linear-gradient(90deg, var(--amber) 0%, #F8DD9A 50%, var(--amber) 100%);
+    background-size: 200% 100%; animation: slide 1.2s linear infinite; }
+  @keyframes slide { to { background-position: -200% 0; } }
+  .d-main { position: absolute; top: 46px; left: 0; right: 0; text-align: center; }
+  .d-num { font-size: 30px; font-weight: 700; line-height: 1; }
+  .d-num.up { color: var(--amber); } .d-num.cf { color: var(--pink); } .d-num.ok { color: var(--ok); }
+  .d-cap { font-size: 11px; color: var(--weak); margin-top: 5px; }
+  .d-foot { position: absolute; left: 12px; right: 44px; bottom: 10px; }
+  .d-name { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .d-ver { font-size: 10.5px; color: var(--weak); margin-top: 2px; }
+
+  /* ---------- 配置面板 ---------- */
+  .panel-wrap { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+  .panel {
+    width: 300px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px 16px; box-shadow: 0 2px 10px rgba(58,76,126,.10);
+  }
+  .panel h3 { font-size: 13.5px; margin-bottom: 10px; }
+  .cfg-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 12.5px; }
+  .cfg-row .hint { color: var(--weak); font-size: 11px; margin-left: auto; }
+  .cfg-row input { accent-color: var(--accent); width: 14px; height: 14px; }
+  .cfg-row.locked { color: var(--weak); }
+  .note { font-size: 12px; color: var(--weak); max-width: 340px; line-height: 1.8; }
+  .note b { color: var(--ink); }
+
+  /* 隐藏开关：body 上的类控制各版式里的元素 */
+  body.no-lamp .lamp { display: none; }
+  body.no-tag .a-tag, body.no-tag .b-tag, body.no-tag .c-tags .c-tag { display: none; }
+  body.no-ver .a-ver, body.no-ver .b-ver, body.no-ver .c-ver, body.no-ver .d-ver { display: none; }
+  body.no-badges .a-stats, body.no-badges .badge, body.no-badges .c-pills, body.no-badges .d-main { display: none; }
+  body.no-plus .plus { display: none; }
+</style>
+</head>
+<body>
+
+<h1>简约卡片样式重设计 · 4 版提案</h1>
+<p class="sub">配色沿用程序现有 token（accent #6C8CFF / 绿 #50C878 / 黄 #F0BE46 / 红 #F06464），深色模式按同一套结构换肤。右上角开关可以实时试「卡片内容配置」对各版式的效果。</p>
+
+<div class="panel" style="margin-bottom:32px">
+  <h3>⚙ 卡片内容配置（实时生效，四版共用）</h3>
+  <label class="cfg-row locked"><input type="checkbox" checked disabled> 目录名称（必显示）</label>
+  <label class="cfg-row"><input type="checkbox" checked data-toggle="no-lamp"> 状态灯（● 连接状态）</label>
+  <label class="cfg-row"><input type="checkbox" checked data-toggle="no-tag"> 标记胶囊</label>
+  <label class="cfg-row"><input type="checkbox" checked data-toggle="no-ver"> 版本号（本地 / 远端）</label>
+  <label class="cfg-row"><input type="checkbox" checked data-toggle="no-badges"> 计数区（↓ 可更新 / ↑ 待提交 / ↔ 差异）</label>
+  <label class="cfg-row"><input type="checkbox" checked data-toggle="no-plus"> 「+」操作按钮</label>
+</div>
+
+<!-- ============ 版 A ============ -->
+<section>
+  <div class="opt-title">版 A · 数据行卡<span class="tagchip">信息最全</span></div>
+  <p class="opt-desc">保留 168 方卡尺寸。名称从居中改为左上对齐（更符合阅读起点），中部变成三枚横排大数字块——↓ 可更新 / ↑ 待提交 / ↔ 差异，各自带底色和数量，0 时置灰。待办一眼可数，版本信息退到底部两行小字。</p>
+  <div class="grid">
+    <div class="card">
+      <span class="lamp ok">●</span>
+      <div class="a-name">旧系统vue</div>
+      <div class="a-tag">老框架</div>
+      <div class="a-stats">
+        <div class="a-stat zero"><div class="num">0</div><div class="lbl">可更新</div></div>
+        <div class="a-stat commit"><div class="num">5</div><div class="lbl">待提交</div></div>
+        <div class="a-stat diff"><div class="num">12</div><div class="lbl">差异</div></div>
+      </div>
+      <div class="a-ver">本地 r128<br>远端 r128</div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card">
+      <span class="lamp ok">●</span>
+      <div class="a-name">vue_new_server</div>
+      <div class="a-stats">
+        <div class="a-stat hot"><div class="num">3</div><div class="lbl">可更新</div></div>
+        <div class="a-stat zero"><div class="num">0</div><div class="lbl">待提交</div></div>
+        <div class="a-stat zero"><div class="num">0</div><div class="lbl">差异</div></div>
+      </div>
+      <div class="a-ver">本地 r120<br><span class="hot">远端 r128</span></div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card conflict">
+      <span class="lamp err">●</span>
+      <div class="a-name">hrp_report</div>
+      <div class="a-tag">需处理</div>
+      <div class="a-stats">
+        <div class="a-stat hot"><div class="num">2</div><div class="lbl">可更新</div></div>
+        <div class="a-stat commit"><div class="num">4</div><div class="lbl">待提交</div></div>
+        <div class="a-stat zero"><div class="num">1</div><div class="lbl">差异</div></div>
+      </div>
+      <div class="a-ver">本地 r87<br>远端 r90</div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card busy">
+      <span class="lamp off">●</span><span class="spin"></span>
+      <div class="a-name">命运手牌</div>
+      <div class="a-stats">
+        <div class="a-stat zero"><div class="num">—</div><div class="lbl">可更新</div></div>
+        <div class="a-stat zero"><div class="num">—</div><div class="lbl">待提交</div></div>
+        <div class="a-stat zero"><div class="num">—</div><div class="lbl">差异</div></div>
+      </div>
+      <div class="a-ver">本地 —<br>远端 —</div>
+      <div class="plus">+</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 版 B ============ -->
+<section>
+  <div class="opt-title">版 B · 极简徽章卡<span class="tagchip">最安静</span></div>
+  <p class="opt-desc">手机桌面的思路：没有待办时整张卡只有名称、标记和一行合并版本「r120 → r128」，非常安静；有待办时右上角才浮出彩色圆徽章（黄=可更新、蓝=待提交、绿=差异），扫一眼就知道哪些卡有事。合并版本行省一半高度，中央留白更多。</p>
+  <div class="grid">
+    <div class="card">
+      <span class="lamp ok">●</span>
+      <div class="badge dn">3</div><div class="badge up">5</div>
+      <div class="b-center">
+        <div class="b-name">旧系统vue</div>
+        <div class="b-tag">老框架</div>
+      </div>
+      <div class="b-ver"><span class="hot">r120 → r128</span></div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card">
+      <span class="lamp ok">●</span>
+      <div class="b-center">
+        <div class="b-name">vue_new_server</div>
+      </div>
+      <div class="b-ver">r128 → r128</div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card conflict">
+      <span class="lamp err">●</span>
+      <div class="badge dif">1</div><div class="badge up">4</div>
+      <div class="b-center">
+        <div class="b-name">hrp_report</div>
+        <div class="b-tag" style="border-color:var(--pink);color:var(--pink)">需处理</div>
+      </div>
+      <div class="b-ver"><span class="hot">r87 → r90</span></div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card busy">
+      <span class="lamp off">●</span><span class="spin"></span>
+      <div class="b-center">
+        <div class="b-name">命运手牌</div>
+      </div>
+      <div class="b-ver">— → —</div>
+      <div class="plus">+</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 版 C ============ -->
+<section>
+  <div class="opt-title">版 C · 宽行卡<span class="tagchip">密度最高</span></div>
+  <p class="opt-desc">放弃方卡改 264×92 宽行，仍两列布局。左侧状态灯+名称+标记+版本，右侧三枚横向胶囊（可更新/待提交/差异），数值右对齐。同屏能看的目录数量约为方卡版的 1.6 倍，适合目录多的用户；缺点是少了方卡的"图标墙"观感。</p>
+  <div class="grid" style="max-width:570px">
+    <div class="card wide">
+      <div class="c-left">
+        <div class="c-name"><span class="lamp ok">●</span>旧系统vue</div>
+        <div class="c-tags"><span class="c-tag">老框架</span></div>
+        <div class="c-ver">本地 r128 · <span class="hot">远端 r128</span></div>
+      </div>
+      <div class="c-pills">
+        <div class="pill">可更新 <b>0</b></div>
+        <div class="pill commit">待提交 <b>5</b></div>
+      </div>
+    </div>
+    <div class="card wide">
+      <div class="c-left">
+        <div class="c-name"><span class="lamp ok">●</span>vue_new_server</div>
+        <div class="c-ver">本地 r120 · <span class="hot">远端 r128</span></div>
+      </div>
+      <div class="c-pills">
+        <div class="pill hot">可更新 <b>3</b></div>
+        <div class="pill">待提交 <b>0</b></div>
+      </div>
+    </div>
+    <div class="card wide conflict">
+      <div class="c-left">
+        <div class="c-name"><span class="lamp err">●</span>hrp_report</div>
+        <div class="c-tags"><span class="c-tag" style="border-color:var(--pink);color:var(--pink)">需处理</span></div>
+        <div class="c-ver">本地 r87 · 远端 r90</div>
+      </div>
+      <div class="c-pills">
+        <div class="pill hot">可更新 <b>2</b></div>
+        <div class="pill commit">待提交 <b>4</b></div>
+        <div class="pill diff">差异 <b>1</b></div>
+      </div>
+    </div>
+    <div class="card wide busy">
+      <div class="c-left">
+        <div class="c-name"><span class="lamp off">●</span>命运手牌<span class="spin" style="position:static"></span></div>
+        <div class="c-ver">读取中 …</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 版 D ============ -->
+<section>
+  <div class="opt-title">版 D · 状态色带头卡<span class="tagchip">扫视最快</span></div>
+  <p class="opt-desc">顶部一条 5px 状态色带：绿=已同步、黄=有可更新、粉=冲突、灰=离线，忙碌时是流动的琥珀渐变。中部只放一个汇总大数字（待处理总数）加一句说明，其余细节（版本、标记）压到底部小字。隔两米看屏幕也能靠颜色分辨哪张卡有事，信息最少、姿态最松弛。</p>
+  <div class="grid">
+    <div class="card">
+      <div class="d-band band-up"></div>
+      <span class="lamp ok">●</span>
+      <div class="d-main">
+        <div class="d-num up">8</div>
+        <div class="d-cap">项待处理（↓3 ↑5）</div>
+      </div>
+      <div class="d-foot">
+        <div class="d-name">旧系统vue</div>
+        <div class="d-ver">老框架 · r120 → r128</div>
+      </div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card">
+      <div class="d-band band-ok"></div>
+      <span class="lamp ok">●</span>
+      <div class="d-main">
+        <div class="d-num ok">✓</div>
+        <div class="d-cap">已同步</div>
+      </div>
+      <div class="d-foot">
+        <div class="d-name">vue_new_server</div>
+        <div class="d-ver">r128 → r128</div>
+      </div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card conflict">
+      <div class="d-band band-cf"></div>
+      <span class="lamp err">●</span>
+      <div class="d-main">
+        <div class="d-num cf">1</div>
+        <div class="d-cap">冲突需处理</div>
+      </div>
+      <div class="d-foot">
+        <div class="d-name">hrp_report</div>
+        <div class="d-ver">r87 → r90</div>
+      </div>
+      <div class="plus">+</div>
+    </div>
+    <div class="card busy">
+      <div class="d-band band-busy"></div>
+      <span class="lamp off">●</span>
+      <div class="d-main">
+        <div class="d-num" style="color:var(--amber)">⋯</div>
+        <div class="d-cap">任务执行中</div>
+      </div>
+      <div class="d-foot">
+        <div class="d-name">命运手牌</div>
+        <div class="d-ver">读取中 …</div>
+      </div>
+      <div class="plus">+</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 配置面板落点 ============ -->
+<section>
+  <div class="opt-title">内容配置的落点</div>
+  <div class="panel-wrap">
+    <div class="panel">
+      <h3>设置 › 主页样式 › 简约卡片内容</h3>
+      <label class="cfg-row locked"><input type="checkbox" checked disabled> 目录名称 <span class="hint">必显示</span></label>
+      <label class="cfg-row"><input type="checkbox" checked> 状态灯 <span class="hint">● 连接状态</span></label>
+      <label class="cfg-row"><input type="checkbox" checked> 标记胶囊</label>
+      <label class="cfg-row"><input type="checkbox" checked> 本地版本</label>
+      <label class="cfg-row"><input type="checkbox" checked> 远端版本</label>
+      <label class="cfg-row"><input type="checkbox" checked> 可更新数 ↓</label>
+      <label class="cfg-row"><input type="checkbox" checked> 待提交数 ↑</label>
+      <label class="cfg-row"><input type="checkbox" checked> 本地差异数 ↔</label>
+      <label class="cfg-row"><input type="checkbox" checked> 「+」操作按钮</label>
+    </div>
+    <p class="note">
+      <b>实现口径</b>：配置存进 config.json（如 <b>card_show = ["name","lamp","tag","ver_local","ver_remote","pending","changed","diff","plus"]</b>），四版卡片共用同一份开关；<br><br>
+      · 全部关掉计数后卡片自动进入"安静态"，与版 B 的默认观感一致；<br>
+      · 冲突边框、忙碌转圈、拖拽排序不受开关影响，永远保留；<br>
+      · 标记胶囊超长仍按现口径截断；<br>
+      · 开关改动即时生效并写回配置文件。
+    </p>
+  </div>
+</section>
+
+<script>
+  document.querySelectorAll('input[data-toggle]').forEach(function (box) {
+    box.addEventListener('change', function () {
+      document.body.classList.toggle(box.dataset.toggle, !box.checked);
+    });
+  });
+</script>
+</body>
+</html>

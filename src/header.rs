@@ -1,10 +1,21 @@
-//! 顶部状态栏：仓库连接状态、页面切换、主题与设置入口，以及有新版本时的那个按钮。
+//! 顶部状态栏（自绘标题栏）：仓库连接状态、图标按钮与窗口控制。
+//!
+//! 系统标题栏已由 titlebar.rs 在原生层抹掉，这一整条就是标题栏：
+//! * 空白天区可拖动 / 双击最大化 / 贴边分屏——每帧把「天区到哪、按钮区从哪开始」
+//!   写给 titlebar.rs，原生的 WM_NCHITTEST 据此区分 拖动 / 缩放 / 按钮点击；
+//! * 右上角一排按钮全部换成 SVG 图标（icons.rs 启动时栅格化），文字说明进悬停提示；
+//! * 最右是窗口控制三键：最小化 / 最大化还原 / 关闭，关闭键悬停变红（Windows 惯例）。
 
+use crate::icons;
 use crate::repo::RepoKind;
-use crate::{APP_TITLE, DirView, RepoApp, ink, quiet};
-use egui::{Align, Color32, Layout, RichText, Ui};
+use crate::{APP_TITLE, DirView, RepoApp, ink};
+use egui::{Align, Color32, Layout, RichText, Ui, Vec2};
 use crate::jobs::Kind;
 use crate::ui::AlignedRow;
+
+/// 图标按钮的尺寸：工具键近方形；窗口控制键略宽（Windows 的惯例比例）
+const TOOL_SIZE: Vec2 = Vec2::new(30.0, 26.0);
+const CAPTION_SIZE: Vec2 = Vec2::new(34.0, 26.0);
 
 impl RepoApp {
     // ------------------------------------------------------------ 顶部状态栏
@@ -60,6 +71,7 @@ impl RepoApp {
     }
 
     pub(crate) fn header(&mut self, ui: &mut Ui) {
+        let icons = self.icons.clone();
         let (color, text, reason) = self.connection();
         let color = ink(ui, color);
         let running = self.pool.running();
@@ -67,6 +79,10 @@ impl RepoApp {
             .selected
             .and_then(|index| self.pool.busy_label(index))
             .or_else(|| if running > 0 { Some("任务执行中".into()) } else { None });
+        // 整条顶栏就是标题栏：高度定成 40，比普通控件行高一档才有标题栏的样子
+        ui.set_min_height(40.0);
+        // 右侧按钮区的左缘（逻辑点）：每放一枚按钮就往左推一次，最后整批写给原生侧
+        let mut buttons_left = f32::INFINITY;
         ui.aligned_row(|ui| {
             ui.label(RichText::new(APP_TITLE).size(19.0).strong());
             ui.separator();
@@ -81,95 +97,120 @@ impl RepoApp {
                 ui.label(RichText::new(format!("{running} 个任务：{label}")).weak().size(12.0));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // 检查到新版本时这里常驻入口，点击直接弹确认框，确认后即开始更新。
-                // 文字七彩流动：每个字错开一点色相（LayoutJob 逐字上色），整行铺满一道
-                // 彩虹并随时间向前流动，约 4 秒转一圈；按钮在屏幕上就要持续重绘。
-                // 有没有新版由 update_ready 定（后台检查那趟按文件 sha256 算好的结论）：
-                // 版本号没动但换了构建时，这里照样亮起
+                let Some(set) = icons.as_ref() else {
+                    // 无头测试没有贴图：按钮区整个跳过（工具键与窗口控制全在这里）
+                    return;
+                };
+
+                // ---- 窗口控制（最右）：最小化 / 最大化还原 / 关闭
+                let close = icons::button(ui, &set.close, "关闭", CAPTION_SIZE, true, None);
+                buttons_left = buttons_left.min(close.rect.min.x);
+                if close.clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                let maximized = ui.ctx().input(|i| i.viewport().maximized) == Some(true);
+                let (max_icon, max_tip) = if maximized {
+                    (&set.restore, "向下还原")
+                } else {
+                    (&set.maximize, "最大化")
+                };
+                let max = icons::button(ui, max_icon, max_tip, CAPTION_SIZE, false, None);
+                buttons_left = buttons_left.min(max.rect.min.x);
+                if max.clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                let min = icons::button(ui, &set.minimize, "最小化", CAPTION_SIZE, false, None);
+                buttons_left = buttons_left.min(min.rect.min.x);
+                if min.clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                // 工具键与窗口控制键之间只留一段空隙，不画分隔线
+                ui.add_space(14.0);
+
+                // ---- 检查到新版本：更新图标常驻入口，整枚图标染上随时间流动的彩虹色相
+                // （约 4 秒转一圈；有没有新版由 update_ready 定，后台检查那趟按文件
+                // sha256 算好的结论：版本号没动但换了构建时，这里照样亮起）。
+                // 深色主题用亮色，浅色主题（白底）压暗到一半亮度，否则会看不清
                 if self.update_ready {
                     let latest = self
                         .update_info
                         .as_ref()
                         .map(|m| m.version.trim().to_owned())
                         .unwrap_or_default();
-                    let text = format!("↑ 新版本 V{latest}");
                     let base = (ui.input(|i| i.time) / 4.0) % 1.0;
-                    // 深色主题用亮色，浅色主题（白底）压暗到一半亮度，否则会看不清
                     let (sat, val) = if ui.visuals().dark_mode { (0.92, 0.85) } else { (0.95, 0.55) };
-                    let font = egui::TextStyle::Button.resolve(ui.style());
-                    let mut job = egui::text::LayoutJob::default();
-                    for (index, ch) in text.chars().enumerate() {
-                        let hue = ((base + index as f64 / 12.0) % 1.0) as f32;
-                        let color = egui::Color32::from(egui::ecolor::Hsva::new(hue, sat, val, 1.0));
-                        job.append(
-                            &ch.to_string(),
-                            0.0,
-                            egui::TextFormat::simple(font.clone(), color),
-                        );
-                    }
+                    let tint = egui::Color32::from(egui::ecolor::Hsva::new(
+                        base as f32,
+                        sat,
+                        val,
+                        1.0,
+                    ));
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(66));
-                    if ui
-                        .button(job)
-                        .on_hover_text("有可用更新，点击确认后直接开始（下载新版本并覆盖重启）")
-                        .clicked()
-                    {
+                    let upd = icons::button(
+                        ui,
+                        &set.update,
+                        &format!(
+                            "新版本 V{latest}：点击确认后直接开始（下载新版本并覆盖重启）"
+                        ),
+                        TOOL_SIZE,
+                        false,
+                        Some(tint),
+                    );
+                    buttons_left = buttons_left.min(upd.rect.min.x);
+                    if upd.clicked() {
                         self.show_update_confirm = true;
                     }
                 }
-                if quiet(ui, |ui| ui.button("设置")).clicked() {
-                    self.show_settings = !self.show_settings;
+
+                // ---- 工具键：SVG 图标 + 悬停提示（原来的文字全搬进提示里）
+                let feedback = icons::button(
+                    ui,
+                    &set.feedback,
+                    "在 GitHub 上为本项目提交 issue：反馈问题或提出功能建议",
+                    TOOL_SIZE,
+                    false,
+                    None,
+                );
+                buttons_left = buttons_left.min(feedback.rect.min.x);
+                if feedback.clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::same_tab(format!(
+                        "{}/issues",
+                        crate::update::OFFICIAL_PAGE
+                    )));
+                    self.hint("已在默认浏览器打开 GitHub 的 issue 页面");
                 }
-                let theme_name = match self.cfg.theme.as_str() {
-                    "light" => "浅色",
-                    "dark" => "深色",
-                    _ => "跟随系统",
-                };
-                if quiet(ui, |ui| ui.button(format!("主题：{theme_name}")))
-                    .on_hover_text("点击在 跟随系统 / 浅色 / 深色 之间循环切换")
-                    .clicked()
-                {
-                    self.cfg.theme = match self.cfg.theme.as_str() {
-                        "system" => "light",
-                        "light" => "dark",
-                        _ => "system",
-                    }
-                    .to_owned();
-                    self.persist();
-                }
-                if quiet(ui, |ui| ui.button("Beyond Compare"))
-                    .on_hover_text("启动Beyond Compare")
-                    .clicked()
-                {
-                    self.open_bcompare_matched();
-                }
-                // AI 日志：排在 Beyond Compare 之后、与其他按钮同款配色（不加粗）。
-                // 开关式入口：第一次点开启「日志模式」（各目录提交记录页里本人提交的
-                // 版本行出现勾选框）；开着但没勾选时显示「取消日志模式」，再点退出；
-                // 有勾选后显示数量，点击弹出「AI 工作日志」窗口（模式保持开启，
-                // 方便关掉窗口后去别的目录继续勾）。
+
+                // AI 日志：开关式入口。开着时图标常亮主色；数量进悬停提示。
+                // 第一次点开启「日志模式」（各目录提交记录页里本人提交的版本行出现勾选框）；
+                // 开着但没勾选时再点退出；有勾选后点击弹出「AI 工作日志」窗口（模式保持
+                // 开启，方便关掉窗口后去别的目录继续勾）。
                 let picks = self.ai_picks.len();
-                let (ai_label, ai_hover) = if !self.ai_mode {
+                let (ai_hover, ai_active) = if !self.ai_mode {
                     (
-                        "AI 日志".to_owned(),
-                        "开启日志模式：各目录「提交记录」页里本人提交的版本行会出现勾选框，\n\
-                         勾选后本按钮变成「AI 日志（N）」，点击弹出「AI 工作日志」窗口".to_owned(),
+                        "开启日志模式：各目录「提交记录」页中本人提交的版本行将出现勾选框，\n\
+                         勾选后本按钮亮起，点击弹出「AI 工作日志」窗口"
+                            .to_owned(),
+                        false,
                     )
                 } else if picks == 0 {
                     (
-                        "取消日志模式".to_owned(),
-                        "退出日志模式：隐藏提交记录页里的勾选框（已勾选的提交保留，重新开启后继续显示）".to_owned(),
+                        "已开启日志模式：提交记录页显示勾选框（已勾选的提交将保留），点击退出"
+                            .to_owned(),
+                        true,
                     )
                 } else {
                     (
-                        format!("AI 日志（{picks}）"),
-                        "打开「AI 工作日志」窗口：把勾选的提交交给 AI，按「口吻」整理成工作日志\n\
-                         （接口在 设置 → AI 日志 里配置；模式保持开启，可到其他目录继续勾选）".to_owned(),
+                        format!(
+                            "打开「AI 工作日志」窗口：将已勾选的 {picks} 条提交交由 AI，\
+                             按「口吻」整理为工作日志（模式保持开启，可继续在其他目录勾选）"
+                        ),
+                        true,
                     )
                 };
-                if quiet(ui, |ui| ui.button(ai_label))
-                    .on_hover_text(ai_hover)
-                    .clicked()
-                {
+                let ai_tint = ai_active.then_some(ui.visuals().hyperlink_color);
+                let ai = icons::button(ui, &set.ai_log, &ai_hover, TOOL_SIZE, false, ai_tint);
+                buttons_left = buttons_left.min(ai.rect.min.x);
+                if ai.clicked() {
                     if !self.ai_mode {
                         self.ai_mode = true;
                     } else if picks == 0 {
@@ -178,51 +219,129 @@ impl RepoApp {
                         self.show_worklog = true;
                     }
                 }
-                if quiet(ui, |ui| ui.button("提意见"))
-                    .on_hover_text("在 GitHub 上给本项目提 issue：报问题、提需求都可以")
-                    .clicked()
-                {
-                    ui.ctx().open_url(egui::OpenUrl::same_tab(format!(
-                        "{}/issues",
-                        crate::update::OFFICIAL_PAGE
-                    )));
-                    self.hint("已在默认浏览器打开 GitHub 的 issue 页面");
+
+                let compare = icons::button(
+                    ui,
+                    &set.compare,
+                    "启动 Beyond Compare",
+                    TOOL_SIZE,
+                    false,
+                    None,
+                );
+                buttons_left = buttons_left.min(compare.rect.min.x);
+                if compare.clicked() {
+                    self.open_bcompare_matched();
+                }
+
+                let (theme_icon, theme_name) = match self.cfg.theme.as_str() {
+                    "light" => (&set.theme_light, "浅色"),
+                    "dark" => (&set.theme_dark, "深色"),
+                    _ => (&set.theme_system, "跟随系统"),
+                };
+                let theme = icons::button(
+                    ui,
+                    theme_icon,
+                    &format!("主题：{theme_name}（点击在 跟随系统 / 浅色 / 深色 之间循环切换）"),
+                    TOOL_SIZE,
+                    false,
+                    None,
+                );
+                buttons_left = buttons_left.min(theme.rect.min.x);
+                if theme.clicked() {
+                    self.cfg.theme = match self.cfg.theme.as_str() {
+                        "system" => "light",
+                        "light" => "dark",
+                        _ => "system",
+                    }
+                    .to_owned();
+                    self.persist();
+                }
+
+                let settings = icons::button(ui, &set.settings, "设置", TOOL_SIZE, false, None);
+                buttons_left = buttons_left.min(settings.rect.min.x);
+                if settings.clicked() {
+                    self.show_settings = !self.show_settings;
                 }
             });
         });
+        // 天区与按钮分界写给原生命中测试：顶栏空白处 = 拖动区，这行以右 = 按钮
+        crate::titlebar::set_drag_zone(
+            ui.min_rect().height().max(40.0),
+            buttons_left,
+            ui.ctx().pixels_per_point(),
+        );
+        // 标题栏底下压一道发丝线，和内容分层
+        let bar = ui.max_rect();
+        ui.painter().hline(
+            bar.left()..=bar.right(),
+            bar.bottom(),
+            egui::Stroke::new(1.0, crate::ui::pane_stroke(ui)),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testbed::stub_app;
+    use egui::{Pos2, RawInput, Rect, ThemePreference};
 
-    /// 顶栏单独跑一帧，收下这一帧画出来的全部文字。
-    fn header_labels() -> Vec<String> {
+    /// 顶栏单独跑一帧（贴图齐全、挂着一条新版本提示），收下这一帧画出来的文字与图片数。
+    /// 测试里没有渲染器，字体增量不应用就得显式丢弃，否则 epaint 在 Drop 时 panic
+    fn header_frame(dark: bool) -> (Vec<String>, usize) {
         let ctx = egui::Context::default();
-        ctx.set_theme(egui::ThemePreference::Dark);
+        ctx.set_theme(if dark { ThemePreference::Dark } else { ThemePreference::Light });
         crate::fonts::install(&ctx, crate::fonts::AUTO);
-        let mut app = crate::testbed::stub_app(false);
-        let mut out = ctx.run_ui(crate::testbed::base_input(), |ui| app.header(ui));
-        // 测试里没有渲染器，字体增量不应用就得显式丢弃，否则 epaint 在 Drop 时 panic
+        let mut app = stub_app(false);
+        app.update_ready = true;
+        app.icons = Some(crate::icons::IconSet::load(&ctx));
+        let mut out = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 600.0))),
+                ..Default::default()
+            },
+            |ui| app.header(ui),
+        );
         out.textures_delta.clear();
-        out.shapes
+        let texts = out
+            .shapes
             .iter()
             .filter_map(|item| match &item.shape {
                 egui::Shape::Text(text) => Some(text.galley.text().to_string()),
                 _ => None,
             })
-            .collect()
+            .collect();
+        // 图标走 Shape::Mesh（贴图三角网），顶栏里贴图网格只可能来自图标键
+        let images = out
+            .shapes
+            .iter()
+            .filter(|item| matches!(item.shape, egui::Shape::Mesh(_)))
+            .count();
+        (texts, images)
     }
 
-    /// 右上角换了人：「提意见」进来顶替「重新寻找svn.exe」，找 svn 的活归设置页那颗「自动寻找」。
+    /// 右上角那一排文字按钮全部换成了 SVG 图标：旧文案不该再以按钮形式出现，
+    /// 图标键（工具 5 + 窗口控制 3 + 新版本 1）一枚不少
     #[test]
-    fn feedback_entry_takes_over_the_svn_rescan_slot() {
-        let labels = header_labels();
-        assert!(labels.iter().any(|text| text == "提意见"), "顶栏没有「提意见」：{labels:?}");
-        assert!(
-            !labels.iter().any(|text| text.contains("重新寻找")),
-            "顶栏不该再有重新寻找 svn.exe：{labels:?}"
-        );
+    fn top_right_buttons_are_all_icons_now() {
+        let (texts, images) = header_frame(true);
+        for label in ["提意见", "设置", "主题：", "Beyond Compare", "AI 日志", "取消日志模式"] {
+            assert!(
+                !texts.iter().any(|text| text.contains(label)),
+                "顶栏还有文字按钮「{label}」：{texts:?}"
+            );
+        }
+        assert!(images >= 9, "顶栏该有 9 枚图标键，只画了 {images}");
+    }
+
+    /// 天区写给原生侧的数值得合理：顶栏有高度、按钮区左缘落在窗口里，
+    /// 既不是 0（整窗可拖，按钮全废）也不是没写
+    #[test]
+    #[cfg(windows)]
+    fn drag_zone_covers_the_bar_but_not_the_buttons() {
+        let _ = header_frame(true);
+        let (bar_h, btn_x) = crate::titlebar::drag_zone();
+        assert!(bar_h > 0, "顶栏高度没写给原生侧");
+        assert!(btn_x > 0 && btn_x < 1200, "按钮区左缘不合理：{btn_x}");
     }
 }

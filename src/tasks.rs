@@ -909,7 +909,7 @@ impl RepoApp {
             let Some(git) = self.git_or_none() else { return };
             let Some(dir) = self.dir_path(index) else { return };
             if self.pool.has(Kind::FileDiff, index) {
-                self.hint("上一条差异还在读取，读完再点「重新读取」");
+                self.hint("正在读取上一条差异，请待完成后重新点击「重新读取」");
                 return;
             }
             let rev = crate::repo::fmt_rev(self.dir_kind(index), &revision);
@@ -947,7 +947,7 @@ impl RepoApp {
             return;
         };
         if self.pool.has(Kind::FileDiff, index) {
-            self.hint("上一条差异还在读取，读完再点「重新读取」");
+            self.hint("正在读取上一条差异，请待完成后重新点击「重新读取」");
             return;
         }
         let shown = url.rsplit('/').next().unwrap_or("").to_owned();
@@ -977,7 +977,7 @@ impl RepoApp {
     pub fn open_file_log(&mut self, index: usize, path: &LogPath) {
         // 一次只读一条：上一条没回来就换路径，结果会串到别的路径上
         if self.pool.has(Kind::FileLog, index) {
-            self.hint("上一个文件的提交记录还在读取，稍等再点");
+            self.hint("正在读取上一个文件的提交记录，请稍候再试");
             return;
         }
         if self.dir_kind(index) == RepoKind::Git {
@@ -1032,7 +1032,7 @@ impl RepoApp {
             let Some(git) = self.git_or_none() else { return };
             let Some(dir) = self.dir_path(index) else { return };
             if self.pool.has(Kind::FileLog, index) {
-                self.hint("上一个文件的提交记录还在读取，稍等再点");
+                self.hint("正在读取上一个文件的提交记录，请稍候再试");
                 return;
             }
             let shown = url.rsplit('/').next().unwrap_or("").to_owned();
@@ -1055,7 +1055,7 @@ impl RepoApp {
             return;
         };
         if self.pool.has(Kind::FileLog, index) {
-            self.hint("上一个文件的提交记录还在读取，稍等再点");
+            self.hint("正在读取上一个文件的提交记录，请稍候再试");
             return;
         }
         let shown = url.rsplit('/').next().unwrap_or("").to_owned();
@@ -1260,7 +1260,7 @@ impl RepoApp {
             return;
         };
         if self.pool.has(Kind::Rollback, index) {
-            self.hint("该目录的上一次回退还在执行，等它结束再点");
+            self.hint("该目录的上一次回退正在执行，请待其结束后再试");
             return;
         }
         // 有冲突没解决时，回退出来的只会是一团更乱的半成品，先把人挡回去
@@ -1370,7 +1370,7 @@ impl RepoApp {
         if self.dir_kind(dir) == RepoKind::Git {
             let Some(git) = self.git_or_none() else { return };
             if self.pool.has(Kind::Rollback, dir) {
-                self.hint("上一次回退还在执行，等它结束再点");
+                self.hint("上一次回退正在执行，请待其结束后再试");
                 return;
             }
             let rev = crate::repo::fmt_rev(self.dir_kind(dir), &revision);
@@ -1428,7 +1428,7 @@ impl RepoApp {
             return;
         };
         if self.pool.has(Kind::Rollback, dir) {
-            self.hint("上一次回退还在执行，等它结束再点");
+            self.hint("上一次回退正在执行，请待其结束后再试");
             return;
         }
         self.pool.spawn(

@@ -47,7 +47,7 @@ impl RepoApp {
                             }
                         }
                     });
-                    ui.label(RichText::new("如果显示“无法添加工作副本”，请重新安装svn，并且勾选“command line client tools”").weak());
+                    ui.label(RichText::new("若提示“无法添加工作副本”，请重新安装 SVN，并勾选“command line client tools”").weak());
                     ui.aligned_row(|ui| {
                         if ui.button("应用此路径").clicked() {
                             let exe = self.cfg.svn_exe.clone();
@@ -119,7 +119,7 @@ impl RepoApp {
                                             found.display()
                                         ));
                                     }
-                                    None => self.hint("未找到 git.exe，请手工填写路径"),
+                                    None => self.hint("未找到 git.exe，请手动填写路径"),
                                 }
                             }
                             let note = if self.git.available() {
@@ -173,7 +173,7 @@ impl RepoApp {
                                         self.cfg.bc_exe = found.to_string_lossy().into_owned();
                                         self.hint(format!("已找到 {}", found.display()));
                                     }
-                                    None => self.hint("未找到 BCompare.exe，请手工填写路径"),
+                                    None => self.hint("未找到 BCompare.exe，请手动填写路径"),
                                 }
                                 self.persist();
                             }
@@ -257,7 +257,7 @@ impl RepoApp {
                             }
                             None => {
                                 ui.label(
-                                    RichText::new("（没找到 BC 的会话默认值节点，先在 Beyond Compare 里做一次文件夹对比）")
+                                    RichText::new("（未找到 BC 的会话默认值节点，请先在 Beyond Compare 中执行一次文件夹对比）")
                                         .weak()
                                         .size(11.0),
                                 );
@@ -398,6 +398,10 @@ impl RepoApp {
                         ui.aligned_row(|ui| {
                             ui.label("字号");
                             let mut changed = false;
+                            // 下拉框默认按 interact_size 撑高度，比整行的按钮档矮一截会错位：
+                            // 先垫到 control_height 同档再画（与上面的取色按钮同一招）
+                            let previous = ui.spacing().interact_size;
+                            ui.spacing_mut().interact_size.y = crate::ui::control_height(ui);
                             egui::ComboBox::from_id_salt("ui_scale")
                                 .selected_text(self.cfg.ui_scale.clone())
                                 .show_ui(ui, |ui| {
@@ -410,6 +414,7 @@ impl RepoApp {
                                         }
                                     }
                                 });
+                            ui.spacing_mut().interact_size = previous;
                             if changed {
                                 self.persist();
                             }
@@ -417,6 +422,8 @@ impl RepoApp {
                         ui.aligned_row(|ui| {
                             ui.label("字体");
                             let mut picked: Option<String> = None;
+                            let previous = ui.spacing().interact_size;
+                            ui.spacing_mut().interact_size.y = crate::ui::control_height(ui);
                             egui::ComboBox::from_id_salt("ui_font")
                                 .selected_text(self.cfg.ui_font.clone())
                                 .show_ui(ui, |ui| {
@@ -429,6 +436,7 @@ impl RepoApp {
                                         }
                                     }
                                 });
+                            ui.spacing_mut().interact_size = previous;
                             if let Some(family) = picked {
                                 self.font_note = fonts::note_for(&family, fonts::install(ctx, &family));
                                 self.persist();
@@ -440,6 +448,61 @@ impl RepoApp {
                         }
                         ui.label(RichText::new(format!("配置文件：{}", config::config_file().display())).size(11.5).weak());
                         ui.label(RichText::new(self.font_note.clone()).size(11.5).weak());
+                    });
+                    ui.collapsing("简约样式卡片显示内容（作用于主页「简约」样式）", |ui| {
+                        ui.label(
+                            RichText::new(
+                                "切换至「简约」样式后，卡片上显示以下内容项；目录名称始终显示。\
+                                 更改即时生效，并自动写入配置文件。",
+                            )
+                            .weak()
+                            .size(11.5),
+                        );
+                        let mut dirty = false;
+                        ui.horizontal(|ui| {
+                            let mut value = self.cfg.card_show.lamp;
+                            if ui.checkbox(&mut value, "检测状态灯").changed() {
+                                self.cfg.card_show.lamp = value;
+                                dirty = true;
+                            }
+                            let mut value = self.cfg.card_show.tag;
+                            if ui.checkbox(&mut value, "目录标记").changed() {
+                                self.cfg.card_show.tag = value;
+                                dirty = true;
+                            }
+                            let mut value = self.cfg.card_show.ver_local;
+                            if ui.checkbox(&mut value, "本地版本").changed() {
+                                self.cfg.card_show.ver_local = value;
+                                dirty = true;
+                            }
+                            let mut value = self.cfg.card_show.ver_remote;
+                            if ui.checkbox(&mut value, "远端版本").changed() {
+                                self.cfg.card_show.ver_remote = value;
+                                dirty = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let mut value = self.cfg.card_show.pending;
+                            if ui.checkbox(&mut value, "可更新项数").changed() {
+                                self.cfg.card_show.pending = value;
+                                dirty = true;
+                            }
+                            let mut value = self.cfg.card_show.changed;
+                            if ui.checkbox(&mut value, "待提交项数").changed() {
+                                self.cfg.card_show.changed = value;
+                                dirty = true;
+                            }
+                            let mut value = self.cfg.card_show.diff;
+                            if ui.checkbox(&mut value, "本地差异项数").on_hover_text(
+                                "仅对已通过「更多 → 绑定对比对象」绑定本地端的目录生效",
+                            ).changed() {
+                                self.cfg.card_show.diff = value;
+                                dirty = true;
+                            }
+                        });
+                        if dirty {
+                            self.persist();
+                        }
                     });
                     ui.collapsing("AI 日志（调用 AI 生成工作日志）", |ui| {
                         ui.label(

@@ -199,7 +199,7 @@ pub fn date_input(
     );
     let button = ui
         .button("日历")
-        .on_hover_text("从月历里点一天，不用手打；输入框照样可以直接改");
+        .on_hover_text("在日历中选择日期，也可直接在输入框中输入");
     // 刚点开时以框里那天为准重置翻月游标，否则 ←/→ 会被输入框的值盖回去
     if button.clicked() {
         let shown = parse_date(text).unwrap_or(today);
@@ -277,7 +277,7 @@ fn month_calendar(
                     if hit.clicked() && allowed {
                         chosen = Some(day);
                     } else if !allowed {
-                        hit.on_hover_text("受另一个日期框的限制，这天不能选");
+                        hit.on_hover_text("受另一日期框限制，无法选择该日期");
                     }
                 } else {
                     // 月初前 / 月末后的空位：占一格，否则整月会左右错位

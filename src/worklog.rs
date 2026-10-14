@@ -305,7 +305,7 @@ impl RepoApp {
             .centered(ctx, "worklog")
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("把勾选的提交交给 AI，按你的口吻整理成工作日志").size(13.0));
+                    ui.label(RichText::new("将勾选的提交交由 AI，按所设口吻整理为工作日志").size(13.0));
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(model_note).weak().size(11.5));
                     });
@@ -342,13 +342,16 @@ impl RepoApp {
                 });
                 // ---- 从其他目录补充勾选：跨目录汇总的入口就放在窗口里 ----
                 ui.aligned_row(|ui| {
-                    ui.label(RichText::new("还要加其他目录的提交：").size(12.5));
+                    ui.label(RichText::new("添加其他目录的提交：").size(12.5));
                     if self.cfg.dirs.is_empty() {
                         ui.label(RichText::new("目录列表为空").weak().size(12.0));
                     } else {
                         if self.ai_pick_dir >= self.cfg.dirs.len() {
                             self.ai_pick_dir = 0;
                         }
+                        // 下拉框垫到按钮同档高度，与行内文字对齐（同 settings 页的取色按钮）
+                        let previous = ui.spacing().interact_size;
+                        ui.spacing_mut().interact_size.y = crate::ui::control_height(ui);
                         egui::ComboBox::from_id_salt("ai_pick_dir")
                             .selected_text(self.dir_label(self.ai_pick_dir))
                             .width(200.0)
@@ -362,6 +365,7 @@ impl RepoApp {
                                     );
                                 }
                             });
+                        ui.spacing_mut().interact_size = previous;
                         if ui
                             .button("打开它的提交记录页 →")
                             .on_hover_text(
@@ -545,7 +549,7 @@ impl RepoApp {
                     if generating {
                         ui.spinner();
                         ui.label(
-                            RichText::new("正在生成日志…（已把提交记录发给 AI，返回后自动显示）")
+                            RichText::new("正在生成日志…（提交记录已发送至 AI，返回后自动显示）")
                                 .size(12.5),
                         );
                     }

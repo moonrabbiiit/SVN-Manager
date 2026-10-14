@@ -10,9 +10,12 @@ use crate::{
 };
 use crate::ui::AlignedRow;
 
-/// 简约形态下目录卡片的边长（逻辑点）：四角各摆一块内容（状态灯、计数标记、版本行、
-/// 「+」），名称横排在正中；168 是让这几块互不相撞、名称还能放六七个汉字的最小尺寸
-const CARD_SIZE: f32 = 168.0;
+/// 简约形态下宽行卡片的尺寸（逻辑点）：左列放名称 / 标记 / 版本，右侧竖排计数胶囊、
+/// 最右一枚圆形「+」。264×92 下两列并排仍能放进 1400 宽的窗口，名称放得下七八个汉字
+const CARD_W: f32 = 264.0;
+const CARD_H: f32 = 92.0;
+/// 计数胶囊列的固定宽度：要装下「待提交 999+」这种最宽的组合，再留一点余量
+const PILL_W: f32 = 74.0;
 
 /// 拖动落点。分组标题条整条通栏，落上去 = 并入那一组；目录行 / 卡片各切成两半，
 /// 落在前半或后半 = 插到它之前或之后，分组也跟着那一行走——
@@ -83,31 +86,33 @@ fn covered_by_overlay(ctx: &egui::Context, pos: egui::Pos2) -> bool {
         .is_some_and(|layer| layer.order != egui::Order::Background)
 }
 
-/// 卡片计数标记的底色：这个方向上没有待办时是实心绿，有待办换成更深的黄
-const MARK_QUIET: Color32 = Color32::from_rgb(56, 168, 96);
-const MARK_BUSY: Color32 = Color32::from_rgb(214, 154, 22);
-/// 计数标记的字号与高度：取上一版（11.5 号字 + 19 高）缩 5% 再落整。
-/// 17 = 10.9 号字的行高 15 + 上下各 1 的内边距；圆角由它取半向下推出来（胶囊）
+/// 计数标记的字号与高度：10.9 号字的行高 15 + 上下内边距 3/4（去描边后 Frame 少画 2，
+/// 非对称补足 20）；圆角由它取半向下推出来（胶囊）
 const MARK_FONT: f32 = 10.9;
-const MARK_H: f32 = 17.0;
+const MARK_H: f32 = 20.0;
+
+/// 计数胶囊的配色：(底色, 文字色)。
+/// 有待办时按语义色出一枚淡底深字胶囊——浅色主题走设计稿的粉彩底、压暗的字；
+/// 深色主题用半透明色底，字直接用原色。没待办就是一枚不抢眼的中性灰。
+fn pill_colors(ui: &Ui, hue: Color32, active: bool) -> (Color32, Color32) {
+    if active {
+        if ui.visuals().dark_mode {
+            (tint(hue, 44), hue)
+        } else {
+            (pale(hue, 0.16), ink(ui, hue))
+        }
+    } else if ui.visuals().dark_mode {
+        (Color32::from_white_alpha(16), Color32::from_gray(150))
+    } else {
+        (Color32::from_rgb(243, 245, 250), Color32::from_gray(138))
+    }
+}
 
 /// 只换 alpha、不动 RGB：卡片上计数标记的底色 / 描边要的是「同一颜色淡一点」，
 /// 而 gamma_multiply 会连 alpha 一起乘、把颜色本身也调淡。
 fn tint(color: Color32, alpha: u8) -> Color32 {
     let [r, g, b, _] = color.to_array();
     Color32::from_rgba_unmultiplied(r, g, b, alpha)
-}
-
-/// 在指定矩形的左上角放一行文字，放不下就截断。
-/// 不用 `Ui::put`：它走的是居中 + 两端对齐的布局，卡片里的名称和版本号要贴着左边摆。
-fn card_text(ui: &mut Ui, rect: egui::Rect, text: RichText) -> egui::Response {
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .layout(Layout::left_to_right(Align::Min))
-            .sense(egui::Sense::hover()),
-    );
-    child.add(egui::Label::new(text).truncate())
 }
 
 /// 计数标记上的数字：四位数起换「999+」，不然窄标记会被撑歪
@@ -149,14 +154,21 @@ pub fn tag_color_hex(rgb: [u8; 3]) -> String {
     format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
 }
 
-/// 标记胶囊：描边与文字同色，颜色在「修改标记」的取色器里选
-fn tag_pill(ui: &mut Ui, text: &str, color: Color32) {
+/// 详细行右下角的标签色块：实心填上标签色，文字按底色亮度取近黑 / 近白，
+/// 深浅两套主题都不用另调一套
+fn tag_block(ui: &mut Ui, text: &str, color: Color32) {
+    let [r, g, b, _] = color.to_array();
+    let text_color = if 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32 > 150.0 {
+        Color32::from_rgb(26, 20, 4)
+    } else {
+        Color32::from_rgb(250, 252, 250)
+    };
     Frame::new()
-        .stroke(egui::Stroke::new(1.0, color))
-        .corner_radius(9.0)
-        .inner_margin(egui::Margin::symmetric(5, 1))
+        .fill(color)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.5).color(color));
+            ui.label(RichText::new(text).size(11.5).color(text_color));
         });
 }
 
@@ -197,14 +209,24 @@ impl RepoApp {
             .corner_radius(8.0)
             .stroke(egui::Stroke::new(
                 if dragging { 1.6 } else { 1.0 },
-                if dragging { self.accent_ink() } else { pane_stroke(ui) },
+                // 比全局 pane_stroke 深一小档：纯白行底上浅色描边有点看不清，但不做多
+                if dragging {
+                    self.accent_ink()
+                } else if ui.visuals().dark_mode {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 54)
+                } else {
+                    Color32::from_rgb(216, 220, 230)
+                },
             ))
             .fill(if is_selected {
                 ui.visuals().selection.bg_fill
             } else if hovered || dragging {
                 pane_hover(ui)
-            } else {
+            } else if ui.visuals().dark_mode {
                 pane_fill(ui)
+            } else {
+                // 浅色主题跟简约卡片一样用白底，两种样式看起来是一套的
+                Color32::WHITE
             });
         frame.show(ui, |ui| {
             // 行内文字默认可选中，会抢占点击；关掉后整行空白处才能选中本行
@@ -236,12 +258,7 @@ impl RepoApp {
                 if self.edit_group == Some(index) {
                     self.group_editor(ui, index);
                 }
-                // 目录标记胶囊：路径后面、待提交计数之前；正在编辑时换成编辑行
-                if self.edit_tag == Some(index) {
-                    self.tag_editor(ui, index);
-                } else if !dir.tag.is_empty() {
-                    tag_pill(ui, &dir.tag, ink(ui, tag_color(&dir)));
-                }
+                // 目录标记挪到了第二行右下角的色块里（编辑也在那里），主行不再重复显示
                 let changed_before = view.changed.is_some();
                 if let Some(changed) = view.changed {
                     if changed > 0 {
@@ -353,11 +370,11 @@ impl RepoApp {
                             self.selected = Some(index);
                             self.open_history(index);
                         }
-                        if quiet(ui, |ui| ui.button("↑ 上传")).clicked() {
+                        if quiet(ui, |ui| ui.button("上传")).clicked() {
                             self.selected = Some(index);
                             self.open_commit(index);
                         }
-                        if quiet(ui, |ui| ui.button("↓ 更新")).clicked() {
+                        if quiet(ui, |ui| ui.button("更新")).clicked() {
                             self.selected = Some(index);
                             self.confirm_remove = None;
                             self.spawn_update(index);
@@ -457,6 +474,15 @@ impl RepoApp {
                         );
                     }
                 }
+                // 行尾右下角：目录标签的色块（实心填标签色）；正在编辑时这一位换成编辑行。
+                // 没标签也不编辑时这里什么都不画，不给行白白加高
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.edit_tag == Some(index) {
+                        self.tag_editor(ui, index);
+                    } else if !dir.tag.is_empty() {
+                        tag_block(ui, &dir.tag, tag_color(&dir));
+                    }
+                });
             });
         });
     }
@@ -532,6 +558,29 @@ impl RepoApp {
             self.edit_tag = Some(index);
             self.tag_buf = self.cfg.dirs[index].tag.clone();
             self.tag_focus = true;
+            ui.close();
+        }
+        // 更新通知订阅：开启后自动检测发现服务器有新版本时弹一次系统通知
+        let subscribed = self.cfg.dirs[index].notify;
+        if ui
+            .button(if subscribed { "关闭更新通知" } else { "订阅更新通知" })
+            .on_hover_text(
+                "开启后，检测到该目录在服务器上有新版本时发送一次 Windows 系统通知\
+                 （含最新版本、最新提交人与未更新项数；同一版本只通知一次，多个目录合并为一条）",
+            )
+            .clicked()
+        {
+            self.cfg.dirs[index].notify = !subscribed;
+            // 重新开启时清掉已通知记录：当前积压的更新会作为「新版本」通知一次
+            if !subscribed {
+                self.cfg.dirs[index].notified_rev = String::new();
+            }
+            self.persist();
+            self.hint(if subscribed {
+                format!("已关闭「{}」的更新通知", self.dir_label(index))
+            } else {
+                format!("已开启「{}」的更新通知", self.dir_label(index))
+            });
             ui.close();
         }
         // 仓库地址 / 清理 / 解决冲突是 SVN 工作副本的概念，Git 目录没有对应操作，直接不出现
@@ -1163,7 +1212,7 @@ impl RepoApp {
     /// （收起的组整段跳过），再按列数流式铺开
     fn dir_cards(&mut self, ui: &mut Ui) {
         let gap = 10.0;
-        let cols = (((ui.available_width() + gap) / (CARD_SIZE + gap)).floor() as usize).max(1);
+        let cols = (((ui.available_width() + gap) / (CARD_W + gap)).floor() as usize).max(1);
         ScrollArea::vertical()
             .id_salt("dir_cards")
             .auto_shrink([false, false])
@@ -1276,8 +1325,9 @@ impl RepoApp {
         collapsed
     }
 
-    /// 简约形态下的一张卡片：圆角正方形，检测状态灯在左上、目录名称在正中、
-    /// 两行版本在左下、两枚计数标记在右上、圆形「+」在右下。返回 (点中卡片, 双击卡片)。
+    /// 简约形态下的一张宽行卡片：左列自上而下是名称（带状态灯）/ 标记胶囊 / 一行版本，
+    /// 右侧竖排计数胶囊（可更新 / 待提交 / 差异）；右键卡片弹出全部操作菜单。
+    /// 显示哪些块由 cfg.card_show 逐项开关。返回 (点中卡片, 双击卡片)。
     fn dir_card(&mut self, ui: &mut Ui, index: usize) -> (bool, bool) {
         let view = self.dirs.get(index).cloned().unwrap_or_default();
         let busy = self.pool.is_busy(index);
@@ -1290,7 +1340,8 @@ impl RepoApp {
         let conflicts = view.conflicts.unwrap_or(0);
         let weak = ui.visuals().weak_text_color();
 
-        let (_id, rect) = ui.allocate_space(Vec2::splat(CARD_SIZE));
+        let show = self.cfg.card_show;
+        let (_id, rect) = ui.allocate_space(Vec2::new(CARD_W, CARD_H));
         // 整张卡片的感应区先注册，里面的标记和「+」都注册在它之后：
         // 点在控件上时控件优先命中，点在空白处才是「选中这一张」；
         // 顺带让它可拖——整张卡片都是把手，挪到别的卡片左/右侧就改顺序
@@ -1341,8 +1392,11 @@ impl RepoApp {
                 ui.visuals().selection.bg_fill
             } else if hovered || dragging {
                 pane_hover(ui)
-            } else {
+            } else if dark {
                 pane_fill(ui)
+            } else {
+                // 浅色主题点名要白底：卡片要比页面底色更亮，浮起的感觉靠那圈投影撑
+                Color32::WHITE
             },
         );
         ui.painter().rect_stroke(
@@ -1355,7 +1409,11 @@ impl RepoApp {
             egui::StrokeKind::Inside,
         );
         let inner = card.shrink(10.0);
-        // 左上角：检测状态灯（配色和悬停说明同详细模式的那枚 ●）
+        // 先把右侧的水平分位定下来：计数胶囊列贴着右内边，左列（名称 / 标记 / 版本）吃剩下的宽度
+        let pill_right = inner.max.x;
+        let pill_left = pill_right - PILL_W;
+        let left_w = pill_left - 8.0 - inner.min.x;
+        // 检测状态灯（配色和悬停说明同详细模式的那枚 ●）
         let lamp = ink(
             ui,
             match view.remote {
@@ -1365,58 +1423,41 @@ impl RepoApp {
                 None => Color32::from_gray(120),
             },
         );
-        ui.place(
-            egui::Rect::from_min_size(inner.min, Vec2::splat(20.0)),
-            egui::Label::new(RichText::new("●").size(15.0).color(lamp)),
+        // 第一行：状态灯 + 名称 +（忙碌时的）转圈
+        let name_rect = egui::Rect::from_min_size(inner.min, Vec2::new(left_w, 20.0));
+        let mut name_row = ui.new_child(
+            egui::UiBuilder::new()
+                .id(egui::Id::new(("dir_card_name", index)))
+                .max_rect(name_rect)
+                .layout(Layout::left_to_right(Align::Center)),
         );
-        // 目录名称摆在卡片正中
-        ui.place(
-            egui::Rect::from_center_size(card.center(), Vec2::new(inner.width() - 8.0, 26.0)),
-            egui::Label::new(RichText::new(&label).strong().size(13.5)).truncate(),
-        );
-        // 标记胶囊画在名称正下方：不占右上角徽标带，免得和忙碌转圈抢位
-        let tag = self.cfg.dirs[index].tag.clone();
-        if !tag.is_empty() {
-            let color = ink(ui, tag_color(&self.cfg.dirs[index]));
-            // 先量字宽再画框：竖排居中的子 Ui 会把成员沿横轴拉满整宽，交给 Frame
-            // 就是一个和卡片等宽的空盒子。超长标记照名称的口径截断
-            let max_width = inner.width() - 16.0;
-            let mut job = egui::text::LayoutJob::simple(
-                tag.clone(),
-                egui::FontId::proportional(11.5),
-                color,
-                f32::INFINITY,
-            );
-            job.wrap = egui::text::TextWrapping::truncate_at_width(max_width - 12.0);
-            let galley = ui.painter().layout_job(job);
-            let pill = egui::Rect::from_center_size(
-                egui::pos2(card.center().x, card.center().y + 22.0),
-                Vec2::new((galley.size().x + 12.0).min(max_width), 18.0),
-            );
-            ui.painter().rect_stroke(
-                pill,
-                9.0,
-                egui::Stroke::new(1.0, color),
-                egui::StrokeKind::Inside,
-            );
-            let text = egui::Align2::CENTER_CENTER.anchor_size(pill.center(), galley.size());
-            ui.painter().galley(text.min, galley, color);
+        if show.lamp {
+            name_row.label(RichText::new("●").size(13.0).color(lamp));
+            name_row.add_space(4.0);
         }
+        name_row.add(egui::Label::new(RichText::new(&label).strong().size(13.5)).truncate());
         if busy {
-            // 加载只留一枚转圈：卡片地方小，任务文字挤在名称上面不好看，进度看边框颜色就够了。
+            // 忙碌只多一枚转圈：任务文字挤进来会把名称顶出去，进度看边框颜色就够了。
             // 颜色显式给：跟着主题走的话浅色底上那圈几乎看不见
-            egui::Spinner::new()
-                .size(15.0)
-                .color(ink(ui, crate::AMBER))
-                .paint_at(
-                    ui,
-                    egui::Rect::from_min_size(
-                        egui::pos2(inner.min.x + 22.0, inner.min.y + 3.0),
-                        Vec2::splat(15.0),
-                    ),
-                );
+            name_row.add_space(4.0);
+            name_row.add(egui::Spinner::new().size(13.0).color(ink(ui, crate::AMBER)));
         }
-        // 左下两行：当前版本 / 远端版本，口径与详细模式一致
+        // 标记色块：名称正下方，实心标签色（与详细模式右下角那块同一套），颜色在「修改标记」的取色器里选
+        let tag = self.cfg.dirs[index].tag.clone();
+        if show.tag && !tag.is_empty() {
+            let tag_rect = egui::Rect::from_min_size(
+                egui::pos2(inner.min.x, inner.min.y + 24.0),
+                Vec2::new(left_w, 18.0),
+            );
+            let mut tag_row = ui.new_child(
+                egui::UiBuilder::new()
+                    .id(egui::Id::new(("dir_card_tag", index)))
+                    .max_rect(tag_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            tag_block(&mut tag_row, &tag, tag_color(&self.cfg.dirs[index]));
+        }
+        // 底部一行：本地 / 远端版本各一小段，口径与详细模式一致
         let up_to_date = view.out_of_date == Some(0) && !view.remote_rev.is_empty();
         let local = match &view.info {
             Some(info) => {
@@ -1430,97 +1471,91 @@ impl RepoApp {
         } else {
             format!("远端 {}", crate::repo::fmt_rev(view.kind, &view.remote_rev))
         };
-        // 远端有更新时，远端那行用详细模式里「远端 rX（可更新 N 项）」的黄色
+        // 远端有更新时，远端那段用详细模式里「远端 rX（可更新 N 项）」的黄色
         let remote_color = if pending > 0 {
             ink(ui, crate::AMBER)
         } else {
             weak
         };
-        for (y, text, color) in [
-            (inner.max.y - 34.0, local.as_str(), weak),
-            (inner.max.y - 14.0, remote.as_str(), remote_color),
-        ] {
-            card_text(
-                ui,
-                egui::Rect::from_min_size(
-                    egui::pos2(inner.min.x, y),
-                    Vec2::new(inner.width() - 36.0, 18.0),
-                ),
-                RichText::new(text).size(10.5).color(color),
+        if show.ver_local || show.ver_remote {
+            let ver_rect = egui::Rect::from_min_size(
+                egui::pos2(inner.min.x, inner.max.y - 17.0),
+                Vec2::new(left_w, 17.0),
             );
-        }
-        // 右上角计数标记：↓=服务器可更新，↑=本地待提交，绑定过本地端再多一枚 ↔=本地端差异。
-        // ↓ 与 ↔ 并排在第一行：竖排三枚要 59px，而卡片只有 168 见方，第三枚会贴到居中的名称上
-        let mut band = ui.new_child(
-            egui::UiBuilder::new()
-                .id(egui::Id::new(("dir_card_band", index)))
-                .max_rect(egui::Rect::from_min_size(
-                    inner.min,
-                    Vec2::new(inner.width(), 44.0),
-                ))
-                .layout(Layout::top_down(Align::Max))
-                .sense(egui::Sense::hover()),
-        );
-        band.spacing_mut().item_spacing.y = 4.0;
-        // 行宽给满、行高只给一枚标记：横排会把成员沿竖轴拉满，跟着 band 的 44 拉就是四枚高
-        let first_row = egui::Rect::from_min_size(inner.min, Vec2::new(inner.width(), MARK_H));
-        let mut row = band.new_child(
-            egui::UiBuilder::new()
-                .max_rect(first_row)
-                .layout(Layout::right_to_left(Align::Center)),
-        );
-        // 两枚标记只靠箭头区分方向：↓ 是从服务器拉下来，↑ 是要传上去
-        let update_clicked = self.count_badge(
-            &mut row,
-            &format!("↓{}", capped(pending)),
-            pending > 0,
-            &format!("服务器上有 {pending} 项本地还没更新\n点击立即更新该目录"),
-        );
-        let local_clicked = match view.local_diff.as_ref() {
-            Some(summary) => {
-                let tip = self.local_diff_tip(index, summary, self.pool.comparing(index));
-                self.count_badge(
-                    &mut row,
-                    &format!("↔{}", capped(summary.total())),
-                    !summary.is_clean(),
-                    &tip,
-                )
+            let mut ver_row = ui.new_child(
+                egui::UiBuilder::new()
+                    .id(egui::Id::new(("dir_card_ver", index)))
+                    .max_rect(ver_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            if show.ver_local {
+                ver_row.label(RichText::new(&local).size(10.5).color(weak));
             }
-            None => false,
-        };
-        drop(row);
-        // 子 Ui 不会替父级推进光标，这里自己把第一行的高度吃掉，↑ 才会落到第二行
-        band.advance_cursor_after_rect(first_row);
-        let commit_clicked = self.count_badge(
-            &mut band,
-            &format!("↑{}", capped(changed)),
-            changed > 0,
-            &format!(
-                "本地有 {changed} 项待提交（口径同「全部上传」）\n点击打开该目录的提交页"
-            ),
-        );
-        drop(band);
-        // 右下角带圆圈的「+」：详细模式摊在行尾的那些按钮全收进这里
-        let plus = ui.place(
-            egui::Rect::from_min_size(
-                egui::pos2(inner.max.x - 30.0, inner.max.y - 30.0),
-                Vec2::splat(30.0),
-            ),
-            egui::Button::new(
-                RichText::new("+")
-                    .size(19.0)
-                    .color(Color32::from_rgb(246, 249, 253)),
-            )
-            .min_size(Vec2::splat(30.0))
-            .corner_radius(15)
-            .fill(ink(ui, self.accent()))
-            .stroke(egui::Stroke::new(
-                1.0,
-                ink(ui, pale(self.accent(), 0.71)),
-            )),
-        );
-        plus.clone().on_hover_text("该目录的全部操作");
-        egui::Popup::menu(&plus).show(|ui| self.card_menu(ui, index, busy, &view));
+            if show.ver_local && show.ver_remote {
+                ver_row.label(RichText::new("·").size(10.5).color(weak));
+            }
+            if show.ver_remote {
+                ver_row.label(RichText::new(&remote).size(10.5).color(remote_color));
+            }
+        }
+        // 右侧竖排计数胶囊：可更新（原 ↓ 的活儿）、待提交（原 ↑ 的活儿）、本地差异（原 ↔ 的活儿），
+        // 整列垂直居中；差异那枚只对绑定过本地端的卡片出现，不拿一枚 0 冒充「已经比过了」
+        let update_tip = format!("服务器上有 {pending} 项本地还没更新\n点击立即更新该目录");
+        let commit_tip =
+            format!("本地有 {changed} 项待提交（口径同「全部上传」）\n点击打开该目录的提交页");
+        // 整张卡没有一件事可做（可更新 / 待提交 / 差异全是 0）时胶囊一起转绿，
+        // 这是「这目录很干净」的余光信号；只要有一件待办，0 的那几枚还是中性灰
+        let all_clear = pending == 0
+            && changed == 0
+            && view.local_diff.as_ref().is_none_or(|s| s.is_clean());
+        let mut pills: Vec<(String, bool, Color32, String)> = Vec::new();
+        if show.pending {
+            pills.push((format!("可更新 {}", capped(pending)), pending > 0, crate::AMBER, update_tip));
+        }
+        if show.changed {
+            pills.push((format!("待提交 {}", capped(changed)), changed > 0, crate::ACCENT, commit_tip));
+        }
+        if show.diff {
+            if let Some(summary) = view.local_diff.as_ref() {
+                pills.push((
+                    format!("差异 {}", capped(summary.total())),
+                    !summary.is_clean(),
+                    // 差异是「两边对不上」的提醒，走粉红；别跟可更新的琥珀撞色
+                    crate::ERR,
+                    self.local_diff_tip(index, summary, self.pool.comparing(index)),
+                ));
+            }
+        }
+        let mut update_clicked = false;
+        let mut commit_clicked = false;
+        let mut local_clicked = false;
+        if !pills.is_empty() {
+            let count = pills.len() as f32;
+            let total_h = count * MARK_H + (count - 1.0) * 4.0;
+            let col_rect = egui::Rect::from_min_max(
+                egui::pos2(pill_left, card.center().y - total_h / 2.0),
+                egui::pos2(pill_right, card.center().y + total_h / 2.0),
+            );
+            let mut col = ui.new_child(
+                egui::UiBuilder::new()
+                    .id(egui::Id::new(("dir_card_band", index)))
+                    .max_rect(col_rect)
+                    .layout(Layout::top_down(Align::Center))
+                    .sense(egui::Sense::hover()),
+            );
+            col.spacing_mut().item_spacing.y = 4.0;
+            for (text, active, hue, tip) in &pills {
+                let hit = self.count_badge(&mut col, text, *active, *hue, tip, all_clear);
+                // 点中哪一枚看文字前缀：跳页动作跟着各自原来的箭头标记走
+                if text.starts_with("可更新") {
+                    update_clicked = hit;
+                } else if text.starts_with("待提交") {
+                    commit_clicked = hit;
+                } else {
+                    local_clicked = hit;
+                }
+            }
+        }
 
         let mut tip = format!("{label}\n{path}\n");
         if let Some(info) = &view.info {
@@ -1548,6 +1583,8 @@ impl RepoApp {
                     .wrap_mode(egui::TextWrapMode::Extend),
             );
         });
+        // 右键弹操作菜单（在指针处打开）：原来右下角那枚「+」收进来了，卡片本身干净不少
+        egui::Popup::context_menu(&hit).show(|ui| self.card_menu(ui, index, busy, &view));
         if update_clicked && !busy {
             self.selected = Some(index);
             self.spawn_update(index);
@@ -1563,32 +1600,74 @@ impl RepoApp {
         (hit.clicked(), hit.double_clicked())
     }
 
-    /// 卡片右上角的圆角长方形计数标记：这个方向没有待办就是实心绿，有待办换成更深的黄。
+    /// 卡片右侧的圆角长方形计数标记：有 待办时按各自的语义色给「淡底 + 深字」，
+    /// 没有待办就是一枚中性灰胶囊；`all_clear`（整卡无待办）时全部转绿。
     /// 不走 `Button`：它的底色 / 描边 / 圆角 / 文字色分 inactive、hovered、active 三套 visuals，
     /// 鼠标进出就换一套，看着就是标记跳一下；`Frame` 不吃控件状态，进出画出来完全一样。
-    fn count_badge(&mut self, ui: &mut Ui, text: &str, active: bool, tip: &str) -> bool {
-        let fill = if active { MARK_BUSY } else { MARK_QUIET };
-        let [r, g, b, _] = fill.to_array();
-        // 数字颜色按底色亮度取近黑 / 近白，深浅两套主题都不用各调一遍
-        let text_color = if 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32 > 150.0 {
-            Color32::from_rgb(26, 20, 4)
+    fn count_badge(
+        &mut self,
+        ui: &mut Ui,
+        text: &str,
+        active: bool,
+        hue: Color32,
+        tip: &str,
+        all_clear: bool,
+    ) -> bool {
+        let (fill, text_color) = if all_clear {
+            pill_colors(ui, crate::OK, true)
         } else {
-            Color32::from_rgb(250, 252, 250)
+            pill_colors(ui, hue, active)
         };
-        let edge = Color32::from_rgb(
-            (r as f32 * 0.68) as u8,
-            (g as f32 * 0.68) as u8,
-            (b as f32 * 0.68) as u8,
-        );
         let chip = Frame::new()
             .fill(fill)
-            .stroke(egui::Stroke::new(1.0, edge))
             .corner_radius((MARK_H / 2.0).floor())
-            .inner_margin(egui::Margin::symmetric(5, 1))
+            // 上下 2/4：粗体数字的行高比常规字高 1px，去掉这 1px 才能凑足 MARK_H 的 20
+            .inner_margin(egui::Margin {
+                left: 5,
+                right: 5,
+                top: 2,
+                bottom: 4,
+            })
             .show(ui, |ui| {
+                // Extend：竖排布局下内容 ui 会给到整列宽度，缺省的 wrap 会让
+                // 「待提交 999+」这种最宽的组合折成两行，把胶囊撑高一倍。
+                // 数字单独拆段走 Name("bold") 粗体（fonts::install 保证该族已绑定）
+                let mut job = egui::text::LayoutJob::default();
+                let number_font = egui::FontId {
+                    size: MARK_FONT,
+                    family: egui::FontFamily::Name("bold".into()),
+                };
+                match text.rfind(' ') {
+                    Some(idx) => {
+                        job.append(
+                            &text[..=idx],
+                            0.0,
+                            egui::TextFormat::simple(
+                                egui::FontId::proportional(MARK_FONT),
+                                text_color,
+                            ),
+                        );
+                        job.append(
+                            &text[idx + 1..],
+                            0.0,
+                            egui::TextFormat::simple(number_font, text_color),
+                        );
+                    }
+                    None => {
+                        job.append(
+                            text,
+                            0.0,
+                            egui::TextFormat::simple(
+                                egui::FontId::proportional(MARK_FONT),
+                                text_color,
+                            ),
+                        );
+                    }
+                }
                 ui.add(
-                    egui::Label::new(RichText::new(text).size(MARK_FONT).color(text_color))
-                        .selectable(false),
+                    egui::Label::new(job)
+                        .selectable(false)
+                        .wrap_mode(egui::TextWrapMode::Extend),
                 );
             });
         // 感应区最后注册，压在字之上；0 的那枚点了没意义，所以按下也不响应
@@ -1602,13 +1681,13 @@ impl RepoApp {
 
     /// 「+」里收纳的操作菜单：一级是四个常用动作，「更多」下面接详细模式那份菜单
     fn card_menu(&mut self, ui: &mut Ui, index: usize, busy: bool, view: &DirView) {
-        if ui.button("↓ 更新").clicked() {
+        if ui.button("更新").clicked() {
             self.selected = Some(index);
             self.confirm_remove = None;
             self.spawn_update(index);
             ui.close();
         }
-        if ui.button("↑ 上传").clicked() {
+        if ui.button("上传").clicked() {
             self.selected = Some(index);
             self.open_commit(index);
             ui.close();
@@ -1750,7 +1829,7 @@ impl RepoApp {
         }
         if ui
             .button("全部上传")
-            .on_hover_text("所有目录用同一条说明一次提交（会改动服务器，需再点一次确认）")
+            .on_hover_text("所有目录使用同一条提交说明一次性提交（将改动服务器，需再次确认）")
             .clicked()
         {
             self.upload_all = Some(UploadAll {
@@ -1764,7 +1843,7 @@ impl RepoApp {
         }
         if ui
             .button("批量修改仓库")
-            .on_hover_text("服务器搬家时，一次把多个目录的仓库地址前缀一起换掉（每个目录单独起任务，需再点一次确认）")
+            .on_hover_text("服务器迁移时批量替换多个目录的仓库地址前缀（每个目录单独执行任务，需再次确认）")
             .clicked()
         {
             self.batch_relocate = Some(crate::BatchRelocate {
@@ -1926,7 +2005,7 @@ mod tests {
         let mut stage = Stage::new(false);
         let texts = stage.step(None);
         // 详细模式：整行的按钮都在，卡片的关键字一个都没有
-        assert!(Stage::rect_of(&texts, "↓ 更新").is_some(), "默认应该是详细样式");
+        assert!(Stage::rect_of(&texts, "更新").is_some(), "默认应该是详细样式");
         assert!(Stage::rect_of(&texts, "+").is_none());
 
         // 切换器自带两格，点哪一格就切到哪一档
@@ -1934,8 +2013,8 @@ mod tests {
         stage.step(Some(to_compact.center()));
         assert!(stage.app.cfg.home_compact, "点「简约」应该切成卡片样式");
         let texts = stage.step(None);
-        assert!(Stage::rect_of(&texts, "↓ 更新").is_none(), "简约模式下六个按钮都收起来了");
-        assert_eq!(Stage::rect_of(&texts, "+").map(|_| 1).unwrap_or(0), 1, "每张卡片一个「+」");
+        assert!(Stage::rect_of(&texts, "更新").is_none(), "简约模式下六个按钮都收起来了");
+        assert!(Stage::rect_of(&texts, "+").is_none(), "「+」按钮已移除，卡片上不该再有加号");
 
         let to_detail = Stage::rect_of(&texts, "详细").expect("切换器里应有「详细」那格");
         stage.step(Some(to_detail.center()));
@@ -2002,7 +2081,7 @@ mod tests {
         }
     }
 
-    /// 卡片是手摆的四角布局，只有跑一帧才知道文字有没有叠在一起、计数有没有真画出来
+    /// 卡片是手摆的块状布局，只有跑一帧才知道文字有没有叠在一起、计数有没有真画出来
     #[test]
     fn compact_card_paints_versions_and_counts() {
         let mut stage = Stage::new(true);
@@ -2011,17 +2090,17 @@ mod tests {
             "HRP",
             "本地 r120",
             "远端 r128",
-            "↓5",
-            "↑3",
+            "可更新 5",
+            "待提交 3",
             // 无待更新项时本地版本号按远端显示
             "本地 r200",
             "远端 r200",
-            "↓0",
-            "↑0",
+            "可更新 0",
+            "待提交 0",
             // 没检测到信息时的占位；1287 项要压成 999+ 才不会把标记撑出卡片
             "本地 —",
             "远端 —",
-            "↑999+",
+            "待提交 999+",
             "empty",
         ] {
             assert!(
@@ -2031,7 +2110,7 @@ mod tests {
             );
         }
         // 名称超长时按矩形宽度截断。注意 galley 里存的仍是原始整串文字，
-        // 只能量画出来的宽度：居中的名称区宽 = 148 - 左右各留 4 = 140
+        // 只能量画出来的宽度：左列宽 162，扣掉状态灯和间距后名称剩 145 上下
         let long = "这是一个故意写得很长的目录别名用来验证截断";
         let wide = texts
             .iter()
@@ -2039,7 +2118,7 @@ mod tests {
             .map(|(_, rect)| rect.width())
             .expect("超长别名那一行总得画出来");
         assert!(
-            wide <= 142.0,
+            wide <= 148.0,
             "超长别名没被截进名称区，实际画了 {wide:.0} 宽"
         );
 
@@ -2054,16 +2133,14 @@ mod tests {
         }
         assert!(collided.is_empty(), "文字重叠：{collided:?}");
 
-        // 卡片必须是正方形：名称、版本、标记、+ 全按边长排，画出来的块歪了说明算错
-        let squares: Vec<f32> = texts
-            .iter()
-            .filter(|(text, _)| text == "+")
-            .map(|(_, rect)| rect.height())
-            .collect();
-        assert_eq!(squares.len(), 4, "四张卡片四个「+」");
+        // 「+」已移除，卡片上不该再有任何加号文字
+        assert!(
+            Stage::rect_of(&texts, "+").is_none(),
+            "「+」按钮已移除，不该再画出加号"
+        );
     }
 
-    /// 形态要求逐项落地：名称居中、状态灯在左上、两枚淡绿标记一上一下右对齐、「+」是个圆
+    /// 形态要求逐项落地：名称带灯在左上、版本一行在左下、计数胶囊竖排贴右、右键出菜单
     #[test]
     fn compact_card_shape_and_corner_layout() {
         let mut stage = Stage::new(true);
@@ -2116,8 +2193,8 @@ mod tests {
         let cards: Vec<egui::Rect> = rects
             .iter()
             .filter(|(rect, radius, ..)| {
-                (rect.width() - CARD_SIZE).abs() < 0.6
-                    && (rect.height() - CARD_SIZE).abs() < 0.6
+                (rect.width() - CARD_W).abs() < 0.6
+                    && (rect.height() - CARD_H).abs() < 0.6
                     && *radius == 10
             })
             .map(|(rect, _, _, _)| *rect)
@@ -2131,7 +2208,7 @@ mod tests {
             squares.windows(2).all(|pair| near(pair[0].top(), pair[1].top())),
             "卡片要排成同一横行，不能歪到下一行：{squares:?}"
         );
-        // 「+」：30 见方、圆角 15 → 画出来就是个圆（填充和圆环在同一个 RectShape 里）
+        // 「+」已移除：卡片上不该再有任何 30 见方的圆形按钮
         assert_eq!(
             rects
                 .iter()
@@ -2141,8 +2218,8 @@ mod tests {
                         && *radius == 15
                 })
                 .count(),
-            4,
-            "四张卡片四个圆的「+」"
+            0,
+            "「+」按钮已移除，不该再有圆钮"
         );
 
         // 第一张卡片：服务器有 5 项待更新、本地有 3 项待提交
@@ -2150,41 +2227,40 @@ mod tests {
         let pills: Vec<(egui::Rect, Color32)> = rects
             .iter()
             .filter(|(rect, radius, ..)| {
-                *radius == 8
+                *radius == 10
                     && (rect.height() - MARK_H).abs() < 1.0
                     && card.contains_rect(*rect)
-                    && rect.center().y < card.center().y
             })
             .map(|(rect, _, fill, _)| (*rect, *fill))
             .collect();
-        assert_eq!(pills.len(), 2, "卡片右上角应该有两枚标记");
+        assert_eq!(pills.len(), 2, "卡片右侧应该有两枚计数胶囊");
         let (top, bottom) = if pills[0].0.top() <= pills[1].0.top() {
             (pills[0], pills[1])
         } else {
             (pills[1], pills[0])
         };
-        assert!(top.0.bottom() <= bottom.0.top(), "两枚标记要一上一下，不能叠");
+        assert!(top.0.bottom() <= bottom.0.top(), "两枚胶囊要一上一下，不能叠");
         assert!(
             near(top.0.right(), bottom.0.right()),
-            "两枚标记右边缘要对齐：{} vs {}",
+            "两枚胶囊右边缘要对齐：{} vs {}",
             top.0.right(),
             bottom.0.right()
         );
         assert!(
             near(card.max.x - top.0.right(), 10.0),
-            "标记要贴着卡片内边"
+            "胶囊列贴着卡片右内边"
         );
-        // 两枚都记着待办 → 都该是那个更深的黄
+        // 两枚都记着待办 → 各按自己的语义色出活跃淡底（待更新琥珀、待提交主色）
         assert_eq!(
             pills.iter().map(|(_, fill)| *fill).collect::<Vec<_>>(),
-            vec![MARK_BUSY, MARK_BUSY],
-            "有待办的标记要填深黄"
+            vec![tint(crate::AMBER, 44), tint(crate::ACCENT, 44)],
+            "有待办的标记按语义色填活跃淡底"
         );
-        // 第二张卡片两个方向都是 0 → 实心绿
+        // 第二张卡片三个方向都是 0 → 整卡全干净，两枚一起转绿
         let quiet_pills: Vec<Color32> = rects
             .iter()
             .filter(|(rect, radius, ..)| {
-                *radius == 8
+                *radius == 10
                     && (rect.height() - MARK_H).abs() < 1.0
                     && squares[1].contains_rect(*rect)
             })
@@ -2192,37 +2268,24 @@ mod tests {
             .collect();
         assert_eq!(
             quiet_pills,
-            vec![MARK_QUIET, MARK_QUIET],
-            "没有待办的标记要填绿色"
+            vec![tint(crate::OK, 44), tint(crate::OK, 44)],
+            "全干净卡片的标记要一起转绿"
         );
 
-        let plus = rects
-            .iter()
-            .find(|(rect, radius, ..)| *radius == 15 && card.contains_rect(*rect))
-            .map(|(rect, _, _, _)| *rect)
-            .expect("卡片里要有「+」");
-        assert!(near(plus.max.x, card.max.x - 10.0), "「+」贴右内边");
-        assert!(near(plus.max.y, card.max.y - 10.0), "「+」贴下内边");
-
-        // 名称居中、状态灯在左上、两行版本在左下
+        // 名称带状态灯在左上、版本一行在左下
         let texts = stage.step(None);
         let name = Stage::rect_of(&texts, "HRP").expect("名称");
         // 名称用的是字形紧贴的可见矩形，左右侧相机天然不完全对称，容差放宽到 2 像素
         let centered = |a: f32, b: f32| (a - b).abs() < 2.0;
         assert!(
-            centered(name.center().x, card.center().x),
-            "名称要横向摆在卡片正中，实际文字中心 {}，卡片中心 {}",
-            name.center().x,
-            card.center().x
+            name.max.y <= card.min.y + 30.0,
+            "名称要在卡片上部第一行，实际 {name:?}，卡片 {card:?}"
         );
         assert!(
-            centered(name.center().y, card.center().y),
-            "名称要纵向摆在卡片正中，实际文字中心 {}，卡片中心 {}",
-            name.center().y,
-            card.center().y
+            name.min.x >= card.min.x + 20.0,
+            "名称要排在状态灯右边"
         );
-        // 状态灯：place 进左上角一个 20 见方的格子，排版原点被居中推到格子中间，
-        // 所以这里量可见矩形落在左上角那一块里就行
+        // 状态灯：排在名称行最前面，量可见矩形落在卡片左上角那一块里就行
         let lamp = Stage::rect_of(&texts, "●").expect("状态灯");
         assert!(
             lamp.max.x <= card.min.x + 40.0 && lamp.max.y <= card.min.y + 40.0,
@@ -2230,19 +2293,24 @@ mod tests {
         );
         let local = found("本地 r120").1;
         let remote = found("远端 r128").1;
-        assert!(near(local.x, remote.x), "两行版本要左对齐");
+        assert!(
+            centered(local.y, remote.y),
+            "本地 / 远端版本要排在同一行：{} vs {}",
+            local.y,
+            remote.y
+        );
+        assert!(remote.x > local.x, "远端版本排在本地版本右边");
         assert!(near(local.x, card.min.x + 10.0), "版本行贴左内边");
-        assert!(local.y < remote.y, "远端版本在本地版本下面");
         // 远端有更新 → 用详细模式里「远端 rX（可更新 N 项）」的那个黄色；没更新的卡片保持弱色
-        assert_eq!(found("远端 r128").2, warn, "有可更新项时远端行要走警告色");
-        assert_eq!(found("本地 r120").2, found("远端 r44").2, "没得更新时两行同为弱色");
+        assert_eq!(found("远端 r128").2, warn, "有可更新项时远端段要走警告色");
+        assert_eq!(found("本地 r120").2, found("远端 r44").2, "没得更新时两段同为弱色");
         assert_ne!(found("远端 r44").2, warn, "另一张卡片没待更新项，不该跟着变黄");
     }
 
-    /// 标记胶囊按标记文字收口。以前交给 `Frame` 画在竖排居中的子 Ui 里，成员被沿横轴
-    /// 拉满整宽，胶囊就成了一个和卡片等宽的空盒子，把名称的视觉重量全抢走了
+    /// 标记色块按标记文字收口。以前交给 `Frame` 画在竖排居中的子 Ui 里，成员被沿横轴
+    /// 拉满整宽，块就成了一个和卡片等宽的空盒子，把名称的视觉重量全抢走了
     #[test]
-    fn compact_tag_pill_hugs_its_text() {
+    fn compact_tag_block_hugs_its_text() {
         let mut stage = Stage::new(true);
         stage.app.cfg.dirs[0].tag = "Java8".to_owned();
         stage.app.cfg.dirs[0].tag_color = "#B03A2E".to_owned();
@@ -2260,10 +2328,11 @@ mod tests {
             .collect();
         let pills: Vec<egui::Rect> = rects
             .iter()
-            .filter(|(_, radius)| *radius == 9)
+            // 标记现在是实心色块（圆角 4）；计数胶囊圆角 10、卡片圆角 10，都不会撞上
+            .filter(|(_, radius)| *radius == 4)
             .map(|(rect, _)| *rect)
             .collect();
-        assert_eq!(pills.len(), 1, "只有挂了标记的那张卡片该有胶囊");
+        assert_eq!(pills.len(), 1, "只有挂了标记的那张卡片该有色块");
         let pill = pills[0];
         let texts = stage.step(None);
         let text = Stage::rect_of(&texts, "Java8").expect("标记文字要画出来");
@@ -2277,17 +2346,19 @@ mod tests {
             .iter()
             .find(|(rect, radius)| {
                 *radius == 10
-                    && (rect.width() - CARD_SIZE).abs() < 0.6
+                    && (rect.width() - CARD_W).abs() < 0.6
                     && rect.contains_rect(pill)
             })
             .map(|(rect, _)| *rect)
             .expect("胶囊所在的那张卡片");
+        // 近黑近白容差 2 像素：胶囊现在左对齐贴左内边，不再居中
         assert!(
-            (card.center().x - pill.center().x).abs() < 2.0,
-            "胶囊要跟着名称横排居中：卡片中心 {}，胶囊中心 {}",
-            card.center().x,
-            pill.center().x
+            (card.min.x + 10.0 - pill.min.x).abs() < 2.0,
+            "胶囊要贴着卡片左内边：卡片左 {}，胶囊左 {}",
+            card.min.x,
+            pill.min.x
         );
+        assert!(pill.min.y > card.min.y + 20.0, "胶囊要在名称行下面");
         assert!(card.contains_rect(pill), "胶囊不许画出卡片");
         assert!(
             !Stage::rect_of(&texts, "HRP")
@@ -2313,7 +2384,7 @@ mod tests {
                 .iter()
                 .filter_map(|item| match &item.shape {
                     egui::Shape::Rect(rect)
-                        if rect.corner_radius.nw == 8
+                        if rect.corner_radius.nw == 10
                             && (rect.rect.height() - MARK_H).abs() < 1.0 =>
                     {
                         Some((rect.rect, rect.fill))
@@ -2322,13 +2393,31 @@ mod tests {
                 })
                 .collect();
             assert_eq!(chips.len(), 8, "{theme:?}：四张卡片八枚标记");
+            // 新配色：有待办的按各自语义色出淡底（深色主题半透明、浅色主题粉彩）；
+            // 全干净卡片一起转绿；只有半干净的 0 胶囊才是中性灰（第三张卡 changed=1287）
+            let (amber_active, accent_active, ok_active, quiet_fill) = match theme {
+                ThemePreference::Dark | ThemePreference::System => (
+                    tint(crate::AMBER, 44),
+                    tint(crate::ACCENT, 44),
+                    tint(crate::OK, 44),
+                    Color32::from_white_alpha(16),
+                ),
+                ThemePreference::Light => (
+                    pale(crate::AMBER, 0.16),
+                    pale(crate::ACCENT, 0.16),
+                    pale(crate::OK, 0.16),
+                    Color32::from_rgb(243, 245, 250),
+                ),
+            };
             assert!(
-                chips.iter().all(|(_, fill)| { *fill == MARK_QUIET || *fill == MARK_BUSY }),
-                "{theme:?}：标记底色只该是那两种实心色，实际 {chips:?}"
+                chips
+                    .iter()
+                    .all(|(_, fill)| [amber_active, accent_active, ok_active, quiet_fill].contains(fill)),
+                "{theme:?}：标记底色只该是语义淡底或中性灰，实际 {chips:?}"
             );
-            // 每张卡片右上角两枚：有以待办的第一张走深黄，两个方向都干净的第二张走绿
-            assert_eq!(chips[0].1, MARK_BUSY, "{theme:?}：有待办的标记该填深黄");
-            assert_eq!(chips[2].1, MARK_QUIET, "{theme:?}：没待办的标记该填实心绿");
+            // 每张卡片右上角两枚：有待办的第一枚走琥珀淡底，全干净的第二张整对转绿
+            assert_eq!(chips[0].1, amber_active, "{theme:?}:有待办的标记该填琥珀淡底");
+            assert_eq!(chips[2].1, ok_active, "{theme:?}：全干净卡片的标记该转绿");
             // 数字压在底色上，两者相同就直接糊了
             let labels: Vec<(egui::Rect, Color32)> = out
                 .shapes
@@ -2374,7 +2463,7 @@ mod tests {
             Stage::rect_of(&texts, "正在检测 …").is_none(),
             "忙碌时不该再显示任务文字"
         );
-        for label in ["HRP", "本地 r120", "远端 r128", "↓5", "↑3"] {
+        for label in ["HRP", "本地 r120", "远端 r128", "可更新 5", "待提交 3"] {
             assert!(
                 Stage::rect_of(&texts, label).is_some(),
                 "转圈不该挤掉卡片原有的「{label}」"
@@ -2383,16 +2472,16 @@ mod tests {
         let _ = quiet;
     }
 
-    /// 「+」点开是一级菜单，悬停「更多」接出二级菜单：两级都要真能出来
+    /// 右键卡片弹出一级菜单，悬停「更多」接出二级菜单：两级都要真能出来
     #[test]
     fn plus_menu_expands_two_levels() {
         let mut stage = Stage::new(true);
         let texts = stage.step(None);
-        let plus = Stage::rect_of(&texts, "+").expect("卡片右下角要有「+」");
-        stage.step(Some(plus.center()));
+        let card = Stage::rect_of(&texts, "HRP").expect("第一张卡片");
+        stage.right_click(card.center());
         let texts = stage.step(None);
-        for label in ["↓ 更新", "↑ 上传", "历史", "打开目录", "移除"] {
-            assert!(Stage::rect_of(&texts, label).is_some(), "「+」菜单里应有「{label}」");
+        for label in ["更新", "上传", "历史", "打开目录", "移除"] {
+            assert!(Stage::rect_of(&texts, label).is_some(), "右键菜单里应有「{label}」");
         }
         // 二级菜单靠悬停展开（点「更多」反而会把整层菜单收掉）；
         // 子菜单按钮的文字里带着右箭头，只能按前缀找
@@ -2410,7 +2499,7 @@ mod tests {
         );
     }
 
-    /// 绑定过本地端的卡片多一枚 ↔ 标记：它跟 ↓ 并排在第一行，不能把第三行顶到名称上
+    /// 绑定过本地端的卡片多一枚「差异」胶囊：它排在计数列的最下面，不能顶出卡片
     #[test]
     fn compact_card_gains_a_local_diff_pill() {
         let mut stage = Stage::new(true);
@@ -2423,25 +2512,19 @@ mod tests {
             ..Default::default()
         });
         let texts = stage.step(None);
-        let local = Stage::rect_of(&texts, "↔8").expect("绑定过本地端就该画出差异那枚");
-        let update = Stage::rect_of(&texts, "↓5").expect("可更新那枚还得在");
-        assert!(
-            (local.center().y - update.center().y).abs() < 3.0,
-            "↔ 与 ↓ 要并排在同一行，另起一行会顶到居中的名称：{local:?} vs {update:?}"
-        );
-        assert!(local.max.x <= update.min.x + 0.5, "↔ 排在 ↓ 的左边");
+        let diff = Stage::rect_of(&texts, "差异 8").expect("绑定过本地端就该画出差异那枚");
+        let update = Stage::rect_of(&texts, "可更新 5").expect("可更新那枚还得在");
+        let commit = Stage::rect_of(&texts, "待提交 3").expect("待提交那枚还得在");
+        // 竖排顺序：可更新 → 待提交 → 差异；三枚加间距 59，正好在 92 高的卡里垂直居中
+        assert!(update.max.y <= commit.min.y, "待提交要排在可更新下面");
+        assert!(commit.max.y <= diff.min.y, "差异要排在待提交下面");
         let name = Stage::rect_of(&texts, "HRP").expect("卡片名称");
-        assert!(local.max.y < name.min.y, "标记整块要在名称之上：{local:?} vs {name:?}");
-        // 没绑定本地端的卡片不画这枚，更不能画一枚 ↔0 冒充「已经比过了」
-        assert!(Stage::rect_of(&texts, "↔0").is_none(), "没绑定本地端的卡片不该有这枚");
-        // 文字画出来了不代表有字形：字体缺这个字会是方块，galley 里照样是「↔」。
-        // 本机实测 msyh 只认 ↔，⇄ / ↕ / ⇅ 全画成方块，所以别随手换箭头。
         assert!(
-            stage
-                .ctx
-                .fonts_mut(|fonts| fonts.has_glyph(&egui::FontId::proportional(MARK_FONT), '↔')),
-            "「↔」在装的字体里没有字形，会画成方块"
+            diff.min.x > name.max.x,
+            "计数列要整个排在名称右边：{diff:?} vs {name:?}"
         );
+        // 没绑定本地端的卡片不画这枚，更不能画一枚「差异 0」冒充「已经比过了」
+        assert!(Stage::rect_of(&texts, "差异 0").is_none(), "没绑定本地端的卡片不该有这枚");
     }
 
     /// 详细行末尾那六个按钮在最小窗口宽度下只剩一百来像素余量，
@@ -2479,7 +2562,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("900 宽的一帧里没画出「{label}」"))
         };
         let local = rect_of("本地差异 546 项");
-        let upload = rect_of("↑ 上传");
+        let upload = rect_of("上传");
         assert!(
             !local.intersects(upload),
             "本地差异标记压到了行尾按钮：{local:?} vs {upload:?}"
@@ -2550,15 +2633,10 @@ mod tests {
             let calm = painted_bounds(&mut stage, None);
             let chip = *calm
                 .iter()
-                .find(|rect| (rect.height() - MARK_H).abs() < 1.0 && rect.width() < 60.0)
+                .find(|rect| (rect.height() - MARK_H).abs() < 1.0 && rect.width() < PILL_W + 2.0)
                 .expect("没画出计数标记");
-            let plus = *calm
-                .iter()
-                .find(|rect| near(rect.width(), 30.0) && near(rect.height(), 30.0))
-                .expect("没画出「+」");
             for (name, target) in [
                 ("计数标记", chip.center()),
-                ("「+」", plus.center()),
                 ("卡片空白", chip.center() + egui::vec2(-40.0, 60.0)),
             ] {
                 let hot = painted_bounds(&mut stage, Some(target));
@@ -2926,12 +3004,13 @@ mod tests {
             stage.app.dirs.push(DirView::default());
         }
         let texts = stage.run(vec![]);
-        let plus = Stage::rect_of(&texts, "+").expect("卡片右下角的「+」");
-        stage.step(Some(plus.center()));
+        let card = Stage::rect_of(&texts, "HRP").expect("第一张卡片");
+        stage.right_click(card.center());
         // 弹层要第二帧才画得出来
         let texts = stage.step(None);
-        // 按第二项：它往下挪了一档，纵向正好压在第二行那张卡片上
-        let item = Stage::rect_of(&texts, "↑ 上传").expect("卡片菜单里的「↑ 上传」");
+        // 按第三项「历史」：宽行卡片一行放五张，一级菜单的第三项纵向正好压在
+        // 第二行那张卡片上（第二项「上传」会落进两行之间的缝隙，这一测就空跑了）
+        let item = Stage::rect_of(&texts, "历史").expect("卡片菜单里的「历史」");
         assert!(
             stage
                 .app

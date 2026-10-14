@@ -131,7 +131,7 @@ impl RepoApp {
                         ui.spinner();
                         ui.label(RichText::new("正在修改 …").weak().size(11.5));
                     } else if !new_url.is_empty() && new_url == current {
-                        ui.label(RichText::new("新旧地址一样").weak().size(11.5));
+                        ui.label(RichText::new("新地址与原地址相同").weak().size(11.5));
                     }
                 });
                 if field.has_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -143,7 +143,7 @@ impl RepoApp {
                     }
                 }
                 ui.label(
-                    RichText::new("提示：svn 会连新地址校验仓库标识，地址写错只是执行失败，不会弄坏工作副本。")
+                    RichText::new("提示：svn 将连接新地址校验仓库标识；地址有误仅会导致执行失败，不会损坏工作副本。")
                         .weak()
                         .size(11.5),
                 );
@@ -379,11 +379,11 @@ impl RepoApp {
                         .clicked()
                     {
                         dialog.confirm = true;
-                        self.hint("每个目录会单独执行一次改地址：核对上面的预览后，再点一次「确认改地址」");
+                        self.hint("每个目录将单独执行一次改地址：核对上方预览后，再次点击「确认改地址」");
                     }
                     if picked == 0 && !rows.is_empty() {
                         ui.label(
-                            RichText::new("填好一对前缀，把地址以「原地址前缀」开头的目录勾上")
+                            RichText::new("填写一对前缀，勾选地址以「原地址前缀」开头的目录")
                                 .weak()
                                 .size(11.5),
                         );
@@ -517,7 +517,7 @@ impl RepoApp {
                         dialog.checked.iter_mut().for_each(|checked| *checked = false);
                     }
                     if picked == 0 {
-                        ui.label(RichText::new("先勾上要修改的目录").weak().size(11.5));
+                        ui.label(RichText::new("请先勾选要修改的目录").weak().size(11.5));
                     }
                 });
                 ScrollArea::vertical()
@@ -692,7 +692,7 @@ impl RepoApp {
                     {
                         dialog.confirm = true;
                         self.hint(format!(
-                            "回退会改动{scope}的本地文件：核对上面的路径后，再点一次「确认回退」"
+                            "回退将改动{scope}的本地文件：核对上方路径后，再次点击「确认回退」"
                         ));
                     }
                     if running {
@@ -845,7 +845,7 @@ impl RepoApp {
                                     )
                                     .on_hover_text(
                                         "该目录还没更新到最新版本：服务器上还有没拉到本地的新改动，\
-                                         这次上传是在旧基线上做的；可以勾掉它先回主页点「↓ 更新」",
+                                         这次上传是在旧基线上做的；可以勾掉它先回主页点「更新」",
                                     );
                                 }
                                 if *running {
@@ -871,8 +871,8 @@ impl RepoApp {
                                 .color(ink(ui, Color32::from_rgb(240, 100, 100))),
                         )
                         .on_hover_text(
-                            "这些目录服务器上还有没拉到本地的新改动，这次上传是在旧基线上做的；\
-                             别人也动过同一处就会撞出冲突。要避开就取消、先更新它们再来。",
+                            "这些目录在服务器上存在尚未同步到本地的新改动，本次上传将基于旧基线执行；\
+                             若他人也修改了同一处，将产生冲突。如需避免，请取消后先更新这些目录。",
                         );
                     }
                 });
@@ -905,7 +905,7 @@ impl RepoApp {
                                         let label = self.dir_label(index);
                                         self.push(
                                             Level::Warning,
-                                            format!("{label}：{warning}，建议先「↓ 更新」再上传"),
+                                            format!("{label}：{warning}，建议先「更新」再上传"),
                                         );
                                     }
                                     self.spawn_upload_all(index, message.clone());
@@ -940,7 +940,7 @@ impl RepoApp {
                         .clicked()
                     {
                         dialog.confirm = true;
-                        self.hint("这一步会改动服务器：核对上面的目录后，再点一次「确认上传」");
+                        self.hint("此操作将改动服务器：核对上方目录后，再次点击「确认上传」");
                     }
                     if total == 0 {
                         ui.label(RichText::new("目录列表是空的").weak().size(11.5));

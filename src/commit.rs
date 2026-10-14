@@ -170,12 +170,12 @@ impl RepoApp {
         if self.dir_kind(index) == RepoKind::Git {
             let Some(git) = self.git_or_none() else { return };
             if plan.targets.is_empty() {
-                self.hint("请先勾选要提交的文件（新增 / 修改 / 删除可以一起提交）");
+                self.hint("请先勾选要提交的文件（新增、修改、删除项可一并提交）");
                 return;
             }
             // git 不收空的提交说明（svn 可以留空，git 会直接拒掉）
             if message.trim().is_empty() {
-                self.hint("Git 提交需要提交说明：请先在「提交备注」里写明这次改了什么");
+                self.hint("Git 提交需要提交说明：请先在「提交备注」中填写本次修改内容");
                 return;
             }
             if self.pool.has(Kind::Commit, index) {
@@ -198,7 +198,7 @@ impl RepoApp {
             return;
         };
         if plan.targets.is_empty() {
-            self.hint("请先勾选要提交的文件（新增 / 修改 / 删除可以一起提交）");
+            self.hint("请先勾选要提交的文件（新增、修改、删除项可一并提交）");
             return;
         }
         if self.pool.has(Kind::Commit, index) {
@@ -229,7 +229,7 @@ impl RepoApp {
             let Some(git) = self.git_or_none() else { return };
             // git 不收空的提交说明（svn 可以留空，git 会直接拒掉）
             if message.trim().is_empty() {
-                self.hint("Git 提交需要提交说明：请补一句说明再上传");
+                self.hint("Git 提交需要提交说明：请先填写提交说明");
                 return;
             }
             if self.pool.has(Kind::Commit, index) {
@@ -357,6 +357,14 @@ impl RepoApp {
             }
             ui.label(RichText::new(format!("上传 / 提交：{}", page.label)).size(17.0).strong());
             ui.label(RichText::new(path.display().to_string()).size(12.0).weak());
+            // 仓库地址跟在本地路径后面，同一行放得下就一行说完
+            if !url.is_empty() {
+                ui.label(
+                    RichText::new(format!("→ {url}"))
+                        .size(12.0)
+                        .color(ink(ui, Color32::from_rgb(140, 205, 255))),
+                );
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if writing || reading || diffing {
                     ui.spinner();
@@ -367,13 +375,6 @@ impl RepoApp {
                 }
             });
         });
-        if !url.is_empty() {
-            ui.label(
-                RichText::new(format!("→ {url}"))
-                    .size(12.0)
-                    .color(ink(ui, Color32::from_rgb(140, 205, 255))),
-            );
-        }
         // 上传前先亮出基线：服务器上还有没拉到本地的新改动时，这次提交是在旧基线上改出来的，
         // 别人也动过同一处就会撞出冲突。点这一句直接跑该目录的 svn update；有写操作在执行时
         // 不给点——避免更新和提交同时改一个工作副本。
@@ -406,7 +407,8 @@ impl RepoApp {
 
         let (added, modified, deleted, blocked) = page.counts();
         let total = page.entries.len();
-        ui.horizontal(|ui| {
+        ui.aligned_row(|ui| {
+            // 统计和操作按钮合并成一行：左边是口径，右边是动作
             ui.label(RichText::new(format!("本次修改内容：共 {total} 项")).strong().size(13.5));
             ui.label(
                 RichText::new(format!("新增 {added}"))
@@ -430,13 +432,12 @@ impl RepoApp {
                         .size(12.5),
                 );
             }
-        });
-        ui.aligned_row(|ui| {
+            ui.label(RichText::new("|").weak());
             // 「全选」是字面意义全勾（含冲突）；计数只认能提交的条目，冲突等特殊状态
             // 勾上了也不会进提交——默认进场就是按 uploadable 勾好的，一般用不着它
             if ui
                 .button("全选")
-                .on_hover_text("勾上列表里的所有条目。注意：冲突等必须先人工处理的状态即使勾上也不会被提交；要回到默认勾选请点「只选可提交项」")
+                .on_hover_text("勾选列表中的所有条目。注意：冲突等须先人工处理的状态，即使勾选也不会被提交；如需恢复默认勾选，请点击「只选可提交项」")
                 .clicked()
             {
                 for entry in page.entries.iter_mut() {
@@ -450,7 +451,7 @@ impl RepoApp {
             }
             if ui
                 .button("只选可提交项")
-                .on_hover_text("恢复默认勾选：能随上传走的全部勾上（? 自动 add、! 自动 delete 也算），冲突等先人工处理的不勾")
+                .on_hover_text("恢复默认勾选：勾选所有可随本次上传提交的条目（含 ? 自动 add、! 自动 delete），冲突等须先人工处理的条目不勾选")
                 .clicked()
             {
                 for entry in page.entries.iter_mut() {
@@ -544,6 +545,8 @@ impl RepoApp {
         let deletes = page.selected_targets(Maintain::Delete);
         // 备注框和右边的提交按钮共用这一个高度，两边都按它 sizing，底部才对得齐
         let note_height = 60.0;
+        // 「提交并关闭」点中后要离开提交页：闭包里 return 出不去，先记下来在外面收尾
+        let mut close_page = false;
         ui.aligned_row(|ui| {
             let width = (ui.available_width() - 140.0).max(240.0);
             ui.add_sized(
@@ -595,15 +598,33 @@ impl RepoApp {
                 let button =
                     egui::Button::new(RichText::new(caption).size(14.0).strong().color(text))
                         .fill(fill);
-                let response = ui.add_sized(Vec2::new(126.0, note_height), button);
+                // 两个提交按钮共用同一套拦截判断：Some(false) 提交后留在本页，Some(true) 提交完回目录页
+                // 上下摞在一起，宽度对齐；「提交并关闭」不参与换色（armed 时主按钮已经够醒目）
+                let mut action: Option<bool> = None;
+                let response = ui
+                    .add_sized(Vec2::new(126.0, 26.0), button)
+                    .on_hover_text("提交后停留在本页，可继续查看结果");
                 if response.clicked() {
+                    action = Some(false);
+                }
+                if ui
+                    .add_sized(
+                        Vec2::new(126.0, 26.0),
+                        egui::Button::new(RichText::new("提交并关闭").size(13.5)),
+                    )
+                    .on_hover_text("提交后直接返回目录页；任务在后台继续执行，可在任务区查看进度")
+                    .clicked()
+                {
+                    action = Some(true);
+                }
+                if let Some(close_after) = action {
                     match blocked {
                         Some(why) => self.hint(why),
                         // 还没确认过就先拦住，只说明后果，不上传
                         None if outdated.is_some() && !page.confirm_outdated => {
                             page.confirm_outdated = true;
                             self.hint(format!(
-                                "{}——再点一次「仍要提交」才会按本地版本上传，或点上面的提示条先更新到最新",
+                                "{}：再次点击「仍要提交」将按本地版本上传，也可先通过上方提示条更新到最新",
                                 outdated.unwrap_or_default()
                             ));
                         }
@@ -619,7 +640,7 @@ impl RepoApp {
                                 Some(warning) => {
                                     self.push(
                                         Level::Warning,
-                                        format!("{warning}，建议先「↓ 更新」再上传"),
+                                        format!("{warning}，建议先「更新」再上传"),
                                     );
                                     self.hint(format!(
                                         "{warning}；仍按本地当前版本提交 {picked_count} 项 …"
@@ -638,6 +659,10 @@ impl RepoApp {
                                 },
                                 page.message.clone(),
                             );
+                            if close_after {
+                                // 任务已在后台跑起来，这里直接回目录页；下面统一收尾
+                                close_page = true;
+                            }
                         }
                     }
                 }
@@ -672,6 +697,12 @@ impl RepoApp {
                 }
             });
         });
+        if close_page {
+            // 提交并关闭：任务留在任务池里继续跑，页面直接回目录（不写回提交页状态）
+            self.back_to_main();
+            self.commit = None;
+            return;
+        }
         ui.separator();
 
         let filter = page.filter.trim().to_owned();
@@ -844,9 +875,9 @@ impl RepoApp {
                 if ui
                     .checkbox(&mut ignore, "忽略空白与换行")
                     .on_hover_text(
-                        "XML 文件默认已勾选（本项目的 XML 常被编辑器整体改掉缩进或换行符 CRLF↔LF，\
-                         不忽略时 svn 会把整份文件报成改动，看不出真正改了哪几行），其余文件默认不勾。\n\
-                         勾选后按 svn diff -x \"-w --ignore-eol-style\" 比较；取消勾选可看到原始差异。",
+                        "XML 文件默认勾选（此类文件的缩进与换行符常被编辑器整体改写（CRLF↔LF），\
+                         不忽略时 svn 会将整份文件报告为改动，无法体现实际修改的行），其余文件默认不勾选。\n\
+                         勾选后按 svn diff -x \"-w --ignore-eol-style\" 比较；取消勾选可查看原始差异。",
                     )
                     .changed()
                 {
@@ -1070,7 +1101,7 @@ fn git_commit_run(
         let mut text =
             format!("{label}：提交已在本地完成（{count} 项），但推送失败——{}", pushed.summary());
         if rejected {
-            text.push_str("\n（远端有你本地没有的提交：先「↓ 更新」拉下来，核对后再提交一次）");
+            text.push_str("\n（远端有你本地没有的提交：先「更新」拉下来，核对后再提交一次）");
         }
         text
     };
@@ -1310,7 +1341,7 @@ mod tests {
         let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "提交 1 项").center());
         assert!(app.commit.as_ref().unwrap().confirm_outdated, "第一下该只拦住");
         assert!(!app.pool.has(Kind::Commit, 0), "拦住的这一下不能起提交任务");
-        assert!(app.log_tail().contains("再点一次"), "{}", app.log_tail());
+        assert!(app.log_tail().contains("再次点击"), "{}", app.log_tail());
 
         // 按钮文案与退路按钮要再跑一帧才画得出来：这一帧的文案是帧首算好的
         let drawn = commit_frame(&ctx, &mut app);
