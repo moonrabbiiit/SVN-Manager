@@ -772,8 +772,40 @@ impl RepoApp {
         });
     }
 
+    /// 配置里各目录在用的分组名：去重、排序，排除 exclude（自己当前的那份，点了也是白点）
+    pub(crate) fn existing_groups(&self, exclude: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .cfg
+            .dirs
+            .iter()
+            .map(|d| d.group.trim().to_owned())
+            .filter(|g| !g.is_empty() && g != exclude)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// 配置里各目录在用的标记：名字 + 首次出现时的颜色（套用旧标记时颜色一并沿用），
+    /// 去重、按名字排序，排除 exclude
+    pub(crate) fn existing_tags(&self, exclude: &str) -> Vec<(String, String)> {
+        let mut tags: Vec<(String, String)> = Vec::new();
+        for dir in &self.cfg.dirs {
+            let name = dir.tag.trim();
+            if name.is_empty() || name == exclude {
+                continue;
+            }
+            if !tags.iter().any(|(seen, _)| seen == name) {
+                tags.push((name.to_owned(), dir.tag_color.clone()));
+            }
+        }
+        tags.sort_by(|a, b| a.0.cmp(&b.0));
+        tags
+    }
+
     /// 分组输入框：详细模式画在目录行的路径后面，简约模式画在列表上方那一行。
-    /// Enter 或点别处提交，Esc 取消，留空取消分组（交互同别名编辑）
+    /// Enter 或点别处提交，Esc 取消，留空取消分组（交互同别名编辑）。
+    /// 编辑期间输入框下方挂着在用的分组名，点一下直接套上，不必每次手敲
     fn group_editor(&mut self, ui: &mut Ui, index: usize) {
         let field = ui.add(
             TextEdit::singleline(&mut self.group_buf)
@@ -805,6 +837,42 @@ impl RepoApp {
                 });
             }
         }
+        // 在用分组下拉：点一下直接套上。编辑器函数只在编辑期间被调，这里不用再查状态；
+        // 点下拉项会先让输入框失焦（按当前内容空提交一次，预填时等于没改），随即套上新分组
+        let names = self.existing_groups(self.cfg.dirs[index].group.trim());
+        if !names.is_empty() {
+            egui::Popup::from_response(&field)
+                .open(true)
+                .gap(2.0)
+                .show(|ui| {
+                    ui.set_min_width(140.0);
+                    ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for name in &names {
+                                if ui
+                                    .add(egui::Button::new(RichText::new(name.clone())).small())
+                                    .clicked()
+                                {
+                                    self.apply_group(index, name);
+                                }
+                            }
+                        });
+                });
+        }
+    }
+
+    /// 套用在用分组：写回并关闭编辑行，口径与手输提交一致
+    fn apply_group(&mut self, index: usize, text: &str) {
+        self.group_buf = text.to_owned();
+        self.edit_group = None;
+        if self.cfg.dirs[index].group != text {
+            self.cfg.dirs[index].group = text.to_owned();
+            self.persist();
+        }
+        let label = self.dir_label(index);
+        self.hint(format!("{label} 已归入分组：{text}"));
     }
 
     /// 标记编辑行：一段文字 + 一枚 RGB 取色按钮（egui 自带的取色弹层：RGB / HSV 滑块与
@@ -851,7 +919,46 @@ impl RepoApp {
                     format!("标记已改为：{text}")
                 });
             }
+            // 在用标记下拉：点一下连名字带颜色一起套上，口径与手输提交一致
+            let tags = self.existing_tags(self.cfg.dirs[index].tag.trim());
+            if !tags.is_empty() {
+                egui::Popup::from_response(&field)
+                    .open(true)
+                    .gap(2.0)
+                    .show(|ui| {
+                        ui.set_min_width(140.0);
+                        ScrollArea::vertical()
+                            .max_height(160.0)
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                for (name, color) in &tags {
+                                    let [r, g, b] = tag_color_rgb(color);
+                                    let dot = RichText::new("● ").color(Color32::from_rgb(r, g, b));
+                                    let label = RichText::new(name.clone());
+                                    if ui
+                                        .add(egui::Button::new((dot, label)).small())
+                                        .clicked()
+                                    {
+                                        self.apply_tag(index, name, color);
+                                    }
+                                }
+                            });
+                    });
+            }
         });
+    }
+
+    /// 套用在用标记：名字与颜色一起写回并关闭编辑行；名字没变就不动（免得把
+    /// 用户刚选的颜色覆盖掉）
+    fn apply_tag(&mut self, index: usize, text: &str, color: &str) {
+        self.tag_buf = text.to_owned();
+        self.edit_tag = None;
+        if self.cfg.dirs[index].tag != text {
+            self.cfg.dirs[index].tag = text.to_owned();
+            self.cfg.dirs[index].tag_color = color.to_owned();
+            self.persist();
+        }
+        self.hint(format!("标记已改为：{text}"));
     }
 
     /// 主页最右侧的样式切换器：两个选项同在一只圆角长方形里，当前那项被一个框圈住。
@@ -1946,7 +2053,7 @@ mod tests {
     use super::*;
     use crate::config;
     use crate::jobs::{Data, Kind};
-    use crate::testbed::{base_input, Stage};
+    use crate::testbed::{base_input, stub_app, Stage};
     use egui::{Pos2, Rect, ThemePreference};
 
     /// 添加目录这条横栏里，输入框要和同一行的按钮一样高（他点名要的一致）：
@@ -3033,5 +3140,60 @@ mod tests {
         // 只按不放：松手会真点了这一项，而起不起拖在两帧里就看得出来
         assert!(stage.app.drag_pending.is_none(), "按在弹层上不该登记拖动按下");
         assert!(stage.app.drag.is_none(), "按在弹层上满 1 秒也不该起拖");
+    }
+
+    /// 在用分组 / 标记的取值口径：去重、排序、排除自己当前的那份；
+    /// 标记取首次出现时的颜色，套用旧标记时颜色能一并沿用
+    #[test]
+    fn existing_groups_and_tags_dedupe_and_exclude() {
+        let mut app = stub_app(false);
+        app.cfg.dirs[0].group = "生产".to_owned();
+        app.cfg.dirs[0].tag = "核心".to_owned();
+        app.cfg.dirs[0].tag_color = "#FF0000".to_owned();
+        app.cfg.dirs[1].group = "生产".to_owned();
+        app.cfg.dirs[1].tag = "备份".to_owned();
+        app.cfg.dirs[2].group = "测试".to_owned();
+
+        assert_eq!(app.existing_groups("生产"), vec!["测试".to_owned()]);
+        assert_eq!(
+            app.existing_groups(""),
+            vec!["测试".to_owned(), "生产".to_owned()]
+        );
+        // 标记按名字去重，颜色取首次出现那份
+        let tags = app.existing_tags("");
+        assert_eq!(
+            tags,
+            vec![
+                ("备份".to_owned(), String::new()),
+                ("核心".to_owned(), "#FF0000".to_owned()),
+            ]
+        );
+        // 排除掉自己正在编辑的标记，列表里就不再出现「点了也是白点」的那项
+        assert!(app.existing_tags("核心").iter().all(|(name, _)| name != "核心"));
+    }
+
+    /// 分组编辑行打开时输入框下方挂着在用分组名，点一下直接套上（不用再手敲）
+    #[test]
+    fn group_editor_suggestion_applies_on_click() {
+        let _appdata = crate::testbed::lock_appdata();
+        std::env::set_var(
+            "APPDATA",
+            std::env::temp_dir().join("repo_manager_group_suggest_test"),
+        );
+        let mut stage = Stage::new(true);
+        stage.app.cfg.dirs[1].group = "生产".to_owned();
+        // 直接开 HRP 的分组编辑行：真实入口在右键菜单，菜单链路另有测试覆盖
+        stage.app.edit_group = Some(0);
+        let mut texts = stage.step(None);
+        // 弹层第一帧是 sizing pass，形状可能不出，再稳一帧
+        texts = stage.step(None);
+        let chip = Stage::rect_of(&texts, "生产")
+            .unwrap_or_else(|| panic!("编辑行下方应挂在用分组名「生产」：{texts:?}"));
+        stage.step(Some(chip.center()));
+        assert_eq!(
+            stage.app.cfg.dirs[0].group, "生产",
+            "点在用分组要直接套上"
+        );
+        assert!(stage.app.edit_group.is_none(), "套用后编辑行要关掉");
     }
 }

@@ -490,6 +490,22 @@ impl RepoApp {
                     group_field.request_focus();
                     dialog.focus = false;
                 }
+                // 在用分组一键取用：点一下填进输入框，勾选范围仍由下面的列表决定
+                let groups = self.existing_groups("");
+                if !groups.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(RichText::new("在用分组：").weak().size(11.0));
+                        for name in groups {
+                            if ui
+                                .add(egui::Button::new(RichText::new(name.clone())).small())
+                                .clicked()
+                            {
+                                dialog.group = name;
+                            }
+                        }
+                    });
+                }
                 ui.add_space(3.0);
                 ui.label(RichText::new("标记").strong().size(12.5));
                 ui.aligned_row(|ui| {
@@ -507,6 +523,28 @@ impl RepoApp {
                         dialog.tag_hex = crate::home::tag_color_hex(rgb);
                     }
                 });
+                // 在用标记一键取用：点一下名字与颜色一起填进输入框
+                let tags = self.existing_tags("");
+                if !tags.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(RichText::new("在用标记：").weak().size(11.0));
+                        for (name, color) in tags {
+                            let [r, g, b] = crate::home::tag_color_rgb(&color);
+                            let dot = RichText::new("● ").color(Color32::from_rgb(r, g, b));
+                            let label = RichText::new(name.clone());
+                            if ui
+                                .add(egui::Button::new((dot, label)).small())
+                                .clicked()
+                            {
+                                dialog.tag = name;
+                                if !color.is_empty() {
+                                    dialog.tag_hex = color;
+                                }
+                            }
+                        }
+                    });
+                }
                 ui.add_space(5.0);
                 ui.aligned_row(|ui| {
                     ui.label(RichText::new("要修改的目录").strong().size(12.5));
