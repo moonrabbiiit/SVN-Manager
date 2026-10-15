@@ -417,6 +417,10 @@ impl RepoApp {
                     "每次从服务器读多少条提交。\n\
                      选了下面的日期区间时改由区间决定读多少条，这个值暂时不生效。",
                 );
+                // 这一行的控件同一档高度：搜索大框、框内输入框、右边的数字框都按它 sizing。
+                // 往上取整是因为按钮/数字框画出来按整像素的行高算（control_height 带小数），
+                // 不取整大框就比它们矮半档
+                let row_h = crate::ui::control_height(ui).ceil();
                 ui.add_enabled(
                     by_count && !page.unlimited,
                     egui::DragValue::new(&mut page.limit).range(1..=2000).speed(5),
@@ -434,12 +438,14 @@ impl RepoApp {
                 let group_w = (400.0 + chrome).min(room);
                 let input_w = (group_w - chrome).max(60.0);
                 let group = ui.allocate_ui_with_layout(
-                    Vec2::new(group_w, 24.0),
+                    Vec2::new(group_w, row_h),
                     Layout::top_down(Align::Min),
                     |ui| {
                         Frame::new()
                             .corner_radius(6.0)
-                            .inner_margin(egui::Margin::symmetric(6, 1))
+                            // 纵向不留边：里面那一格只让出描边的 2 像素（row_h - 2），
+                            // 这里再留边大框就比旁边的数字框高一档
+                            .inner_margin(egui::Margin::symmetric(6, 0))
                             .fill(ui.style().visuals.extreme_bg_color)
                             .stroke(egui::Stroke::new(
                                 1.0,
@@ -450,17 +456,28 @@ impl RepoApp {
                                 // 否则按钮会跑到输入框左边、顺序还是反的
                                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing.x = 3.0;
-                                    ui.add_sized(
-                                        Vec2::new(input_w, 20.0),
-                                        TextEdit::singleline(&mut page.filter)
-                                            // 这个分支的 frame() 收 Frame 不是 bool：给个透明无描边的，
-                                            // 让外面那只大框成为唯一的边
-                                            .frame(
-                                                Frame::new()
-                                                    .fill(Color32::TRANSPARENT)
-                                                    .stroke(egui::Stroke::NONE),
-                                            )
-                                            .hint_text("按说明 / 作者 / 路径过滤"),
+                                    // 整格高由这一层占住（大框才不会缩到按钮那一档），
+                                    // 里面的输入框按自己的自然高度上下居中：直接把 TextEdit
+                                    // 撑到整格高，egui 会把文字画在格子顶边，提示字就偏上
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(input_w, row_h - 2.0),
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                TextEdit::singleline(&mut page.filter)
+                                                    // 大框是按内容收口的，宽度得由输入框自己报，
+                                                    // 否则整组会缩到提示字那么宽
+                                                    .desired_width(input_w)
+                                                    // 这个分支的 frame() 收 Frame 不是 bool：给个透明
+                                                    // 无描边的，让外面那只大框成为唯一的边
+                                                    .frame(
+                                                        Frame::new()
+                                                            .fill(Color32::TRANSPARENT)
+                                                            .stroke(egui::Stroke::NONE),
+                                                    )
+                                                    .hint_text("按说明 / 作者 / 路径过滤"),
+                                            );
+                                        },
                                     );
                                     // 三枚小按钮：Aa 区分大小写、.* 正则、\b 整词（都是编辑器里的通用记号）
                                     let chip = |ui: &mut Ui,
@@ -987,20 +1004,24 @@ impl RepoApp {
                                 // 路径文字按剩余宽度截断、固定行高（截断时 egui 自己会悬停浮出全文），
                                 // 行最右侧始终留出「操作」那枚按钮的位——长路径也不会把它挤出可视区
                                 let color = action_color(ui, path.action);
+                                // 标记与路径同一字号：两只 label 各自垂直居中，字号一不同基线就错开，
+                                // 看着就是标记偏高、路径偏低
+                                let size = 12.0;
                                 // 目录名用粗体（Name("bold") 由 fonts::install 保证已绑定）
                                 let font = if path.kind == "dir" {
                                     FontId {
-                                        size: 12.0,
+                                        size,
                                         family: egui::FontFamily::Name("bold".into()),
                                     }
                                 } else {
-                                    FontId::proportional(12.0)
+                                    FontId::proportional(size)
                                 };
                                 let row = ui.aligned_row(|ui| {
                                     ui.label(
                                         RichText::new(path.action.to_string())
                                             .strong()
                                             .monospace()
+                                            .size(size)
                                             .color(color),
                                     );
                                     let path_w = (ui.available_width() - 68.0).max(120.0);
@@ -1827,6 +1848,135 @@ mod tests {
         );
     }
 
+    /// 搜索这一行的对齐：「条数」数字框和左边的搜索大框同一档高度、同一条水平线，
+    /// 大框里的提示字也要上下居中（输入框被硬撑到整格高时 egui 会把文字画在格子顶边）
+    #[test]
+    fn search_row_controls_line_up() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.page = crate::Page::History;
+        app.history = Some(HistoryPage::new(
+            0,
+            "订单服务".to_owned(),
+            100,
+            "zhangsan".to_owned(),
+            false,
+        ));
+        app.apply_accent(&ctx);
+        let mut out = ctx.run_ui(crate::testbed::base_input(), |ui| app.history_page(ui));
+        out.textures_delta.clear();
+        let text_of = |wanted: &str| {
+            out.shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::Text(text) if text.galley.text() == wanted => {
+                        Some(item.shape.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_else(|| panic!("页面上没有「{wanted}」"))
+        };
+        let boxes: Vec<(u8, egui::Rect)> = out
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Rect(rect) => Some((rect.corner_radius.nw as u8, rect.rect)),
+                _ => None,
+            })
+            .collect();
+        let hint = text_of("按说明 / 作者 / 路径过滤");
+        let group = boxes
+            .iter()
+            .find(|(radius, rect)| *radius == 6 && rect.contains_rect(hint))
+            .map(|(_, rect)| *rect)
+            .expect("包住搜索框的那只大框");
+        let number = text_of("100");
+        let drag = boxes
+            .iter()
+            .filter(|(_, rect)| rect.contains_rect(number) && rect.width() < 200.0)
+            .map(|(_, rect)| *rect)
+            .min_by(|a, b| a.area().partial_cmp(&b.area()).expect("可比较的面积"))
+            .expect("「条数」那只数字框");
+        assert!(
+            (drag.height() - group.height()).abs() < 1.0,
+            "数字框 {:.1} 高、搜索大框 {:.1} 高，差一档",
+            drag.height(),
+            group.height()
+        );
+        assert!(
+            (drag.center().y - group.center().y).abs() < 1.0,
+            "两个框的中心不在同一水平线：{drag:?} vs {group:?}",
+        );
+        assert!(
+            (hint.center().y - group.center().y).abs() < 1.0,
+            "提示字中心 {:.1}、大框中心 {:.1}，上下没居中",
+            hint.center().y,
+            group.center().y
+        );
+    }
+
+    /// 「涉及文件」那一行的标记与路径同一条基线：标记是默认字号的等宽体，路径是比例体 12，
+    /// 两只 label 各自垂直居中时路径肉眼可见地掉下去。
+    #[test]
+    fn file_row_mark_and_path_sit_on_one_baseline() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.page = crate::Page::History;
+        let mut page = HistoryPage::new(
+            0,
+            "订单服务".to_owned(),
+            100,
+            "zhangsan".to_owned(),
+            false,
+        );
+        let mut row = entry("5232", "2026-01-26 18:23:25");
+        row.paths = vec![LogPath {
+            action: 'M',
+            kind: "file".to_owned(),
+            path: "/code/a/Alpha.java".to_owned(),
+        }];
+        page.entries = vec![row];
+        page.picked = Some(0);
+        app.history = Some(page);
+        // 真实皮肤：标记没写死字号，吃的是 tune_style 调过的 Body
+        app.apply_accent(&ctx);
+
+        let mut out = ctx.run_ui(crate::testbed::base_input(), |ui| app.history_page(ui));
+        out.textures_delta.clear();
+        // epaint 里 Glyph::pos.y 就是这一行的基线（相对行起点），行起点再加 galley 起点
+        let mut mark: Option<f32> = None;
+        let mut body: Option<f32> = None;
+        for item in &out.shapes {
+            if let egui::Shape::Text(text) = &item.shape {
+                let line = text.galley.text();
+                if line != "M" && !line.contains("Alpha.java") {
+                    continue;
+                }
+                for row in &text.galley.rows {
+                    for glyph in &row.row.glyphs {
+                        let y = text.pos.y + row.pos.y + glyph.pos.y;
+                        if glyph.chr == 'M' {
+                            mark.get_or_insert(y);
+                        }
+                        if glyph.chr == '/' {
+                            body.get_or_insert(y);
+                        }
+                    }
+                }
+            }
+        }
+        let mark = mark.expect("右侧没有那枚状态标记");
+        let body = body.expect("右侧没有路径文字");
+        assert!(
+            (mark - body).abs() < 0.5,
+            "标记基线 {mark:.2}、路径基线 {body:.2}，错开 {:.2} 像素",
+            (mark - body).abs()
+        );
+    }
+
     /// 测试用的便捷入口：按页面当前状态筛一次。页面本身走 visible_with，
     /// 条件（含正则编译）每帧只构建一次。
     fn visible(page: &HistoryPage) -> Vec<usize> {
@@ -2078,12 +2228,14 @@ mod tests {
         assert!(app.rollback.is_none(), "拼不出本地路径不该开窗口");
         assert!(app.log_tail().contains("不在本目录"), "要说清是路径不在本地：{}", app.log_tail());
 
-        // 还有冲突没解决：整目录回退也先挡回去
-        app.output.clear();
+        // 有冲突不再挡回退：窗口照开，冲突数带进去，让人先看清会被卷进来
+        app.rollback = None;
         app.dirs[0].conflicts = Some(1);
         app.open_rollback(0, &record, None);
-        assert!(app.rollback.is_none(), "冲突没解决不该开始回退");
-        assert!(app.log_tail().contains("冲突"), "提示要指向「解决冲突」：{}", app.log_tail());
+        let dialog = app.rollback.clone().expect("有冲突也该开回退确认窗口");
+        assert_eq!(dialog.conflicts, 1, "冲突数要带进窗口才能提示后果");
+        assert!(!dialog.confirm, "开窗口不等于进入执行");
+        assert!(!app.pool.is_writing(0), "窗口刚打开时不该已经起回退任务");
 
         let _ = std::fs::remove_dir_all(&root);
     }

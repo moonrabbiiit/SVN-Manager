@@ -268,8 +268,8 @@ impl RepoApp {
                                 .color(ink(ui, crate::AMBER)),
                         )
                         .on_hover_text(
-                            "口径与「全部上传」一致：新增(?)、已丢失(!) 也算在内——\n\
-                             全部上传时自动 svn add / svn delete 后一并提交，无需手动标记",
+                            "口径与「全部上传」一致：未版本化(?)、已丢失(!) 也算在内——\n\
+                             上传时它们会先加入版本控制或标记删除，再和改动一并提交，无需手动标记",
                         );
                     } else {
                         ui.label(
@@ -676,8 +676,12 @@ impl RepoApp {
                 self.spawn_maintain(index, Maintain::Cleanup);
                 ui.close();
             }
-            if ui.button(Maintain::Resolve.label()).clicked() {
-                self.spawn_maintain(index, Maintain::Resolve);
+            if ui
+                .button("解决冲突")
+                .on_hover_text("列出该目录里必须先人工处理的条目，逐条挑收场策略（我的 / 服务器的 / 丢弃改动）")
+                .clicked()
+            {
+                self.open_resolve(index);
                 ui.close();
             }
         });
@@ -1494,6 +1498,11 @@ impl RepoApp {
         );
         shadow.blur_width = 10.0;
         ui.painter().add(shadow);
+        // 选中先铺一层不透光的底：主色本身是半透明的，底下那圈投影不盖住就会一起被叠暗，
+        // 同一个选中态在两种样式里看着就不是一个颜色
+        if is_selected {
+            ui.painter().rect_filled(card, 10.0, ui.visuals().panel_fill);
+        }
         ui.painter().rect_filled(
             card,
             10.0,
@@ -1909,10 +1918,12 @@ impl RepoApp {
                 .map(|(index, count)| format!("{}：{count} 项", self.dir_label(*index)))
                 .collect::<Vec<_>>()
                 .join("\n");
+            // 和目录行「待提交 N 项 · 冲突 N 项」用同一根分隔点，接在标题后面才不像半句话
+            ui.label(RichText::new("·").size(12.0).weak());
             let first = blocked[0].0;
             let hit = ui.add(
                 egui::Label::new(
-                    RichText::new(format!("，{total} 项冲突待处理"))
+                    RichText::new(format!("冲突 {total} 项待处理"))
                         .size(12.0)
                         .strong()
                         .underline()
@@ -3195,5 +3206,92 @@ mod tests {
             "点在用分组要直接套上"
         );
         assert!(stage.app.edit_group.is_none(), "套用后编辑行要关掉");
+    }
+
+    /// 同一个选中态在两种样式里要叠出同一个颜色：选中色和卡片那圈投影都是半透明的，
+    /// 不先垫一层不透光的底，卡片就被投影拽暗，和详细模式的选中行看着就不像一个东西
+    #[test]
+    fn selected_card_and_row_end_up_the_same_color() {
+        /// 选中第一个目录，把穿过名称左侧同一处的每一层底色按画序取出来，最前面补上面板底。
+        /// 主题要连着 tune_style 一起换：`Stage::new` 只 set_theme，选中色停在 egui 出厂的
+        /// 不透明值上，叠在投影里的差就复现不出来
+        fn stacked(compact: bool, theme: egui::Theme) -> Vec<Color32> {
+            let mut stage = Stage::new(compact);
+            stage.ctx.set_theme(theme);
+            let accent = stage.app.accent();
+            stage
+                .ctx
+                .style_mut_of(theme, |style| crate::ui::tune_style(style, accent));
+            let Stage { ctx, app } = &mut stage;
+            let mut out = ctx.run_ui(base_input(), |ui| app.main_page(ui));
+            out.textures_delta.clear();
+            let texts: Vec<(String, Rect)> = out
+                .shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::Text(t) => {
+                        Some((t.galley.text().to_string(), item.shape.visual_bounding_rect()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let name = Stage::rect_of(&texts, "HRP").expect("卡片名称");
+            let at = name.center() - egui::vec2(name.width() / 2.0 + 12.0, 0.0);
+            app.selected = Some(0);
+            let mut panels = None;
+            let mut out = ctx.run_ui(base_input(), |ui| {
+                panels = Some((ui.visuals().panel_fill, ui.visuals().selection.bg_fill));
+                app.main_page(ui);
+            });
+            out.textures_delta.clear();
+            let (panel, selected) = panels.expect("视觉");
+            let mut layers: Vec<Color32> = out
+                .shapes
+                .iter()
+                .filter_map(|item| match &item.shape {
+                    egui::Shape::Rect(r)
+                        if r.rect.contains(at)
+                            && r.rect.height() > 20.0
+                            && r.fill != Color32::TRANSPARENT =>
+                    {
+                        Some(r.fill)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                *layers.last().expect("这一处没垫任何底色"),
+                selected,
+                "最上面那层要就是选中色"
+            );
+            // 面板底是这一切的最下面那层
+            layers.insert(0, panel);
+            layers
+        }
+
+        /// 从底往上按 over 合一遍。Color32 在 egui 里按预乘存放，通道要先除回 alpha
+        fn composite(layers: &[Color32]) -> Color32 {
+            let [r, g, b, _] = layers[0].to_array();
+            let (mut ar, mut ag, mut ab) = (r as f32, g as f32, b as f32);
+            for c in &layers[1..] {
+                let [sr, sg, sb, sa] = c.to_array();
+                let a = sa as f32 / 255.0;
+                let (ur, ug, ub) = if a > 0.0 {
+                    (sr as f32 / a, sg as f32 / a, sb as f32 / a)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+                ar = ur * a + ar * (1.0 - a);
+                ag = ug * a + ag * (1.0 - a);
+                ab = ub * a + ab * (1.0 - a);
+            }
+            Color32::from_rgb(ar as u8, ag as u8, ab as u8)
+        }
+
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let row = composite(&stacked(false, theme));
+            let card = composite(&stacked(true, theme));
+            assert_eq!(row, card, "{theme:?}：选中行的 {row:?} 对上选中卡片的 {card:?}");
+        }
     }
 }

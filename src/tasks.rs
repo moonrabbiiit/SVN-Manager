@@ -1,7 +1,7 @@
 //! 每个 svn 动作的发起点：起后台任务（检测 / 更新 / 提交 / 日志 / 维护 / relocate）、
 //! 目录的增删移，以及各页面之间的跳转。
 
-use crate::{Level, Maintain, Page, Relocate, Rollback, RepoApp};
+use crate::{Level, Maintain, Page, Relocate, Resolve, ResolveRow, Rollback, RepoApp};
 use crate::{daterange, svn, update};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -407,6 +407,7 @@ impl RepoApp {
                         changed: None,
                         changes: Vec::new(),
                         conflicts: None,
+                        blocked: Vec::new(),
                         out_of_date: None,
                     };
                 };
@@ -487,6 +488,7 @@ impl RepoApp {
                     changed,
                     changes,
                     conflicts,
+                    blocked: crate::svn::blocked_entries(&entries),
                     out_of_date,
                 }
             });
@@ -542,6 +544,7 @@ impl RepoApp {
                         changed: None,
                         changes: Vec::new(),
                         conflicts: None,
+                        blocked: Vec::new(),
                         out_of_date: None,
                     };
                 };
@@ -615,6 +618,7 @@ impl RepoApp {
                     changed,
                     changes,
                     conflicts,
+                    blocked: crate::svn::blocked_entries(&entries),
                     out_of_date,
                 }
             });
@@ -1149,7 +1153,6 @@ impl RepoApp {
             Maintain::Add => "add --force",
             Maintain::Delete => "delete",
             Maintain::Cleanup => "cleanup",
-            Maintain::Resolve => "resolve --accept working --recursive",
             Maintain::Revert => "revert --recursive",
         };
         self.pool
@@ -1163,7 +1166,6 @@ impl RepoApp {
                     Maintain::Add => svn.add(&path, &targets, &|line| sink.line(line)),
                     Maintain::Delete => svn.delete(&path, &targets, &|line| sink.line(line)),
                     Maintain::Cleanup => svn.cleanup(&path, &|line| sink.line(line)),
-                    Maintain::Resolve => svn.resolve_working(&path, &|line| sink.line(line)),
                     Maintain::Revert => svn.revert_all(&path, &|line| sink.line(line)),
                 };
                 let message = if run.ok {
@@ -1184,7 +1186,7 @@ impl RepoApp {
     /// Git 目录的维护操作：加 / 删 / 撤销三项照常，清理与解决冲突是 SVN 特有的概念。
     fn spawn_maintain_git(&mut self, index: usize, op: Maintain) {
         let sub = match op {
-            Maintain::Cleanup | Maintain::Resolve => {
+            Maintain::Cleanup => {
                 self.hint(format!("Git 仓库用不到「{}」", op.label()));
                 return;
             }
@@ -1227,7 +1229,7 @@ impl RepoApp {
                     Maintain::Delete => git.delete(&path, &targets, &|line| sink.line(line)),
                     Maintain::Revert => git.revert_all(&path, &|line| sink.line(line)),
                     // 上面已经拦掉，给个空结果只为让 match 完整
-                    Maintain::Cleanup | Maintain::Resolve => crate::svn::Run {
+                    Maintain::Cleanup => crate::svn::Run {
                         ok: true,
                         code: 0,
                         out: String::new(),
@@ -1248,6 +1250,71 @@ impl RepoApp {
             });
     }
 
+    /// 打开「解决冲突」窗口。条目取自最近一次读到的 status（口径同「冲突 N 项」），
+    /// 开完再补一趟 status 把列表核正——窗口开着时他可能已经去 BC 里合完了。
+    pub fn open_resolve(&mut self, index: usize) {
+        if self.svn_or_none().is_none() {
+            return;
+        }
+        let Some(view) = self.dirs.get(index) else { return };
+        if view.conflicts.is_none() {
+            self.hint("还没读到这个目录的状态，先点「全部检测」");
+            return;
+        }
+        if view.conflicts == Some(0) {
+            self.hint("这个目录没有需要人工处理的冲突条目");
+            return;
+        }
+        self.resolve = Some(Resolve::from_entries(index, &view.blocked));
+        self.spawn_status(index, true);
+    }
+
+    /// 按窗口里逐行挑好的策略执行：同一条策略的路径并成一条命令发给 svn。
+    /// 只动本地工作副本，不碰服务器；跑完照例重读 status 与检测。
+    pub fn spawn_resolve(&mut self, index: usize, rows: Vec<ResolveRow>) {
+        let Some(svn) = self.svn_or_none() else { return };
+        if rows.is_empty() {
+            self.hint("请先勾选要处理的条目");
+            return;
+        }
+        if self.pool.has(Kind::Resolve, index) {
+            self.hint("该目录的上一次解决冲突正在执行，请待其结束后再试");
+            return;
+        }
+        let label = self.dir_label(index);
+        let total = rows.len();
+        self.pool
+            .spawn(Kind::Resolve, index, format!("{label} 解决冲突"), move |sink| {
+                let mut failed: Vec<String> = Vec::new();
+                for accept in crate::svn::Accept::ALL {
+                    let targets: Vec<PathBuf> = rows
+                        .iter()
+                        .filter(|row| row.accept == accept)
+                        .map(|row| row.target.clone())
+                        .collect();
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    sink.line(format!("$ svn {}（{} 项）", accept.command(), targets.len()));
+                    let run = svn.accept_conflicts(accept, &targets, &|line| sink.line(line));
+                    if !run.ok {
+                        failed.push(format!("「{}」：{}", accept.label(), run.summary()));
+                    }
+                }
+                let message = if failed.is_empty() {
+                    format!("{label}：{total} 项已按所选策略处理")
+                } else {
+                    format!("{label}：解决冲突有失败——{}", failed.join("；"))
+                };
+                Data::Run {
+                    dir: index,
+                    ok: failed.is_empty(),
+                    message,
+                    reload: true,
+                }
+            });
+    }
+
     /// 打开「回退到 r{版本}」确认窗口。`path` 不给 = 整个目录回到这一次提交的样子；
     /// 给了就是历史页「涉及文件」里的那一个文件，只回退它。
     /// 两种都只改本地工作副本，确认窗口里讲清楚后果才执行。
@@ -1263,18 +1330,16 @@ impl RepoApp {
             self.hint("该目录的上一次回退正在执行，请待其结束后再试");
             return;
         }
-        // 有冲突没解决时，回退出来的只会是一团更乱的半成品，先把人挡回去
-        if let Some(count) = self
+        // 冲突不挡回退：svn merge 带 --accept postpone，冲突出来的照样能收尾。
+        // 但要把数记下来，确认窗口里说清回退会把它们一起卷进来
+        let blocked = self
             .dirs
             .get(index)
             .and_then(|view| view.conflicts)
             .filter(|count| *count > 0)
-        {
-            self.hint(format!("该目录还有 {count} 项冲突没处理，先「解决冲突」或「撤销修改」再回退"));
-            return;
-        }
+            .unwrap_or_default();
         if self.dir_kind(index) == RepoKind::Git {
-            self.open_rollback_git(index, entry, path, local);
+            self.open_rollback_git(index, entry, path, local, blocked);
             return;
         }
         let (target, name, is_dir) = match path {
@@ -1307,6 +1372,7 @@ impl RepoApp {
             is_dir,
             confirm: false,
             error: String::new(),
+            conflicts: blocked,
         });
         self.hint(format!("回退到 r{} 会改动本地文件，请在弹出窗口里确认", entry.revision));
     }
@@ -1320,6 +1386,7 @@ impl RepoApp {
         entry: &LogEntry,
         path: Option<&LogPath>,
         local: PathBuf,
+        blocked: usize,
     ) {
         let Some(top) = self.git.toplevel(&local) else {
             self.hint("读不到 Git 仓库根目录，无法回退");
@@ -1352,6 +1419,7 @@ impl RepoApp {
             is_dir,
             confirm: false,
             error: String::new(),
+            conflicts: blocked,
         });
         let rev = crate::repo::fmt_rev(self.dir_kind(index), &entry.revision);
         self.hint(format!("回退到 {rev} 会改动本地文件，请在弹出窗口里确认"));
@@ -1436,18 +1504,25 @@ impl RepoApp {
             dir,
             format!("{name} 回退 r{revision}"),
             move |sink| {
+                let path = format!("\"{}\"", target.display());
                 sink.line(format!(
-                    "$ svn merge -r HEAD:{revision} --accept postpone \"{}\"",
-                    target.display()
+                    "$ svn merge -r HEAD:{revision} --accept postpone {path} {path}"
                 ));
                 let run = svn.merge_back(&target, &revision, &|line| sink.line(line));
                 let scope = if is_dir { "整个目录" } else { "该文件" };
+                let summary = run.summary();
                 let message = if run.ok {
                     format!(
                         "{name}：已回到 r{revision}——{scope}的改动只落在本地，核对后再上传，不想要就「撤销修改」"
                     )
+                } else if summary.contains("E155035") {
+                    // svn 只拒绝「回退要落在正冲突的那个节点」上，报错前一个文件都没动
+                    format!(
+                        "{name}：回退到 r{revision} 被冲突挡下——svn 不肯把回退落在正冲突的文件上，\
+                         这一趟没有改动任何文件；先在目录行「更多 → 解决冲突」把它处理掉再回退：{summary}"
+                    )
                 } else {
-                    format!("{name}：回退到 r{revision} 失败——{}", run.summary())
+                    format!("{name}：回退到 r{revision} 失败——{summary}")
                 };
                 // 收尾文案只交给回收端统一写进输出区，避免同一句显示两遍
                 Data::Run {
