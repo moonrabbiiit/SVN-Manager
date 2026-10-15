@@ -94,12 +94,13 @@ pub struct Excludes {
     dirs: Vec<String>,
     /// 任意层级都命中的目录名模式（名字里带 `*` `?` 的，整名匹配）
     dir_globs: Vec<Regex>,
-    /// 只在根目录命中的目录相对路径（BC 写法 `.\.idea\` / `\.idea\`，字面量）
-    root_dirs: Vec<String>,
-    /// 根目录锚定的目录路径模式（BC 写法 `.\*\.settings\`：`*` 匹配一段路径、不跨级）。
-    /// 对相对路径整段匹配，目录本身命中即整枝排除——issue #3 的根因：这类带通配符的
-    /// 模式以前被当字面量存进 root_dirs，`*` 永远打不中，bin/.settings 整片漏排，
-    /// 差异数被上万条构建产物淹没，真实差异在抽样里根本翻不到
+    /// 根目录锚定的目录路径模式（BC 写法 `.\out\` / `.\*\.settings\` / `.\HRP.Web\build\`）。
+    /// 一律按「整段相对路径」编译成正则：`*` 匹配一段路径、不跨级，命中即整枝排除。
+    /// 模式自带层级信息（`^a/b(/.*)?$` 只认根上的 a/b，深层同名项天然不匹配），
+    /// 所以不再需要区分「根上的那份」和深层同名项。issue #3 只修了带通配符的那一半，
+    /// 纯字面量的**多段**路径（`.\HRP.Web\build\`、`.\Infrastructure\Model\target\`）
+    /// 留在按 at_root 判定的老路上，而这类 rel 里必然带 `/`，永远打不中，整片构建产物
+    /// 被记成「只在本地开发侧」
     root_dir_globs: Vec<Regex>,
     /// 任意层级都命中的文件名模式
     files: Vec<Regex>,
@@ -119,6 +120,8 @@ impl Excludes {
     /// （前导点属于名字本身，`.project`、`.classpath` 都是文件不是相对路径）。
     /// 名字与路径里的 `*` `?` 都按通配符算（issue #3：`.\*\.settings\` 这种
     /// 「根目录下任意一段路径 + 固定目录名」的 BC 写法必须展开，否则永不命中）。
+    /// 锚定根目录的**目录**一律走整段路径正则（`.\out\`、`.\HRP.Web\build\`），
+    /// 多段路径的 rel 里必然带 `/`，任何「按末级名 or 按 at_root 判定」的写法都打不中。
     /// `+` 前缀和无前缀的包含模式这里不支持：差异口径要和他用同一份筛选打开的 BC 对得上，
     /// 而 BC 那边包含条件是记在会话里的，我们只有这份排除串。
     pub fn parse(raw: &str) -> Self {
@@ -152,12 +155,13 @@ impl Excludes {
                     if path.is_empty() {
                         continue;
                     }
-                    if path.contains('*') || path.contains('?') {
-                        if let Some(re) = root_dir_glob_regex(&path) {
-                            out.root_dir_globs.push(re);
-                        }
-                    } else {
-                        out.root_dirs.push(path);
+                    // 根锚定的目录一律编译成「整段路径」正则：单段的 `.\out\` 只命中根上的
+                    // out，多段的 `.\HRP.Web\build\` 也不必再靠 at_root 判定——多段路径的
+                    // rel 必然带 `/`，靠 at_root 就永远打不中（本机 biaozhunword 的
+                    // build/classes、springbootWork 的 Infrastructure\Model\target 就是
+                    // 这么被漏成 121 / 4519 条「只在本地开发侧」的）
+                    if let Some(re) = root_dir_glob_regex(&path) {
+                        out.root_dir_globs.push(re);
                     }
                 } else {
                     let name = dir.rsplit('/').next().unwrap_or("").trim_matches('/');
@@ -185,7 +189,7 @@ impl Excludes {
         out
     }
 
-    /// rel 是相对根目录的 `/` 分隔路径，顺带告诉筛选项是不是落在根目录
+    /// rel 是相对根目录的 `/` 分隔路径
     fn skips_dir(&self, name: &str, rel: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         if self.dirs.iter().any(|d| *d == lower)
@@ -194,39 +198,26 @@ impl Excludes {
         {
             return true;
         }
-        if at_root(rel) && self.root_hit(rel) {
-            return true;
-        }
-        // 根目录锚定的路径模式自带层级信息（`*` 匹配一段路径），不受 at_root 限制
-        self.root_dir_globs
-            .iter()
-            .any(|re| re.is_match(&rel.to_ascii_lowercase()))
+        // 锚定根目录的模式自带层级信息，直接拿 rel 整段匹配就够了：
+        // 目录走 `^a/b(/.*)?$` 这种路径正则，文件走 `^a/b.txt$`；
+        // `x/a/b` 天然不匹配，不用再靠 at_root 区分根上和深层同名项
+        self.root_hit(rel)
+            || self.root_dir_globs.iter().any(|re| re.is_match(&rel.to_ascii_lowercase()))
     }
 
     fn skips_file(&self, name: &str, rel: &str) -> bool {
-        if self.matches_file(&name.to_ascii_lowercase()) {
-            return true;
-        }
-        at_root(rel) && self.root_hit(rel)
+        self.matches_file(&name.to_ascii_lowercase()) || self.root_hit(rel)
     }
 
-    /// 根目录锚定的那些条目：rel（已统一小写）正好等于模式或多段模式的前缀才算
+    /// 根目录锚定的文件条目：rel（已统一小写）整段等于模式才算
     fn root_hit(&self, rel: &str) -> bool {
         let lower = rel.to_ascii_lowercase();
-        self.root_dirs
-            .iter()
-            .any(|d| lower == *d || lower.starts_with(&format!("{d}/")))
-            || self.root_files.iter().any(|re| re.is_match(&lower))
+        self.root_files.iter().any(|re| re.is_match(&lower))
     }
 
     fn matches_file(&self, lower: &str) -> bool {
         self.files.iter().any(|re| re.is_match(lower))
     }
-}
-
-/// 根目录判定：rel 里没有分隔符就是在根上
-fn at_root(rel: &str) -> bool {
-    !rel.contains('/')
 }
 
 /// 把 BC 的名称模式编译成整串匹配的正则（`*` → 一段内任意字符、`?` → 单字符、
@@ -1044,6 +1035,44 @@ mod tests {
         assert_eq!(s.only_local, 2, "{:?}", s.samples);
         assert!(s.samples.contains(&"sub/auth.json".to_owned()), "{:?}", s.samples);
         assert!(s.samples.contains(&"sub/notes/b.md".to_owned()), "{:?}", s.samples);
+    }
+
+    /// 根锚定的**多段**目录路径（`.\A\B\`）：rel 里必然带 `/`，不能再靠 at_root 判定，
+    /// 否则纯字面量的多段路径整片漏排。本机 biaozhunword 的 `.\HRP.Web\build\` 漏成 121 条、
+    /// springbootWork 的 `.\Infrastructure\Model\target\` 漏成 4519 条，都是这条规则没命中的结果。
+    #[test]
+    fn multisegment_root_dir_pattern_excludes_that_path() {
+        let (local, server) = tree("multiseg_dir");
+        let t = 1_700_000_000;
+        let filter = r"-.\HRP.Web\build\;-.\Infrastructure\Model\target\";
+        put(&local, "HRP.Web/build/classes/applicationContext.xml", b"x", t); // 命中
+        put(&local, "HRP.Web/build/classes/db/migration/V1.sql", b"x", t); // 命中，整枝
+        put(&local, "Infrastructure/Model/target/classes/A.class", b"x", t); // 命中
+        put(&local, "Infrastructure/Model/src/A.java", b"x", t); // 同级但不在 target 下，照报
+        put(&local, "HRP.Web/web/WEB-INF/web.xml", b"x", t); // 不在筛选里，照报
+        put(&local, "Other/Infrastructure/Model/target/A.class", b"x", t); // 深层同名，锚定根就不排
+        let s = compare(&local, &server, filter).unwrap();
+        assert_eq!(s.only_local, 3, "{:?}", s.samples);
+        for keep in [
+            "Infrastructure/Model/src/A.java",
+            "HRP.Web/web/WEB-INF/web.xml",
+            "Other/Infrastructure/Model/target/A.class",
+        ] {
+            assert!(s.samples.contains(&keep.to_owned()), "漏了 {keep}：{:?}", s.samples);
+        }
+    }
+
+    /// 根锚定的多段文件路径同理（`.\A\B.txt`），以前也永远打不中
+    #[test]
+    fn multisegment_root_file_pattern_excludes_that_path() {
+        let (local, server) = tree("multiseg_file");
+        let t = 1_700_000_000;
+        let filter = r"-.\Config\app.properties";
+        put(&local, "Config/app.properties", b"x", t); // 命中
+        put(&local, "Other/Config/app.properties", b"x", t); // 深层同名，照报
+        let s = compare(&local, &server, filter).unwrap();
+        assert_eq!(s.only_local, 1, "{:?}", s.samples);
+        assert_eq!(s.samples, vec!["Other/Config/app.properties".to_owned()]);
     }
 
     #[test]
