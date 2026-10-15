@@ -27,6 +27,8 @@ pub enum Kind {
     Update,
     Commit,
     Maintain,
+    /// 「解决冲突」窗口按所选策略执行 `svn resolve --accept …` / `svn revert …`
+    Resolve,
     /// 版本回退：`svn merge -r HEAD:<rev>` 把整个目录或单个文件倒回某个版本，
     /// 结果是一批本地改动，要他确认后自己上传
     Rollback,
@@ -83,6 +85,8 @@ pub enum Data {
         /// 需要人工处理的条目数（冲突 / 不完整），按**未过滤**的 status 结果统计：
         /// `changed` / `changes` 只留可提交的条目，冲突会被滤掉，不另外数就没人知道自己卡住了
         conflicts: Option<usize>,
+        /// 上面这些条目本身（口径同 `conflicts`），给「解决冲突」窗口列行用
+        blocked: Vec<StatusEntry>,
         /// 服务器上已变、本地还没更新的文件数（`svn status -u`）
         out_of_date: Option<usize>,
     },
@@ -209,7 +213,8 @@ impl Pool {
             task.dir == dir
                 && matches!(
                     task.kind,
-                    Kind::Update | Kind::Commit | Kind::Maintain | Kind::Rollback | Kind::Relocate
+                    Kind::Update | Kind::Commit | Kind::Maintain | Kind::Resolve
+                    | Kind::Rollback | Kind::Relocate
                 )
         })
     }

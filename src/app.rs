@@ -124,6 +124,7 @@ impl RepoApp {
             batch_relocate: None,
             batch_label: None,
             rollback: None,
+            resolve: None,
             svn_user: String::new(),
             user_probed: false,
             show_settings: false,
@@ -466,6 +467,7 @@ impl RepoApp {
                         changed,
                         changes,
                         conflicts,
+                        blocked,
                         out_of_date,
                     },
                 ) => {
@@ -480,6 +482,7 @@ impl RepoApp {
                         view.changed = changed;
                         view.changes = changes;
                         view.conflicts = conflicts;
+                        view.blocked = blocked;
                         view.out_of_date = out_of_date;
                         view.checked_at = chrono::Local::now().format("%H:%M:%S").to_string();
                     }
@@ -533,8 +536,10 @@ impl RepoApp {
                 (Kind::Status, Data::Status { dir: index, entries, ok, message }) => {
                     // 先数完再把 entries 交给提交页（它拿走所有权）
                     let blocked = ok.then(|| crate::svn::blocked_count(&entries));
+                    let listed = ok.then(|| crate::svn::blocked_entries(&entries));
                     if let Some(view) = self.dirs.get_mut(index) {
                         view.conflicts = blocked;
+                        view.blocked = listed.unwrap_or_default();
                         if ok {
                             // 口径与「全部上传」一致：? / ! 提交时会自动补 add / delete，一并算待提交
                             view.changes = entries
@@ -547,6 +552,21 @@ impl RepoApp {
                             // 读失败就清掉旧数：宁可显示「未检测」也不能拿旧清单冒充现状
                             view.changed = None;
                             view.changes.clear();
+                        }
+                    }
+                    // 「解决冲突」窗口开着时这一趟就是它的最新依据：窗口里可能已经挑好策略，
+                    // rebuild 按路径把挑的保住；条目全没了就关窗，别让人对着一张空表点执行
+                    if ok {
+                        let closed = match self.resolve.as_mut().filter(|panel| panel.dir == index) {
+                            Some(panel) => {
+                                panel.rebuild(&entries);
+                                panel.rows.is_empty() && panel.incomplete == 0
+                            }
+                            None => false,
+                        };
+                        if closed {
+                            self.resolve = None;
+                            self.hint("这个目录的冲突已经没有了");
                         }
                     }
                     if let Some(commit) = self.commit.as_mut() {
@@ -616,6 +636,19 @@ impl RepoApp {
                         self.spawn_status(dir, false);
                         self.spawn_refresh(dir, false);
                     }
+                }
+                (Kind::Resolve, Data::Run { dir, ok, message, .. }) => {
+                    // 成了不关窗：跟着重读一遍 status，还剩几条就是几条，全清了才在
+                    // Status 那段把窗口收掉——一把梭最容易漏掉的就是「以为全成了」
+                    self.hint(message.clone());
+                    self.push(if ok { Level::Success } else { Level::Error }, message.clone());
+                    if !ok {
+                        if let Some(panel) = self.resolve.as_mut().filter(|p| p.dir == dir) {
+                            panel.error = message;
+                        }
+                    }
+                    self.spawn_status(dir, false);
+                    self.spawn_refresh(dir, false);
                 }
                 (Kind::Rollback, Data::Run { dir, ok, message, reload }) => {
                     if ok {
@@ -1130,6 +1163,7 @@ impl eframe::App for RepoApp {
         self.batch_relocate_dialog(&ctx);
         self.batch_label_dialog(&ctx);
         self.rollback_dialog(&ctx);
+        self.resolve_dialog(&ctx);
         self.upload_all_dialog(&ctx);
         self.file_diff_window(&ctx);
         self.file_log_window(&ctx);

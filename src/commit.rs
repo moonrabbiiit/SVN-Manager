@@ -115,6 +115,18 @@ impl CommitPage {
     }
 }
 
+/// 提交前要先补做标记的条目怎么说：计数为 0 的那一类不提，两类都没有时返回空串。
+fn staging_note(adds: usize, deletes: usize, sep: &str) -> String {
+    let mut parts = Vec::new();
+    if adds > 0 {
+        parts.push(format!("提交时新增 {adds} 项"));
+    }
+    if deletes > 0 {
+        parts.push(format!("提交时删除 {deletes} 项"));
+    }
+    parts.join(sep)
+}
+
 /// 待提交列表展示用的相对路径：把绝对路径里的工作副本根前缀去掉，
 /// 只留 `src\views\foo.vue` 这样的部分。路径不在根下（理论上不会发生）就原样返回。
 fn relative_to_root(full: &str, root: &Path) -> String {
@@ -314,11 +326,15 @@ impl RepoApp {
                         reload: false,
                     };
                 }
+                let counts = staging_note(plan.adds.len(), plan.deletes.len(), "、");
+                let breakdown = if counts.is_empty() {
+                    String::new()
+                } else {
+                    format!("（其中{counts}）")
+                };
                 sink.line(format!(
-                    "{label}：全部上传 {} 项（其中先 add {} 项、先 delete {} 项）",
-                    plan.targets.len(),
-                    plan.adds.len(),
-                    plan.deletes.len()
+                    "{label}：全部上传 {} 项{breakdown}",
+                    plan.targets.len()
                 ));
                 commit_run(&svn, &sink, &path, &label, index, plan, &message, update_after)
             });
@@ -451,7 +467,7 @@ impl RepoApp {
             }
             if ui
                 .button("只选可提交项")
-                .on_hover_text("恢复默认勾选：勾选所有可随本次上传提交的条目（含 ? 自动 add、! 自动 delete），冲突等须先人工处理的条目不勾选")
+                .on_hover_text("恢复默认勾选：勾选所有可随本次上传提交的条目（含提交时新增的未版本化项、提交时删除的已丢失项），冲突等须先人工处理的条目不勾选")
                 .clicked()
             {
                 for entry in page.entries.iter_mut() {
@@ -549,13 +565,25 @@ impl RepoApp {
         let mut close_page = false;
         ui.aligned_row(|ui| {
             let width = (ui.available_width() - 140.0).max(240.0);
-            ui.add_sized(
-                Vec2::new(width, note_height),
-                TextEdit::multiline(&mut page.message)
-                    .desired_width(width)
-                    .desired_rows(3)
-                    .hint_text("填写本次提交说明（可留空）"),
-            );
+            // 计数说明跟在备注框下面：右侧按钮列只有 140px 宽，这句会被挤成两行
+            let staging_label = staging_note(adds.len(), deletes.len(), " · ");
+            ui.vertical(|ui| {
+                ui.add_sized(
+                    Vec2::new(width, note_height),
+                    TextEdit::multiline(&mut page.message)
+                        .desired_width(width)
+                        .desired_rows(3)
+                        .hint_text("填写本次提交说明（可留空）"),
+                );
+                if !staging_label.is_empty() {
+                    ui.label(
+                        RichText::new(staging_label)
+                            .color(ink(ui, Color32::from_rgb(240, 190, 70)))
+                            .size(11.5),
+                    )
+                    .on_hover_text("勾选里的未版本化 / 已丢失条目，提交前会先加入版本控制或标记删除，和改动一起一次传上去");
+                }
+            });
             ui.with_layout(Layout::top_down(Align::Max), |ui| {
                 // 配色、点击结果、按钮下方的说明文字全部来自这一个判断：
                 // 不能提交时一定说明原因，能提交时点了就一定有动作
@@ -629,10 +657,11 @@ impl RepoApp {
                             ));
                         }
                         None => {
-                            let staging = if adds.is_empty() && deletes.is_empty() {
+                            let counts = staging_note(adds.len(), deletes.len(), "、");
+                            let staging = if counts.is_empty() {
                                 String::new()
                             } else {
-                                format!("，先 add {} 项、delete {} 项", adds.len(), deletes.len())
+                                format!("，其中{counts}")
                             };
                             // 没更新到最新还是让它传（用户可能就是要把手上这份传上去，而且已经确认过），
                             // 但要说清基线，并往输出记录写一条——提示条马上被下一句覆盖，只有记录留得住
@@ -683,14 +712,6 @@ impl RepoApp {
                             page.confirm_outdated = false;
                         }
                     });
-                }
-                if !adds.is_empty() || !deletes.is_empty() {
-                    ui.label(
-                        RichText::new(format!("自动 add {} 项 · delete {} 项", adds.len(), deletes.len()))
-                            .color(ink(ui, Color32::from_rgb(240, 190, 70)))
-                            .size(11.5),
-                    )
-                    .on_hover_text("勾选的未版本化 / 已丢失条目会在提交前自动执行 svn add / svn delete，和修改一起提交");
                 }
                 if let Some(why) = blocked {
                     ui.label(RichText::new(why).weak().size(11.5));
@@ -805,18 +826,22 @@ impl RepoApp {
                                     // 这两类不再需要先手动处理：勾上就会在提交时自动补 add / delete
                                     if entry.item.needs_add() {
                                         ui.label(
-                                            RichText::new("自动 add")
+                                            RichText::new("提交时新增")
                                                 .size(11.0)
                                                 .color(ink(ui, Color32::from_rgb(240, 190, 70))),
                                         )
-                                        .on_hover_text("勾选后提交时自动执行 svn add，并和修改一起提交");
+                                        .on_hover_text(
+                                            "这个文件目前只在本地，勾选后提交时会先加入版本控制（svn add），再作为新文件上传到服务器",
+                                        );
                                     } else if entry.item.needs_delete() {
                                         ui.label(
-                                            RichText::new("自动 delete")
+                                            RichText::new("提交时删除")
                                                 .size(11.0)
                                                 .color(ink(ui, Color32::from_rgb(240, 190, 70))),
                                         )
-                                        .on_hover_text("勾选后提交时自动执行 svn delete，并和修改一起提交");
+                                        .on_hover_text(
+                                            "这个文件本地已经删掉了，勾选后提交时会先标记删除（svn delete），服务器上的那份也一并删除",
+                                        );
                                     }
                                     if entry.props != "none" {
                                         ui.label(RichText::new("属性变更").size(11.0).weak());
@@ -900,7 +925,7 @@ impl RepoApp {
             } else if page.diff.trim().is_empty() {
                 ui2.label(
                     RichText::new(
-                        "提示：\n· 勾选要提交的文件，备注可留空，点「提交」即可\n· 新增 / 修改 / 删除可以一起提交：未版本化(?) 会先自动 svn add，\n  已丢失(!) 会先自动 svn delete，再和修改项一次提交\n· 冲突(C) 的条目要先解决，不会被带进提交",
+                        "提示：\n· 勾选要提交的文件，备注可留空，点「提交」即可\n· 新增 / 修改 / 删除可以一起提交：未版本化(?) 提交时先加入版本控制，\n  已丢失(!) 提交时先标记删除，再和修改项一次传上去\n· 冲突(C) 的条目要先解决，不会被带进提交",
                     )
                     .weak(),
                 );
@@ -1187,6 +1212,15 @@ mod tests {
         assert!(page.selected_targets(Maintain::Revert).is_empty());
     }
 
+    /// 计数为 0 的那一类不写出来，界面上不该出现「提交时删除 0 项」这种说法。
+    #[test]
+    fn staging_note_skips_the_zero_side() {
+        assert_eq!(staging_note(3, 1, " · "), "提交时新增 3 项 · 提交时删除 1 项");
+        assert_eq!(staging_note(4, 0, " · "), "提交时新增 4 项");
+        assert_eq!(staging_note(0, 2, "、"), "提交时删除 2 项");
+        assert_eq!(staging_note(0, 0, " · "), "");
+    }
+
     /// 计数里未版本化算新增、已丢失算删除，「需处理」只剩冲突和不完整。
     #[test]
     fn counters_fold_pending_add_and_delete_into_totals() {
@@ -1324,6 +1358,80 @@ mod tests {
                 .iter()
                 .any(|(text, _)| text.starts_with("未更新到最新版本")),
             "已是最新还提示就成了误报"
+        );
+    }
+
+    /// 计数说明要整句一行：这句以前画在右侧按钮列里，被 140px 挤成了两行。
+    #[test]
+    fn staging_note_is_drawn_on_one_line() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.commit = Some(page_of(
+            vec![Item::Unversioned, Item::Missing],
+            &[Item::Unversioned, Item::Missing],
+        ));
+
+        let drawn = commit_frame(&ctx, &mut app);
+        let (text, rect) = drawn
+            .iter()
+            .find(|(text, _)| text.starts_with("提交时新增"))
+            .map(|(text, rect)| (text.clone(), *rect))
+            .expect("勾选了未版本化和已丢失各一项，提交页要显示这句计数");
+        assert_eq!(text, "提交时新增 1 项 · 提交时删除 1 项", "换行会把这句拆开");
+        assert!(rect.height() < 20.0, "这句只该占一行，实际高 {}", rect.height());
+    }
+
+    /// 标记与路径同一条基线：两处分成两只 label 时 egui 只能各自垂直居中，等宽 13 的标记
+    /// 和比例字体 12.5 的路径字面高矮不同，路径就肉眼可见地掉下去了。
+    #[test]
+    fn mark_and_path_sit_on_one_baseline() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        let mut page = CommitPage::new(0, "测试".to_owned());
+        page.set_entries(vec![StatusEntry {
+            path: "D:\\wc\\Alpha.java".to_owned(),
+            name: "Alpha.java".to_owned(),
+            item: Item::Modified,
+            props: "none".to_owned(),
+            checked: true,
+        }]);
+        app.commit = Some(page);
+        app.apply_accent(&ctx);
+
+        let mut out = ctx.run_ui(crate::testbed::base_input(), |ui| app.commit_page(ui));
+        out.textures_delta.clear();
+        // epaint 里 Glyph::pos.y 就是这一行的基线（相对行起点），行起点再加 galley 起点
+        let mut mark: Option<f32> = None;
+        let mut body: Option<f32> = None;
+        for item in &out.shapes {
+            if let egui::Shape::Text(text) = &item.shape {
+                let line = text.galley.text();
+                if line != "M" && !line.contains("Alpha.java") {
+                    continue;
+                }
+                for row in &text.galley.rows {
+                    for glyph in &row.row.glyphs {
+                        let y = text.pos.y + row.pos.y + glyph.pos.y;
+                        if glyph.chr == 'M' {
+                            mark.get_or_insert(y);
+                        }
+                        if glyph.chr == 'D' {
+                            body.get_or_insert(y);
+                        }
+                    }
+                }
+            }
+        }
+        let mark = mark.expect("列表里没有状态标记 M");
+        let body = body.expect("列表里没有路径文字");
+        assert!(
+            (mark - body).abs() < 0.5,
+            "标记基线 {mark:.2}、路径基线 {body:.2}，错开 {:.2} 像素",
+            (mark - body).abs()
         );
     }
 

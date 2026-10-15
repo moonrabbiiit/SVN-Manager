@@ -152,6 +152,89 @@ pub struct Rollback {
     pub confirm: bool,
     /// 上一次执行的失败原因
     pub error: String,
+    /// 打开窗口那一刻该目录未解决的冲突 / 不完整条目数。回退照常执行，
+    /// 只是要在窗口里说清：这些没解决的会被一起卷进回退结果
+    pub conflicts: usize,
+}
+
+/// 「解决冲突」窗口：列出该目录里必须先人工处理的条目，每条挑一个收场策略，
+/// 勾上的那批一次执行。策略都只动本地工作副本，不碰服务器。
+#[derive(Clone, Default)]
+pub struct Resolve {
+    /// 目录行（也是任务池里的 dir）
+    pub dir: usize,
+    pub rows: Vec<ResolveRow>,
+    /// 列表上方「全部取用」那一行的策略，点一下套到所有行
+    pub bulk: crate::svn::Accept,
+    /// 不完整（~）的条目数：resolve 动不了它们，只报一句「先更新这个目录」
+    pub incomplete: usize,
+    /// 第一下只把按钮换成「确认执行」，再点一次才真的动工作副本
+    pub confirm: bool,
+    /// 上一次执行的失败原因
+    pub error: String,
+}
+
+/// 窗口里的一行 = 一个必须人工处理的条目
+#[derive(Clone)]
+pub struct ResolveRow {
+    /// 本地绝对路径，`svn resolve` / `svn revert` 作用在它上
+    pub target: PathBuf,
+    /// 显示用文件名，整路径挂在 tooltip 上
+    pub name: String,
+    pub accept: crate::svn::Accept,
+    pub checked: bool,
+}
+
+impl Resolve {
+    /// status 结果 → 一版新行：只认真冲突（C），默认全选、默认「保留手头这份」
+    pub fn from_entries(dir: usize, entries: &[crate::svn::StatusEntry]) -> Self {
+        Resolve {
+            dir,
+            rows: Self::rows_of(entries),
+            bulk: crate::svn::Accept::default(),
+            incomplete: entries.iter().filter(|e| e.item == crate::svn::Item::Incomplete).count(),
+            confirm: false,
+            error: String::new(),
+        }
+    }
+
+    fn rows_of(entries: &[crate::svn::StatusEntry]) -> Vec<ResolveRow> {
+        entries
+            .iter()
+            .filter(|entry| entry.item == crate::svn::Item::Conflict)
+            .map(|entry| ResolveRow {
+                target: PathBuf::from(&entry.path),
+                name: entry.name.clone(),
+                accept: crate::svn::Accept::default(),
+                checked: true,
+            })
+            .collect()
+    }
+
+    /// status 重读之后套一遍：还在冲突的保住他挑好的策略和勾，已经解决掉的从列表里消失。
+    /// 窗口开着时人在 BC 里手动合完了，不能让他对着一条早就不存在的旧记录点执行。
+    pub fn rebuild(&mut self, entries: &[crate::svn::StatusEntry]) {
+        let picked = std::mem::take(&mut self.rows);
+        let mut fresh = Self::rows_of(entries);
+        for row in fresh.iter_mut() {
+            if let Some(old) = picked.iter().find(|old| old.target == row.target) {
+                row.accept = old.accept;
+                row.checked = old.checked;
+            }
+        }
+        self.rows = fresh;
+        self.incomplete = entries
+            .iter()
+            .filter(|e| e.item == crate::svn::Item::Incomplete)
+            .count();
+    }
+
+    /// 勾了行且至少一行选了「丢弃本地改动」——revert 会把改动整个扔掉，值得多问一句
+    pub fn drops_local(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.checked && row.accept == crate::svn::Accept::Revert)
+    }
 }
 
 #[derive(Clone)]
@@ -182,6 +265,9 @@ pub struct DirView {
     pub out_of_date: Option<usize>,
     /// 需要人工处理的条目数（冲突 / 不完整）；`None` = 还没读到过，不显示
     pub conflicts: Option<usize>,
+    /// 上面这些条目本身（口径同 `conflicts`）：「解决冲突」窗口列的就是它。
+    /// `changes` 只留可提交的条目，冲突在那里被滤掉了，所以另存一份
+    pub blocked: Vec<crate::svn::StatusEntry>,
     /// 本地端（「绑定对比对象」里那个不受版本控制的目录）与这个工作副本的差异；
     /// `None` = 没绑定、目录读不到或还没测过——和 `changed` 一样，不显示，绝不显示成 0
     pub local_diff: Option<crate::localdiff::Summary>,
@@ -202,7 +288,6 @@ pub enum Maintain {
     Add,
     Delete,
     Cleanup,
-    Resolve,
     Revert,
 }
 
@@ -212,7 +297,6 @@ impl Maintain {
             Self::Add => "加入版本控制",
             Self::Delete => "标记删除",
             Self::Cleanup => "清理工作副本",
-            Self::Resolve => "解决冲突",
             Self::Revert => "撤销修改",
         }
     }
@@ -291,6 +375,8 @@ pub struct RepoApp {
     pub batch_label: Option<BatchLabel>,
     /// 正在确认的版本回退（None = 窗口关闭）
     pub rollback: Option<Rollback>,
+    /// 「解决冲突」窗口（None = 窗口关闭）
+    pub resolve: Option<Resolve>,
     pub show_settings: bool,
     pub confirm_remove: Option<usize>,
     pub auto_scroll: bool,
@@ -511,5 +597,47 @@ mod tests {
             opaque,
             48 * 48
         );
+    }
+
+    /// 「解决冲突」窗口的行口径与重建：只有真冲突进表，不完整的另数一句；
+    /// status 重读后合完的那行消失，还在冲突的那行保住他挑好的策略和勾。
+    #[test]
+    fn resolve_rows_follow_the_latest_status() {
+        use crate::svn::{Accept, Item, StatusEntry};
+        let entry = |name: &str, item: Item| StatusEntry {
+            path: format!(r"D:\wc\{name}"),
+            name: name.to_owned(),
+            item,
+            props: "none".to_owned(),
+            checked: false,
+        };
+        // 同一个文件名给两种状态：筛错一批这条用例就红
+        let mixed = vec![
+            entry("clash.txt", Item::Conflict),
+            entry("half.txt", Item::Conflict),
+            entry("half.txt", Item::Incomplete),
+            entry("mod.txt", Item::Modified),
+        ];
+        let mut panel = Resolve::from_entries(0, &mixed);
+        assert_eq!(panel.rows.len(), 2, "只有冲突条目进窗口，修改与不完整都不该列");
+        assert_eq!(panel.incomplete, 1, "不完整另数一句：它走「更新」，不归 resolve 管");
+        assert!(panel.rows.iter().all(|row| row.checked), "开窗口就是要处理它们，默认全勾");
+        assert_eq!(panel.rows[0].accept, Accept::Working, "默认策略谁都不丢");
+        assert!(!panel.drops_local(), "没人选「丢弃本地改动」时不该亮危险确认");
+
+        panel.rows[0].accept = Accept::TheirsFull;
+        panel.rows[0].checked = false;
+        panel.rebuild(&[entry("clash.txt", Item::Conflict), entry("mod.txt", Item::Modified)]);
+        assert_eq!(panel.rows.len(), 1, "他在 BC 里合完了的那行该从表上消失");
+        assert_eq!(panel.rows[0].name, "clash.txt");
+        assert_eq!(panel.rows[0].accept, Accept::TheirsFull, "重读不该把他挑好的策略抹平");
+        assert!(!panel.rows[0].checked, "勾法同样要保住");
+        assert_eq!(panel.incomplete, 0, "不完整的数跟着新读的 status 走");
+
+        panel.rows[0].accept = Accept::Revert;
+        panel.rows[0].checked = true;
+        assert!(panel.drops_local(), "勾着的行里出现「丢弃本地改动」得多问一句");
+        panel.rows[0].checked = false;
+        assert!(!panel.drops_local(), "没勾的行不该替他承担后果");
     }
 }

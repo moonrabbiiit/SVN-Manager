@@ -190,6 +190,71 @@ pub fn blocked_count(entries: &[StatusEntry]) -> usize {
     entries.iter().filter(|entry| entry.item.blocked()).count()
 }
 
+/// 需要人工处理的条目本身（口径同 `blocked_count`）：「解决冲突」窗口列的就是这一批。
+pub fn blocked_entries(entries: &[StatusEntry]) -> Vec<StatusEntry> {
+    entries
+        .iter()
+        .filter(|entry| entry.item.blocked())
+        .cloned()
+        .collect()
+}
+
+/// 一条冲突的收场策略。前三种是 `svn resolve --accept <取值>` 的不同取值，第四种另走
+/// `svn revert`——想把本地这份整个扔掉、回到干净基线，SVN 只有这一个开关。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Accept {
+    /// 保留手头这份，只把冲突状态摘掉（冲突标记会留在文件里，得自己清）
+    #[default]
+    Working,
+    /// 整份用我自己的版本，服务器带来的改动丢掉
+    MineFull,
+    /// 整份用服务器版本，我在这份文件里的改动丢掉
+    TheirsFull,
+    /// 丢弃本地改动，文件回到干净基线（标记和改动一起没了）
+    Revert,
+}
+
+impl Accept {
+    pub const ALL: [Accept; 4] = [Self::Working, Self::MineFull, Self::TheirsFull, Self::Revert];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Working => "保留手头这份",
+            Self::MineFull => "用我的版本",
+            Self::TheirsFull => "用服务器版本",
+            Self::Revert => "丢弃本地改动",
+        }
+    }
+
+    /// 后果说明：这几种策略都会改动本地文件，两种「用谁的版本」还会丢掉一边，得写明白
+    pub fn tip(self) -> &'static str {
+        match self {
+            Self::Working => "把现在磁盘上这份当已解决，冲突标记 <<<<<<< 留在文件里，\n之后自己删或用 BC 合。",
+            Self::MineFull => "整份用合并前我自己的版本，服务器那次改动从这份文件里消失。",
+            Self::TheirsFull => "整份用服务器版本，我在这份文件里的改动消失。",
+            Self::Revert => "svn revert：本地改动全部丢弃，文件回到工作副本的干净基线。",
+        }
+    }
+
+    /// 发给 `--accept` 的取值；Revert 用的是另一条命令，没有这个参数
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Working => Some("working"),
+            Self::MineFull => Some("mine-full"),
+            Self::TheirsFull => Some("theirs-full"),
+            Self::Revert => None,
+        }
+    }
+
+    /// 输出区里那行命令的意思（`resolve --accept working` / `revert`）
+    pub fn command(self) -> String {
+        match self.flag() {
+            Some(flag) => format!("resolve --accept {flag}"),
+            None => "revert".to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StatusEntry {
     pub path: String,
@@ -787,31 +852,47 @@ impl Svn {
     /// 锚点写 `HEAD` 而不是 `BASE`：svn 把范围收拢到目标当前所在的那个版本，所以工作副本
     /// 落后于服务器时也一样正好回到 `revision`（拿临时仓库实测：本地停在 r2、仓库 HEAD 是 r3，
     /// `merge -r HEAD:1` 报的是「Reverse-merging r2」）。
-    /// `--accept postpone`：这一趟没给它终端，冲突不能让 svn 停下来等键盘；留下
-    /// `.merge-left / .merge-right / .working` 三件套，交给「解决冲突」或 BC 手工合。
+    /// `--accept postpone`：这一趟没给它终端，回退自己在同一行上撞出来的冲突不能让 svn 停下来
+    /// 等键盘；留下 `.merge-left / .merge-right / .working` 三件套，交给「解决冲突」或 BC 手工合。
     /// 同一路径自己往回合不会留下 `svn:mergeinfo`（svn 记完就 elide 掉了），属性不会被带脏。
     pub fn merge_back(&self, target: &Path, revision: &str, on_line: &dyn Fn(&str)) -> Run {
-        let range = format!("HEAD:{revision}");
-        let path = target.to_string_lossy();
-        self.call_stream(
-            &["merge", "-r", &range, "--accept", "postpone", &path],
-            None,
-            on_line,
-        )
+        let owned = Self::merge_back_args(&target.to_string_lossy(), revision);
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+        self.call_stream(&args, None, on_line)
     }
 
-    pub fn resolve_working(&self, dir: &Path, on_line: &dyn Fn(&str)) -> Run {
-        self.call_stream(
-            &[
-                "resolve",
-                "--accept",
-                "working",
-                "--recursive",
-                &dir.to_string_lossy(),
-            ],
-            None,
-            on_line,
-        )
+    /// `merge -r HEAD:<rev>` 的参数。同一条路径要写两遍：svn 的位置参数是「合并源 合并目标」，
+    /// 只给一条时那条被当成合并源、目标退回进程当前目录 —— 主程序从工作副本外面启动时
+    /// 整条命令直接 E155007（拿临时仓库实测）。路径当合并源用自己的 URL，不必先问服务器。
+    pub fn merge_back_args(target: &str, revision: &str) -> Vec<String> {
+        vec![
+            "merge".to_owned(),
+            "-r".to_owned(),
+            format!("HEAD:{revision}"),
+            "--accept".to_owned(),
+            "postpone".to_owned(),
+            target.to_owned(),
+            target.to_owned(),
+        ]
+    }
+
+    /// 「解决冲突」窗口按选定策略收场：同一条策略的多个路径并成一条命令发给 svn。
+    /// `--recursive` 是为了目录条目（tree conflict 挂在目录上时不带它解决不掉），
+    /// 对单个文件没有副作用。
+    pub fn accept_conflicts(
+        &self,
+        accept: Accept,
+        targets: &[PathBuf],
+        on_line: &dyn Fn(&str),
+    ) -> Run {
+        let mut owned: Vec<String> = match accept.flag() {
+            Some(flag) => vec!["resolve".to_owned(), "--accept".to_owned(), flag.to_owned()],
+            None => vec!["revert".to_owned()],
+        };
+        owned.push("--recursive".to_owned());
+        owned.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+        self.call_stream(&args, None, on_line)
     }
 
     /// 修改仓库地址（`svn relocate`）：只改写工作副本里的 URL 元数据，不动任何本地文件。
@@ -1279,5 +1360,56 @@ mod tests {
         assert_eq!(wc_target("", url, local, "/code/HRP.FA/a.cs"), None);
         assert_eq!(wc_target(root, "", local, "/code/HRP.FA/a.cs"), None);
         assert_eq!(wc_target(root, url, Path::new(""), "/code/HRP.FA/a.cs"), None);
+    }
+
+    /// 四条收场策略发给 svn 的写法：三条是 `resolve --accept <取值>` 的不同取值，
+    /// 「丢弃本地改动」resolve 里没有对应取值，只能另走 `revert`。
+    #[test]
+    fn accept_strategies_spell_their_svn_commands() {
+        assert_eq!(Accept::Working.command(), "resolve --accept working");
+        assert_eq!(Accept::MineFull.command(), "resolve --accept mine-full");
+        assert_eq!(Accept::TheirsFull.command(), "resolve --accept theirs-full");
+        assert_eq!(Accept::Revert.command(), "revert", "丢弃本地改动只能靠 revert");
+        assert_eq!(Accept::default(), Accept::Working, "默认策略谁的一边都不丢");
+        assert_eq!(Accept::ALL.len(), 4, "窗口下拉里的选项和这里的策略要一样多");
+    }
+
+    /// 「解决冲突」窗口列的条目必须就是目录行上数出来的那一批：两个口径只能有一处。
+    #[test]
+    fn blocked_entries_are_the_batch_blocked_count_counts() {
+        let xml = r#"<status>
+  <target path="D:\wc">
+    <entry path="D:\wc\clash.txt"><wc-status item="conflicted" props="none"/></entry>
+    <entry path="D:\wc\other\clash.txt"><wc-status item="conflicted" props="none"/></entry>
+    <entry path="D:\wc\half.txt"><wc-status item="incomplete" props="none"/></entry>
+    <entry path="D:\wc\mod.txt"><wc-status item="modified" props="none"/></entry>
+    <entry path="D:\wc\new.txt"><wc-status item="unversioned" props="none"/></entry>
+    <entry path="D:\wc\fine.txt"><wc-status item="normal" props="none"/></entry>
+  </target>
+</status>"#;
+        let entries = parse_status(xml, Path::new(r"D:\wc"));
+        let listed = blocked_entries(&entries);
+        assert_eq!(listed.len(), blocked_count(&entries), "列出来的就该是数出来的那几条");
+        assert_eq!(listed.len(), 3, "冲突两条 + 不完整一条，修改与未版本化不算");
+        assert!(listed.iter().all(|e| e.item.blocked()), "不该掺进能提交的条目");
+        assert_eq!(
+            listed.iter().filter(|e| e.item == Item::Conflict).count(),
+            2,
+            "真冲突是「解决冲突」窗口能动手的那部分"
+        );
+        assert_eq!(listed[1].name, "clash.txt", "同名不同目录的两条都要留下，别按名字并掉");
+    }
+
+    /// 只写一遍路径时 svn 把它当合并源、目标取进程当前目录：主程序从工作副本外面点开就是
+    /// 一条 E155007，回退根本发不出去（临时仓库实测）
+    #[test]
+    fn merge_back_names_both_the_source_and_the_target() {
+        let path = r"D:\wc\trunk";
+        let args = Svn::merge_back_args(path, "7");
+        assert_eq!(
+            args.join(" "),
+            format!("merge -r HEAD:7 --accept postpone {path} {path}"),
+            "路径要写两遍，一遍合并源一遍合并目标"
+        );
     }
 }

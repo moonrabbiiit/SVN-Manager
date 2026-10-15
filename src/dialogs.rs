@@ -4,7 +4,7 @@
 use egui::{Align, Color32, Frame, Key, Layout, RichText, ScrollArea, TextEdit, Vec2};
 
 use crate::jobs::Kind;
-use crate::repo::fmt_rev;
+use crate::repo::{fmt_rev, RepoKind};
 use crate::ui::WindowCentered;
 use crate::{pane_hover, update, APP_VERSION, Level, RepoApp, UploadAll, ink};
 use crate::ui::{AlignedRow, field_margin};
@@ -31,6 +31,20 @@ fn checked_row(ui: &mut egui::Ui, id: egui::Id, checked: bool, add_contents: imp
             ui.horizontal(add_contents);
         });
     ui.interact(row.response.rect, id, egui::Sense::hover());
+}
+
+/// 「解决冲突」窗口里那条策略下拉：四个选项排下来和 `svn resolve --accept` 的取值一一对应，
+/// 选中项的短名当按钮文字。每个选项挂一句后果说明——「用我的版本」和「用服务器版本」
+/// 各会丢掉一边，不写出来最容易点错。
+fn accept_choice(ui: &mut egui::Ui, salt: impl egui::AsIdSalt, selected: &mut crate::svn::Accept) {
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(selected.label())
+        .show_ui(ui, |ui| {
+            for accept in crate::svn::Accept::ALL {
+                ui.selectable_value(selected, accept, accept.label())
+                    .on_hover_text(accept.tip());
+            }
+        });
 }
 
 /// 地址前缀改写：把 `current` 开头的 `from` 换成 `to`。两边都先掐掉尾部斜杠；
@@ -688,6 +702,34 @@ impl RepoApp {
                             .color(ink(ui, Color32::from_rgb(240, 190, 70))),
                     );
                 }
+                if dialog.conflicts > 0 {
+                    // 实测口径：svn 不肯把回退落在正冲突的节点上，拒绝时一个文件都不改；
+                    // 整目录回退只要沾上一个冲突文件就整趟作废，单文件只看它自己
+                    let here = self
+                        .dirs
+                        .get(dir)
+                        .and_then(|view| view.blocked.iter().find(|e| {
+                            e.path.to_ascii_lowercase() == shown.to_ascii_lowercase()
+                        }))
+                        .is_some();
+                    let note = match (kind, is_dir) {
+                        (RepoKind::Git, _) => format!(
+                            "该目录还有 {} 项冲突没解决，回退撞上同一处改动会中途停下",
+                            dialog.conflicts
+                        ),
+                        (_, true) => format!(
+                            "该目录还有 {} 项冲突没解决，svn 会拒绝整趟回退、一个文件都不改\n想先回退别的文件，就只选那个文件",
+                            dialog.conflicts
+                        ),
+                        (_, false) if here =>
+                            "这个文件自己正有冲突，svn 会拒绝这趟回退、不会改动它\n先在目录行「更多 → 解决冲突」把它处理掉".to_string(),
+                        (_, false) => format!(
+                            "该目录还有 {} 项冲突没解决，不在这个文件上，回退它不受影响",
+                            dialog.conflicts
+                        ),
+                    };
+                    ui.label(RichText::new(note).size(11.5).color(ink(ui, Color32::from_rgb(240, 190, 70))));
+                }
                 if !dialog.error.is_empty() {
                     ui.label(
                         RichText::new(dialog.error.clone())
@@ -746,6 +788,143 @@ impl RepoApp {
         }
     }
 
+    /// 「解决冲突」窗口：该目录里必须先人工处理的条目逐行列出来，每行自己挑一个收场策略，
+    /// 勾上的那批一次执行。策略都只动本地工作副本，不碰服务器；「处理」要先确认一次。
+    pub(crate) fn resolve_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut panel) = self.resolve.clone() else { return };
+        let dir = panel.dir;
+        let label = self.dir_label(dir);
+        let running = self.pool.has(Kind::Resolve, dir);
+        let mut open = true;
+        egui::Window::new(format!("解决冲突 · {label}"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .centered(ctx, "resolve")
+            .show(ctx, |ui| {
+                if panel.rows.is_empty() {
+                    ui.label(
+                        RichText::new(if panel.incomplete > 0 {
+                            "没有文本冲突要处理，但有工作副本没读完的条目（不完整）"
+                        } else {
+                            "这个目录现在没有必须人工处理的条目"
+                        })
+                        .size(12.5),
+                    );
+                    if panel.incomplete > 0 {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} 项不完整（~）：resolve 动不了它们，先「更新」这个目录。",
+                                panel.incomplete
+                            ))
+                            .size(11.5)
+                            .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                        );
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(
+                            "每条选一个收场策略，勾上的那些一次处理完。\n\
+                             只改本地工作副本，不碰服务器；之后照样能提交或再撤销。",
+                        )
+                        .size(11.5)
+                        .weak(),
+                    );
+                    ui.add_space(4.0);
+                    // 一行套全部：大多数情况整目录的冲突都是同一种收场，逐行点太累
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("全部取用").size(12.0));
+                        accept_choice(ui, "resolve_bulk", &mut panel.bulk);
+                        if ui.button("套到所有行").clicked() {
+                            for row in panel.rows.iter_mut() {
+                                row.accept = panel.bulk;
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ScrollArea::vertical()
+                        .id_salt("resolve_rows")
+                        .max_height(220.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (index, row) in panel.rows.iter_mut().enumerate() {
+                                let checked = row.checked;
+                                let name = row.name.clone();
+                                let target = row.target.clone();
+                                checked_row(
+                                    ui,
+                                    egui::Id::new(("resolve_row", index)),
+                                    checked,
+                                    |ui| {
+                                        ui.checkbox(&mut row.checked, "");
+                                        ui.label(RichText::new(name).monospace().size(12.0))
+                                            .on_hover_text(target.display().to_string());
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            accept_choice(ui, ("resolve_row", index), &mut row.accept)
+                                        });
+                                    },
+                                );
+                            }
+                        });
+                }
+                if !panel.error.is_empty() {
+                    ui.label(
+                        RichText::new(panel.error.clone())
+                            .size(12.0)
+                            .color(ink(ui, Color32::from_rgb(240, 100, 100))),
+                    );
+                }
+                let picked: Vec<crate::ResolveRow> = panel
+                    .rows
+                    .iter()
+                    .filter(|row| row.checked)
+                    .cloned()
+                    .collect();
+                if picked.is_empty() && panel.rows.is_empty() {
+                    return;
+                }
+                ui.add_space(6.0);
+                ui.aligned_row(|ui| {
+                    if panel.confirm {
+                        let button = egui::Button::new(
+                            RichText::new(format!("确认处理 {} 项", picked.len()))
+                                .strong()
+                                .color(crate::DANGER_TEXT),
+                        )
+                        .fill(crate::DANGER_FILL);
+                        if ui.add_enabled(!running, button).clicked() {
+                            panel.confirm = false;
+                            self.spawn_resolve(dir, picked);
+                        }
+                        if ui.button("先不处理").clicked() {
+                            panel.confirm = false;
+                        }
+                    } else if ui
+                        .add_enabled(
+                            !running,
+                            egui::Button::new(
+                                RichText::new(format!("处理勾选的 {} 项", picked.len())).strong(),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        panel.confirm = true;
+                        self.hint("这会改动本地文件，核对每行的策略后再点「确认处理」");
+                    }
+                    if running {
+                        ui.spinner();
+                        ui.label(RichText::new("正在处理 …").weak().size(11.5));
+                    }
+                });
+            });
+        if open {
+            self.resolve = Some(panel);
+        } else {
+            self.resolve = None;
+        }
+    }
+
     // ------------------------------------------------------------ 「全部上传」窗口
 
     /// 所有目录用同一条说明各起一个提交任务。会改动服务器，所以第一下只亮出确认按钮。
@@ -796,7 +975,7 @@ impl RepoApp {
                 ui.label(
                     RichText::new(
                         "· 提交完别人立刻就能看到，本地撤不回来（要退回只能再提交一次）\n\
-                         · 清单 = 各目录全部可提交项：未版本化(?) 提交时自动 svn add、已丢失(!) 自动 svn delete，\n\
+                         · 清单 = 各目录全部可提交项：未版本化(?) 提交时先加入版本控制、已丢失(!) 先标记删除，\n\
                          与修改项一起一次提交，不需要再手动标记删除和添加\n\
                          · 冲突 / 不完整的条目不会被带上；没有可提交改动的目录自动跳过\n\
                          · 勾选参与本次上传的目录（默认全选）；点「待提交 X 项」可先核对明细\n\
@@ -1065,7 +1244,7 @@ impl RepoApp {
                 });
                 ui.label(
                     RichText::new(
-                        "这些就是「全部上传」会提交的条目：新增(?)、已丢失(!) 提交时自动补 svn add / svn delete，无需手动标记",
+                        "这些就是「全部上传」会提交的条目：未版本化(?)、已丢失(!) 提交时会先加入版本控制或标记删除，无需手动标记",
                     )
                     .weak()
                     .size(11.0),
@@ -1110,15 +1289,21 @@ impl RepoApp {
                                     ));
                                 if entry.item.needs_add() {
                                     ui.label(
-                                        RichText::new("提交时自动 add")
+                                        RichText::new("提交时新增")
                                             .size(10.5)
                                             .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                                    )
+                                    .on_hover_text(
+                                        "这个文件目前只在本地，提交时会先加入版本控制（svn add），再作为新文件上传到服务器",
                                     );
                                 } else if entry.item.needs_delete() {
                                     ui.label(
-                                        RichText::new("提交时自动 delete")
+                                        RichText::new("提交时删除")
                                             .size(10.5)
                                             .color(ink(ui, Color32::from_rgb(240, 190, 70))),
+                                    )
+                                    .on_hover_text(
+                                        "这个文件本地已经删掉了，提交时会先标记删除（svn delete），服务器上的那份也一并删除",
                                     );
                                 }
                             });

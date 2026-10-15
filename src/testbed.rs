@@ -126,6 +126,7 @@ pub fn stub_app(compact: bool) -> RepoApp {
         batch_relocate: None,
         batch_label: None,
         rollback: None,
+        resolve: None,
         show_settings: false,
         confirm_remove: None,
         auto_scroll: true,
