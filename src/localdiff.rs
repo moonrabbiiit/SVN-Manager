@@ -189,6 +189,30 @@ impl Excludes {
         out
     }
 
+    /// 扁平清单版的排除判定：给一条相对根目录的路径，判它自己或它的任一级父目录是否被排除。
+    /// `walk()` 走的是递归剪枝，提交页拿到的是「一条一条状态条目」、没有目录树可剪，所以自己
+    /// 逐级认父段。条目到底是文件还是目录 `StatusEntry` 没带，末级段就两种身份各试一次：
+    /// 这样 `bin\` 既命中 `bin` 目录本身，也命中 `src/main/bin/x.class`。
+    pub fn hits(&self, rel: &str) -> bool {
+        let joined = rel.replace('\\', "/").to_ascii_lowercase();
+        let flat = joined.trim_matches('/');
+        if flat.is_empty() {
+            return false;
+        }
+        let last = flat.rsplit('/').next().unwrap_or(flat);
+        if self.skips_file(last, flat) || self.skips_dir(last, flat) {
+            return true;
+        }
+        for (index, _) in flat.match_indices('/') {
+            let parent = &flat[..index];
+            let name = parent.rsplit('/').next().unwrap_or("");
+            if self.skips_dir(name, parent) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// rel 是相对根目录的 `/` 分隔路径
     fn skips_dir(&self, name: &str, rel: &str) -> bool {
         let lower = name.to_ascii_lowercase();
@@ -1019,6 +1043,22 @@ mod tests {
         assert_eq!(s.only_server, 1);
         assert!(s.samples.contains(&"src/auth.json".to_owned()), "{:?}", s.samples);
         assert!(s.samples.contains(&"src/.idea/work.xml".to_owned()), "{:?}", s.samples);
+    }
+
+    /// 扁平清单判定要和 `walk()` 的剪枝口径对齐：目录名命中它本身、也命中它底下任意深度的
+    /// 文件；根锚定的多段目录只认根上那一份（PR #4 修的就是这种写法永不命中）。
+    #[test]
+    fn excludes_hits_matches_flat_paths_through_their_parents() {
+        let ex = Excludes::parse(r"-bin\;-.project;-.\HRP.Web\build\;-*.log");
+        assert!(ex.hits("bin"), "目录条目本身");
+        assert!(ex.hits(r"src\main\bin\b.class"), "深层 bin 底下的文件，反斜杠输入一样算");
+        assert!(ex.hits("HRP.Web/build/out.txt"), "根锚定的多段目录命中它下面的内容");
+        assert!(!ex.hits("x/HRP.Web/build/out.txt"), "根锚定不该把深层同名目录一起带走");
+        assert!(ex.hits("debug.log"), "带通配符的文件名");
+        assert!(ex.hits("A/B/.PROJECT"), "Windows 路径大小写不算数");
+        assert!(!ex.hits("bin2/x.txt"), "名字前缀像但不等于");
+        assert!(!ex.hits("src/app.vue"), "没命中的正常条目");
+        assert!(ex.hits(".svn/entries"), "工作副本元数据永远排除");
     }
 
     /// `\名字` 与 `.\名字` 同义，都锚定根目录；子目录里的照常比较

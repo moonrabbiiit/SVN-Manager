@@ -135,6 +135,33 @@ pub struct BatchLabel {
     pub focus: bool,
 }
 
+/// 目录行「更多 → 差异过滤与提交屏蔽」的窗口状态。两格都是本目录的配置：过滤条件写
+/// `DirConfig::bc_filter`（只管本地差异比对）、屏蔽规则写 `DirConfig::commit_excludes`
+/// （决定会不会被提交）。窗口里另存一份过滤条件的行视图：配置里是分号串，
+/// 框里要一行一条。
+#[derive(Clone)]
+pub struct CommitRules {
+    /// 打开窗口那一刻提交页所在的目录
+    pub dir: usize,
+    /// `bc_filter` 的行视图：编辑期间以它为准，落盘时按 `;` 拼回分号串
+    pub filter_buf: String,
+    /// 窗口开着时过滤条件改过：关窗口那一刻按新口径重算一次本地差异
+    pub filter_dirty: bool,
+    /// 打开时抢一下过滤框的焦点
+    pub focus: bool,
+}
+
+impl CommitRules {
+    pub(crate) fn new(dir: usize, bc_filter: &str) -> Self {
+        Self {
+            dir,
+            filter_buf: crate::commit::bc_filter_lines(bc_filter),
+            filter_dirty: false,
+            focus: true,
+        }
+    }
+}
+
 /// 「回退到某个版本」确认窗口：把整个目录或单个文件倒回所选版本，改动先落在本地。
 #[derive(Clone)]
 pub struct Rollback {
@@ -261,6 +288,9 @@ pub struct DirView {
     pub changed: Option<usize>,
     /// 待提交条目明细，来自最近一次检测或「待提交 X 项」点开的现读
     pub changes: Vec<crate::svn::StatusEntry>,
+    /// 上面这一份的来源：最近一次读取到的**全部**改动条目，本目录屏蔽规则挡掉的也在里面。
+    /// 「过滤与屏蔽规则」窗口边写规则边算命中数就靠它，`changes` 里那些已经滤干净了
+    pub all_changes: Vec<crate::svn::StatusEntry>,
     /// 服务器上已变、本地还没更新的文件数（`svn status -u`，比本地/远端版本号可靠）
     pub out_of_date: Option<usize>,
     /// 需要人工处理的条目数（冲突 / 不完整）；`None` = 还没读到过，不显示
@@ -341,11 +371,6 @@ pub struct RepoApp {
     pub edit_label: Option<usize>,
     pub label_buf: String,
     pub label_focus: bool,
-    /// 正在修改 BC 名称筛选的目录行（编辑器放在目录行里，
-    /// 不能塞进「更多」菜单——menu_button 里点输入框本身就会把菜单关掉）
-    pub edit_filter: Option<usize>,
-    pub filter_buf: String,
-    pub filter_focus: bool,
     /// 正在修改分组的目录行
     pub edit_group: Option<usize>,
     pub group_buf: String,
@@ -377,6 +402,8 @@ pub struct RepoApp {
     pub rollback: Option<Rollback>,
     /// 「解决冲突」窗口（None = 窗口关闭）
     pub resolve: Option<Resolve>,
+    /// 「差异过滤与提交屏蔽」窗口，目录行「更多」里开（None = 窗口关闭）
+    pub commit_rules: Option<CommitRules>,
     pub show_settings: bool,
     pub confirm_remove: Option<usize>,
     pub auto_scroll: bool,

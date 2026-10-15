@@ -82,6 +82,8 @@ pub enum Data {
         changed: Option<usize>,
         /// 会进「全部上传」的变动明细（含 ? 自动 add、! 自动 delete 的条目）
         changes: Vec<StatusEntry>,
+        /// 未经本目录屏蔽规则过滤的完整改动清单：规则窗口的「当前命中 N 项」按它现算
+        all_changes: Vec<StatusEntry>,
         /// 需要人工处理的条目数（冲突 / 不完整），按**未过滤**的 status 结果统计：
         /// `changed` / `changes` 只留可提交的条目，冲突会被滤掉，不另外数就没人知道自己卡住了
         conflicts: Option<usize>,

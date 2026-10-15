@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use egui::{Align, Button, Color32, FontId, Frame, Layout, RichText, ScrollArea, TextEdit, Ui, Vec2};
 
 use crate::jobs::{Data, Kind, Sink};
+use crate::localdiff::Excludes;
 use crate::repo::RepoKind;
-use crate::svn::{blocked_count, Item, StatusEntry, Svn};
+use crate::svn::{Item, StatusEntry, Svn};
 use crate::{highlight, ink, Level, Maintain, RepoApp};
 use crate::ui::{AlignedRow, field_margin};
 
@@ -21,6 +22,11 @@ pub struct CommitPage {
     pub error: String,
     pub done_ok: bool,
     pub filter: String,
+    /// 「显示屏蔽的 N 项」开关：关掉时被屏蔽的条目连列表都不出现
+    pub show_excluded: bool,
+    /// 与 entries 等长的屏蔽掩码，每帧在 `commit_page` 里按本目录规则重算，
+    /// 显示、计数、提交清单、批量勾选四个口径共用这一份
+    pub excluded: Vec<bool>,
     pub picked: usize,
     pub diff: String,
     /// 当前这份差异是否忽略空白与换行（按正在看的那一项决定：XML 自动勾选，其余默认不勾）
@@ -40,6 +46,8 @@ impl CommitPage {
             error: String::new(),
             done_ok: false,
             filter: String::new(),
+            show_excluded: false,
+            excluded: Vec::new(),
             picked: usize::MAX,
             diff: String::new(),
             diff_ignore: false,
@@ -53,8 +61,42 @@ impl CommitPage {
         self.picked = usize::MAX;
         self.diff.clear();
         self.error.clear();
+        // 屏蔽掩码是按条目索引存的下标对应关系，条目一换就全错位：清掉等下一帧重算
+        self.excluded.clear();
         // 重新读过状态就把「没更新到最新」的确认撤掉：清单变了，之前那一下点的是旧清单
         self.confirm_outdated = false;
+    }
+
+    /// 按本目录的屏蔽规则重算掩码，一帧里在所有口径之前调用一次。
+    pub(crate) fn apply_gate(&mut self, root: &Path, raw: &str) {
+        let gate = Gate::new(root, raw);
+        if gate.excludes.is_none() {
+            self.excluded.clear();
+            return;
+        }
+        self.excluded = self.entries.iter().map(|entry| gate.hits(entry)).collect();
+    }
+
+    /// 第 index 条是否被屏蔽。掩码越界一律按「没屏蔽」算：宁可多列一项让人看见，
+    /// 也不能把该提交的东西静悄悄漏掉。
+    pub(crate) fn is_excluded(&self, index: usize) -> bool {
+        self.excluded.get(index).copied().unwrap_or(false)
+    }
+
+    /// 本目录当前被屏蔽掉的条目数（顶栏那颗开关上的数字）。
+    pub(crate) fn hidden_count(&self) -> usize {
+        self.excluded.iter().filter(|hidden| **hidden).count()
+    }
+
+    /// 三个批量勾选按钮共用：被屏蔽的条目一律跳过。勾不上的东西不该能被勾上，
+    /// 否则又回到「屏幕上找不到、却照样传了上去」。
+    fn set_checks(&mut self, keep: impl Fn(Item) -> bool) {
+        for index in 0..self.entries.len() {
+            if self.is_excluded(index) {
+                continue;
+            }
+            self.entries[index].checked = keep(self.entries[index].item);
+        }
     }
 
     /// 这次要提交的路径。未版本化(?) 与已丢失(!) 也算在内：提交前会先替它们补上
@@ -62,13 +104,15 @@ impl CommitPage {
     pub fn commit_targets(&self) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|entry| {
-                entry.checked
+            .enumerate()
+            .filter(|(index, entry)| {
+                !self.is_excluded(*index)
+                    && entry.checked
                     && (entry.item.committable()
                         || entry.item.needs_add()
                         || entry.item.needs_delete())
             })
-            .map(|entry| entry.path.clone())
+            .map(|(_, entry)| entry.path.clone())
             .collect()
     }
 
@@ -76,43 +120,64 @@ impl CommitPage {
     pub fn selected_targets(&self, op: Maintain) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|entry| entry.checked)
-            .filter(|entry| match op {
+            .enumerate()
+            .filter(|(index, entry)| entry.checked && !self.is_excluded(*index))
+            .filter(|(_, entry)| match op {
                 Maintain::Add => entry.item == Item::Unversioned,
                 Maintain::Delete => entry.item == Item::Missing,
                 _ => false,
             })
-            .map(|entry| entry.path.clone())
+            .map(|(_, entry)| entry.path.clone())
             .collect()
     }
 
     /// 未版本化算进「新增」、已丢失算进「删除」（提交时会自动补 add / delete），
-    /// 「需处理」只剩冲突、不完整这类必须人工干预的条目。
+    /// 「需处理」只剩冲突、不完整这类必须人工干预的条目。被屏蔽的不参与计数。
     fn counts(&self) -> (usize, usize, usize, usize) {
         let mut added = 0;
         let mut modified = 0;
         let mut deleted = 0;
-        for entry in &self.entries {
-            match entry.item {
+        let mut blocked = 0;
+        for index in 0..self.entries.len() {
+            if self.is_excluded(index) {
+                continue;
+            }
+            match self.entries[index].item {
                 Item::Added | Item::Unversioned => added += 1,
                 Item::Modified | Item::Replaced => modified += 1,
                 Item::Deleted | Item::Missing => deleted += 1,
+                item if item.blocked() => blocked += 1,
                 _ => {}
             }
         }
-        (added, modified, deleted, blocked_count(&self.entries))
+        (added, modified, deleted, blocked)
     }
 
     fn visible(&self) -> Vec<usize> {
-        let filter = self.filter.trim().to_lowercase();
+        let needles = filter_needles(&self.filter);
         (0..self.entries.len())
+            .filter(|index| self.show_excluded || !self.is_excluded(*index))
             .filter(|index| {
-                filter.is_empty()
-                    || self.entries[*index].name.to_lowercase().contains(&filter)
-                    || self.entries[*index].path.to_lowercase().contains(&filter)
+                needles.is_empty()
+                    || needles.iter().any(|needle| {
+                        let entry = &self.entries[*index];
+                        entry.name.to_lowercase().contains(needle)
+                            || entry.path.to_lowercase().contains(needle)
+                    })
             })
             .collect()
     }
+}
+
+/// 过滤框是单行的，多个关键字用 `;` 隔开，任一命中即留下（OR）；空段丢掉、整体转小写。
+/// 转好的列表同时喂给判定与高亮，两边才是同一个口径——以前判定用 Unicode 折叠、高亮只认
+/// ASCII 大小写，中文关键字能过滤出来却标不亮。
+pub(crate) fn filter_needles(raw: &str) -> Vec<String> {
+    raw.split(';')
+        .map(str::trim)
+        .filter(|needle| !needle.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// 提交前要先补做标记的条目怎么说：计数为 0 的那一类不提，两类都没有时返回空串。
@@ -144,11 +209,143 @@ fn relative_to_root(full: &str, root: &Path) -> String {
     full.to_owned()
 }
 
+/// 弹窗里那一框是「一行一条」，而 `Excludes::parse` 认的是 BC 那套 `;` 分隔、`-` 前缀的写法。
+/// 这里把两种写法缝合起来，让屏蔽框里只写 `bin\`、`*.log` 就能生效，不必再抄一遍 `-`：
+/// 逐行去空白、丢空行与 `#` 注释与 `+`（包含模式本功能不支持，留着只会让人以为能写），
+/// 缺 `-` 的补上；不带 `.\` / `\` 锚定却带层级的裸路径（`A\B\target\`）补成 `./A\B\target\`，
+/// 因为这种写法在 `Excludes` 里根本打不中——issue #4 就是栽在这条上。`;` 分隔的老写法照样认。
+fn normalize_excludes(raw: &str) -> String {
+    let mut parts = Vec::new();
+    for line in raw.split(['\n', '\r', ';']).map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with('+') {
+            continue;
+        }
+        let body = line.strip_prefix('-').unwrap_or(line).trim();
+        if body.is_empty() {
+            continue;
+        }
+        let anchored = body.starts_with(".\\")
+            || body.starts_with("./")
+            || body.starts_with('\\')
+            || body.starts_with('/');
+        let segments = body.split(['\\', '/']).filter(|s| !s.is_empty()).count();
+        // 只有一段（`bin\`、`debug.log`）不用锚定，按末级名在任意层级命中正是想要的；
+        // 多段又不锚定的必须补 `./`，否则整条规则形同没写
+        let pattern = if anchored || segments < 2 {
+            body.to_owned()
+        } else {
+            format!("./{body}")
+        };
+        parts.push(format!("-{pattern}"));
+    }
+    parts.join(";")
+}
+
+/// `bc_filter` 在配置里是 BC 那套分号串（`-*.iml;-bin\`），弹窗里要一行一条：
+/// 按分号与换行拆开、去空白、丢空行，用换行拼回去。
+pub(crate) fn bc_filter_lines(raw: &str) -> String {
+    raw.split([';', '\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 行视图拼回配置里的分号串。只做拆行与 `;` 拼接，不补 `-` 也不补 `./`：
+/// 这份口径要和他用同一份筛选打开的 Beyond Compare 对得上，目录行那个单行编辑器
+/// 写的也是原样文本，这里擅自加工反而会多出两个说不清的版本。
+pub(crate) fn bc_filter_rules(buf: &str) -> String {
+    buf.split(['\n', '\r', ';'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// 一个目录的「屏蔽闸门」：把配置里那串规则解析一次，之后显示、计数、提交清单、提交前复核
+/// 都反复问同一份。规则为空时压根不解析，默认用户零成本。
+pub(crate) struct Gate {
+    root: PathBuf,
+    excludes: Option<Excludes>,
+}
+
+impl Gate {
+    pub(crate) fn new(root: &Path, raw: &str) -> Self {
+        let normalized = normalize_excludes(raw);
+        Self {
+            root: root.to_path_buf(),
+            excludes: (!normalized.is_empty()).then(|| Excludes::parse(&normalized)),
+        }
+    }
+
+    /// 一条本地绝对路径是否被屏蔽。只用本地 path，不碰 svn 的 url：
+    /// url 是正斜杠的仓库地址，跟本地排除规则不是一个坐标系。
+    pub(crate) fn hits_path(&self, full: &str) -> bool {
+        self.excludes
+            .as_ref()
+            .map(|excludes| excludes.hits(&relative_to_root(full, &self.root)))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn hits(&self, entry: &StatusEntry) -> bool {
+        self.hits_path(&entry.path)
+    }
+}
+
+/// 「真正会进提交清单的条目」——主页的待提交数、「全部上传」的清单、提交页的清单都必须走这一个
+/// 口径，否则就出现「屏幕上看不见却照样传上去了」。
+pub(crate) fn pending_entries(entries: &[StatusEntry], root: &Path, raw: &str) -> Vec<StatusEntry> {
+    let gate = Gate::new(root, raw);
+    entries
+        .iter()
+        .filter(|entry| entry.item.uploadable() && !gate.hits(entry))
+        .cloned()
+        .collect()
+}
+
+/// 这份清单里被屏蔽规则命中了多少条。口径与提交页顶栏「显示屏蔽的 N 项」完全一致（只问命中，
+/// 不再筛掉冲突一类条目），两处数字不一样会让人以为规则在乱跳。
+/// 规则窗口边写边报这个数，靠的是最近一次读取的完整清单，不必先进提交页。
+pub(crate) fn excluded_count(entries: &[StatusEntry], root: &Path, raw: &str) -> usize {
+    let gate = Gate::new(root, raw);
+    entries.iter().filter(|entry| gate.hits(entry)).count()
+}
+
+/// 「全部上传」的三份名单：targets 交给 svn commit，adds / deletes 是提交前要先补的标记。
+/// 单独成一个函数只为一件事——用例能拿同一批条目、同一个根、同一条规则，逐项比对它和提交页
+/// 给出的清单，旁路各算一套正是这个功能最容易出的事故。
+pub(crate) fn upload_plan(entries: &[StatusEntry], root: &Path, raw: &str) -> CommitPlan {
+    let picked = pending_entries(entries, root, raw);
+    let paths = |keep: fn(Item) -> bool| {
+        picked
+            .iter()
+            .filter(|entry| keep(entry.item))
+            .map(|entry| entry.path.clone())
+            .collect()
+    };
+    CommitPlan {
+        targets: picked.iter().map(|entry| entry.path.clone()).collect(),
+        adds: paths(Item::needs_add),
+        deletes: paths(Item::needs_delete),
+        excludes: raw.to_owned(),
+    }
+}
+
 /// 一次提交的清单：真正交给 `svn commit` 的路径，以及提交前要先补 svn add / svn delete 的路径。
+/// `excludes` 是该目录的屏蔽规则原文：后台任务在提交前用它再复核一遍，旁路进来的清单（「全部上传」、
+/// 界面还没来得及重读的旧勾选）也挡得住。
 pub struct CommitPlan {
     pub targets: Vec<String>,
     pub adds: Vec<String>,
     pub deletes: Vec<String>,
+    pub excludes: String,
+}
+
+/// 提交前的最后一道闸：把一份路径清单里被屏蔽规则命中的摘掉，返回摘掉的条数。
+fn gate_list(list: &mut Vec<String>, gate: &Gate) -> usize {
+    let before = list.len();
+    list.retain(|full| !gate.hits_path(full));
+    before - list.len()
 }
 
 impl RepoApp {
@@ -237,6 +434,12 @@ impl RepoApp {
             self.hint("无法提交：该目录已从列表中移除");
             return;
         };
+        let excludes = self
+            .cfg
+            .dirs
+            .get(index)
+            .map(|dir| dir.commit_excludes.clone())
+            .unwrap_or_default();
         if self.dir_kind(index) == RepoKind::Git {
             let Some(git) = self.git_or_none() else { return };
             // git 不收空的提交说明（svn 可以留空，git 会直接拒掉）
@@ -260,10 +463,9 @@ impl RepoApp {
                             reload: false,
                         };
                     }
-                    let targets: Vec<String> = entries
-                        .iter()
-                        .filter(|entry| entry.item.uploadable())
-                        .map(|entry| entry.path.clone())
+                    let targets: Vec<String> = pending_entries(&entries, &path, &excludes)
+                        .into_iter()
+                        .map(|entry| entry.path)
                         .collect();
                     if targets.is_empty() {
                         return Data::Run {
@@ -300,23 +502,7 @@ impl RepoApp {
                         reload: false,
                     };
                 }
-                let picked: Vec<&StatusEntry> = entries
-                    .iter()
-                    .filter(|entry| entry.item.uploadable())
-                    .collect();
-                let plan = CommitPlan {
-                    targets: picked.iter().map(|entry| entry.path.clone()).collect(),
-                    adds: picked
-                        .iter()
-                        .filter(|entry| entry.item.needs_add())
-                        .map(|entry| entry.path.clone())
-                        .collect(),
-                    deletes: picked
-                        .iter()
-                        .filter(|entry| entry.item.needs_delete())
-                        .map(|entry| entry.path.clone())
-                        .collect(),
-                };
+                let plan = upload_plan(&entries, &path, &excludes);
                 if plan.targets.is_empty() {
                     let text = format!("{label}：没有可提交的改动，已跳过");
                     return Data::Run {
@@ -352,6 +538,14 @@ impl RepoApp {
             self.back_to_main();
             return;
         };
+        // 屏蔽掩码一帧只算一次，后面显示 / 计数 / 清单 / 批量勾选四个口径共用这一份
+        let excludes = self
+            .cfg
+            .dirs
+            .get(page.dir)
+            .map(|dir| dir.commit_excludes.clone())
+            .unwrap_or_default();
+        page.apply_gate(&path, &excludes);
         let git_kind = self.dir_kind(page.dir) == RepoKind::Git;
         let url = self
             .dirs
@@ -422,7 +616,8 @@ impl RepoApp {
         ui.separator();
 
         let (added, modified, deleted, blocked) = page.counts();
-        let total = page.entries.len();
+        // 「共 N 项」跟旁边三项同一口径：被屏蔽的不算在本次提交里，也就不算进这个数
+        let total = page.entries.len() - page.hidden_count();
         ui.aligned_row(|ui| {
             // 统计和操作按钮合并成一行：左边是口径，右边是动作
             ui.label(RichText::new(format!("本次修改内容：共 {total} 项")).strong().size(13.5));
@@ -453,28 +648,20 @@ impl RepoApp {
             // 勾上了也不会进提交——默认进场就是按 uploadable 勾好的，一般用不着它
             if ui
                 .button("全选")
-                .on_hover_text("勾选列表中的所有条目。注意：冲突等须先人工处理的状态，即使勾选也不会被提交；如需恢复默认勾选，请点击「只选可提交项」")
+                .on_hover_text("勾选列表中的所有条目（本目录已屏蔽的条目不参与）。注意：冲突等须先人工处理的状态，即使勾选也不会被提交；如需恢复默认勾选，请点击「只选可提交项」")
                 .clicked()
             {
-                for entry in page.entries.iter_mut() {
-                    entry.checked = true;
-                }
+                page.set_checks(|_| true);
             }
             if ui.button("全不选").clicked() {
-                for entry in page.entries.iter_mut() {
-                    entry.checked = false;
-                }
+                page.set_checks(|_| false);
             }
             if ui
                 .button("只选可提交项")
-                .on_hover_text("恢复默认勾选：勾选所有可随本次上传提交的条目（含提交时新增的未版本化项、提交时删除的已丢失项），冲突等须先人工处理的条目不勾选")
+                .on_hover_text("恢复默认勾选：勾选所有可随本次上传提交的条目（含提交时新增的未版本化项、提交时删除的已丢失项），冲突等须先人工处理的条目不勾选；本目录已屏蔽的条目不参与")
                 .clicked()
             {
-                for entry in page.entries.iter_mut() {
-                    entry.checked = entry.item.committable()
-                        || entry.item.needs_add()
-                        || entry.item.needs_delete();
-                }
+                page.set_checks(Item::uploadable);
             }
             ui.label(RichText::new("|").weak());
             // 会改动工作副本的按钮：有写任务时直接置灰（置灰即点不动，显示与行为不会打架）
@@ -498,6 +685,16 @@ impl RepoApp {
                 if remove.clicked() {
                     self.spawn_maintain(page.dir, Maintain::Delete);
                 }
+                // 屏蔽挡得住提交，挡不住 `svn revert --recursive`：整目录一起倒回去。
+                // 唯一的例外，所以两态都要在 hover 里说清有多少被屏蔽的项会跟着丢
+                let hidden = page.hidden_count();
+                let revert_tip = if hidden > 0 {
+                    format!(
+                        "svn revert --recursive：本目录已屏蔽的 {hidden} 项也会被一起撤销，改动不可恢复"
+                    )
+                } else {
+                    "svn revert --recursive".to_owned()
+                };
                 let revert = if page.confirm_revert {
                     ui.add(
                         Button::new(
@@ -508,15 +705,22 @@ impl RepoApp {
                         .fill(Color32::from_rgb(150, 60, 60)),
                     )
                 } else {
-                    ui.button("撤销全部修改").on_hover_text("svn revert --recursive")
+                    ui.button("撤销全部修改")
                 };
+                let revert = revert.on_hover_text(revert_tip);
                 if revert.clicked() {
                     if page.confirm_revert {
                         page.confirm_revert = false;
                         self.spawn_maintain(page.dir, Maintain::Revert);
                     } else {
                         page.confirm_revert = true;
-                        self.hint("再次点击将丢弃该目录下所有本地修改（不可恢复）");
+                        self.hint(if hidden > 0 {
+                            format!(
+                                "再次点击将丢弃该目录下所有本地修改（不可恢复），含已屏蔽的 {hidden} 项"
+                            )
+                        } else {
+                            "再次点击将丢弃该目录下所有本地修改（不可恢复）".to_owned()
+                        });
                     }
                 }
                 if page.confirm_revert && ui.button("放弃撤销").clicked() {
@@ -529,7 +733,16 @@ impl RepoApp {
                         .hint_text("按名称过滤（命中处高亮）")
                         .margin(field_margin(ui))
                         .desired_width(210.0),
-                );
+                )
+                .on_hover_text("只是这一页看不到了，勾着的照样会提交：要长期不提交某类文件，写进目录行「更多 → 差异过滤与提交屏蔽」。多个关键字用 ; 隔开");
+                // 一条都没屏蔽时不必占一个开关位；N 就是这枚开关的存在理由，写进标签里
+                let hidden = page.hidden_count();
+                if hidden > 0 {
+                    ui.toggle_value(&mut page.show_excluded, format!("显示屏蔽的 {hidden} 项"))
+                        .on_hover_text(
+                            "勾上就把被屏蔽的条目也列出来（置灰、勾不动）；它们不会进本次提交清单，规则在目录行「更多 → 差异过滤与提交屏蔽」里改",
+                        );
+                }
             });
         });
         if !page.error.is_empty() {
@@ -685,6 +898,7 @@ impl RepoApp {
                                     targets: targets.clone(),
                                     adds: adds.clone(),
                                     deletes: deletes.clone(),
+                                    excludes: excludes.clone(),
                                 },
                                 page.message.clone(),
                             );
@@ -726,7 +940,7 @@ impl RepoApp {
         }
         ui.separator();
 
-        let filter = page.filter.trim().to_owned();
+        let needles = filter_needles(&page.filter);
         ui.columns(2, |columns| {
             let list_width = columns[0].available_width();
             let picked = page.picked;
@@ -743,20 +957,27 @@ impl RepoApp {
                 .show(&mut columns[0], |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     if visible.is_empty() && !reading {
-                        ui.label(
-                            RichText::new(if page.filter.is_empty() {
-                                "没有本地修改，无需提交"
-                            } else {
-                                "过滤后没有匹配项"
-                            })
-                            .weak(),
-                        );
+                        // 三种「列表是空的」要说得开：被过滤掉了、改的全在屏蔽规则里、真没改
+                        let empty_note = if !page.filter.trim().is_empty() {
+                            "过滤后没有匹配项".to_owned()
+                        } else if !page.entries.is_empty() {
+                            format!("已屏蔽 {} 项，未列入本次提交", page.hidden_count())
+                        } else {
+                            "没有本地修改，无需提交".to_owned()
+                        };
+                        ui.label(RichText::new(empty_note).weak());
                     }
                     for index in visible {
                         let entry = page.entries[index].clone();
-                        // A/M/D 标记与文件名共用同一个类型色
+                        let hidden = page.is_excluded(index);
+                        // A/M/D 标记与文件名共用同一个类型色；被屏蔽的整行压成弱色，
+                        // 一眼看出这一条不在本次提交里（只有开了开关才会出现在这儿）
                         let rgb = entry.item.color();
-                        let color = ink(ui, Color32::from_rgb(rgb.0, rgb.1, rgb.2));
+                        let color = if hidden {
+                            ui.visuals().weak_text_color()
+                        } else {
+                            ink(ui, Color32::from_rgb(rgb.0, rgb.1, rgb.2))
+                        };
                         Frame::new()
                             .inner_margin(3.0)
                             .corner_radius(4.0)
@@ -768,9 +989,18 @@ impl RepoApp {
                             .show(ui, |ui| {
                                 ui.aligned_row(|ui| {
                                     let mut checked = entry.checked;
-                                    if ui.checkbox(&mut checked, "").on_hover_text("勾选后提交该项").changed() {
+                                    // 屏蔽行连勾选都禁用：勾不动才和「不进提交清单」说得一致
+                                    let toggle = ui
+                                        .add_enabled_ui(!hidden, |ui| ui.checkbox(&mut checked, ""))
+                                        .inner;
+                                    if toggle.changed() {
                                         page.entries[index].checked = checked;
                                     }
+                                    toggle.on_hover_text(if hidden {
+                                        "已被本目录的屏蔽规则挡下，不会进入本次提交；规则写在目录行「更多 → 差异过滤与提交屏蔽」里"
+                                    } else {
+                                        "勾选后提交该项"
+                                    });
                                     ui.label(
                                         RichText::new(entry.item.mark().to_string())
                                             .strong()
@@ -793,7 +1023,7 @@ impl RepoApp {
                                                     egui::Label::new(highlight(
                                                         ui,
                                                         &display,
-                                                        &filter,
+                                                        &needles,
                                                         FontId::proportional(12.5),
                                                         color,
                                                     ))
@@ -846,6 +1076,10 @@ impl RepoApp {
                                     if entry.props != "none" {
                                         ui.label(RichText::new("属性变更").size(11.0).weak());
                                     }
+                                    if hidden {
+                                        ui.label(RichText::new("已屏蔽").size(11.0).weak())
+                                        .on_hover_text("本目录的屏蔽规则挡住了这一条：不显示、不勾选、不进提交清单；这一行是顶栏「显示屏蔽的 N 项」开关打开后才出现的");
+                                    }
                                 });
                             });
                     }
@@ -880,7 +1114,7 @@ impl RepoApp {
                     let job = highlight(
                         &columns[0],
                         &target_path,
-                        &filter,
+                        &needles,
                         FontId::proportional(11.0),
                         ink(&columns[0], Color32::from_rgb(rgb.0, rgb.1, rgb.2)),
                     );
@@ -975,7 +1209,16 @@ fn commit_run(
     message: &str,
     update_after_commit: bool,
 ) -> Data {
-    let CommitPlan { targets, adds, deletes } = plan;
+    let CommitPlan { mut targets, mut adds, mut deletes, excludes } = plan;
+    // 最后一道闸：清单里被本目录屏蔽规则命中的路径一律摘掉。提交页给的清单本来就在屏幕上挡好了，
+    // 这一层防的是旁路——「全部上传」现读的清单、以及刚改完规则还没重新读取状态时的旧勾选
+    let gate = Gate::new(path, &excludes);
+    let dropped = gate_list(&mut targets, &gate)
+        + gate_list(&mut adds, &gate)
+        + gate_list(&mut deletes, &gate);
+    if dropped > 0 {
+        sink.line(format!("{label}：本目录屏蔽规则拦下 {dropped} 项，未提交"));
+    }
     let count = targets.len();
     if !adds.is_empty() {
         sink.line(format!("$ svn add --force （{} 项）", adds.len()));
@@ -1026,6 +1269,8 @@ fn commit_run(
             if child.item.committable()
                 && child.path.starts_with(&prefix)
                 && !commit_list.contains(&child.path)
+                // 子项是从 fresh 现读出来的，不在这儿挡一道就会跟着目录一起传上去
+                && !gate.hits(child)
             {
                 commit_list.push(child.path.clone());
             }
@@ -1331,6 +1576,48 @@ mod tests {
         drawn.iter().any(|(text, _)| text == label)
     }
 
+    /// 断言失败时把这一帧画出来的文字整体打出来，省得靠猜页面上到底有什么
+    fn texts_of(drawn: &[(String, egui::Rect)]) -> Vec<String> {
+        drawn.iter().map(|(text, _)| text.clone()).collect()
+    }
+
+    /// 提交页连同帧末的「差异过滤与提交屏蔽」窗口一起跑一帧：弹窗挂在帧末，测试台那条路
+    /// 只跑主页，所以这里必须自己补调一次，否则窗口在测试里永远画不出来。
+    fn rules_frame(
+        ctx: &egui::Context,
+        app: &mut RepoApp,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Rect)> {
+        let mut input = crate::testbed::base_input();
+        input.events = events;
+        let out = ctx.run_ui(input, |ui| {
+            app.commit_page(ui);
+            app.commit_rules_dialog(ui.ctx());
+        });
+        commit_drawn(out)
+    }
+
+    /// 按文字片段取矩形：多行框本身不是文字，拿它的占位示例定位才拿得到整块输入区。
+    fn rect_containing(drawn: &[(String, egui::Rect)], needle: &str) -> egui::Rect {
+        drawn
+            .iter()
+            .find(|(text, _)| text.contains(needle))
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("页面上没画出含「{needle}」的文字：{:?}", texts_of(drawn)))
+    }
+
+    fn pointer(events: &mut Vec<egui::Event>, pos: egui::Pos2) {
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        events.push(egui::Event::PointerMoved(pos));
+        events.push(button(true));
+        events.push(button(false));
+    }
+
     /// 这句要在提交页一直亮着（点它直接更新），不是只在按下提交那一瞬闪一下。
     #[test]
     fn commit_page_shows_the_not_up_to_date_warning() {
@@ -1495,5 +1782,394 @@ mod tests {
             !app.commit.as_ref().unwrap().confirm_outdated,
             "重新读过清单就不能留着上一次的确认"
         );
+    }
+
+    fn entry_at(item: Item, rel: &str) -> StatusEntry {
+        StatusEntry {
+            path: format!("D:\\wc\\{rel}"),
+            name: rel.rsplit(['\\', '/']).next().unwrap_or(rel).to_owned(),
+            item,
+            props: "none".to_owned(),
+            checked: true,
+        }
+    }
+
+    /// 弹窗里一行一条的写法要变成 `Excludes` 认的语法：补 `-`、丢掉注释与空行与 `+`、
+    /// 不带锚定的多段路径补成 `./`（不补就永不命中，issue #4），已经是 `-` / `.\` 开头的原样保留。
+    #[test]
+    fn normalize_excludes_turns_lines_into_the_bc_grammar() {
+        assert_eq!(normalize_excludes("bin\\"), "-bin\\");
+        assert_eq!(normalize_excludes("  *.log  "), "-*.log");
+        assert_eq!(normalize_excludes("-bin\\"), "-bin\\", "已经带减号的不能变成 --");
+        assert_eq!(normalize_excludes(r".\out\"), r"-.\out\");
+        assert_eq!(normalize_excludes(r"A\B\target\"), r"-./A\B\target\");
+        assert_eq!(normalize_excludes("a/b/c"), "-./a/b/c", "正斜杠的多段同样要锚定");
+        // 注释、空行、不支持的包含模式都不该进规则串
+        assert_eq!(normalize_excludes("# 构建产物\n\nbin\\\n+keep.txt\n"), "-bin\\");
+        assert!(normalize_excludes("  \n#\n+\n").is_empty());
+        // 老的分号写法照样认
+        assert_eq!(normalize_excludes(r"-bin\;-.\auth.json"), r"-bin\;-.\auth.json");
+    }
+
+    /// 屏蔽只该挡住规则命中的那几条：单段目录名任意层级都算，根锚定的 `.\auth.json` 不能
+    /// 带走子目录里的同名文件，裸多段路径补上锚定后深层同名目录也不该被误屏蔽。
+    #[test]
+    fn pending_entries_only_keeps_what_will_actually_be_committed() {
+        let root = Path::new("D:\\wc");
+        let raw = "bin\\\n# 日志\n*.log\n.\\auth.json\nInfrastructure\\Model\\target\\\n";
+        let entries = vec![
+            entry_at(Item::Modified, r"src\main.java"),
+            entry_at(Item::Unversioned, r"bin\tool.exe"),
+            entry_at(Item::Unversioned, r"logs\debug.log"),
+            entry_at(Item::Modified, r"auth.json"),
+            entry_at(Item::Modified, r"src\auth.json"),
+            entry_at(Item::Modified, r"Infrastructure\Model\target\out.jar"),
+            entry_at(Item::Modified, r"src\Infrastructure\Model\target\deep.jar"),
+            entry_at(Item::Normal, r"keep\untouched.java"),
+            entry_at(Item::Conflict, r"keep\busted.java"),
+        ];
+        let kept = pending_entries(&entries, root, raw)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec![
+                r"D:\wc\src\main.java".to_owned(),
+                r"D:\wc\src\auth.json".to_owned(),
+                r"D:\wc\src\Infrastructure\Model\target\deep.jar".to_owned(),
+            ],
+            "{kept:?}"
+        );
+        // 没写规则时口径就是老口径：只看能不能提交，一条都不多挡
+        assert_eq!(
+            pending_entries(&entries, root, "   ").len(),
+            entries.iter().filter(|e| e.item.uploadable()).count()
+        );
+    }
+
+    /// 屏蔽项就算带着 checked 也进不了提交清单：清单、add 名单、分类计数、可见行四个口径
+    /// 共用同一份掩码，漏掉任何一个都是「看不见却传上去了」。
+    #[test]
+    fn excluded_entries_stay_out_of_the_commit_list() {
+        let mut page = CommitPage::new(0, "测试".to_owned());
+        page.set_entries(vec![
+            entry_at(Item::Modified, r"src\main.java"),
+            entry_at(Item::Modified, r"bin\tool.exe"),
+            entry_at(Item::Unversioned, r"logs\debug.log"),
+        ]);
+        page.apply_gate(Path::new(r"D:\wc"), "bin\\\n*.log\n");
+        assert_eq!(page.hidden_count(), 2);
+        assert_eq!(page.commit_targets(), vec![r"D:\wc\src\main.java".to_owned()]);
+        assert!(page.selected_targets(Maintain::Add).is_empty(), "屏蔽的未版本化项不该补 svn add");
+        let (added, modified, _, _) = page.counts();
+        assert_eq!((added, modified), (0, 1), "分类计数只认没屏蔽的");
+        assert_eq!(page.visible(), vec![0], "默认不显示屏蔽项");
+        // 开关只是让人看见那几行，清单口径一个字都不能变
+        page.show_excluded = true;
+        assert_eq!(page.visible().len(), 3);
+        assert_eq!(page.commit_targets(), vec![r"D:\wc\src\main.java".to_owned()]);
+    }
+
+    /// 「全选」按字面意义是把能勾的都勾上，但被本目录规则屏蔽的条目必须留在勾不上的那一侧。
+    #[test]
+    fn select_all_skips_excluded() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.cfg.dirs[0].path = r"D:\wc".to_owned();
+        app.cfg.dirs[0].commit_excludes = "bin\\".to_owned();
+        let mut page = CommitPage::new(0, "测试".to_owned());
+        page.set_entries(vec![
+            entry_at(Item::Modified, r"src\main.java"),
+            entry_at(Item::Unversioned, r"bin\tool.exe"),
+            entry_at(Item::Conflict, r"src\busted.java"),
+        ]);
+        page.entries.iter_mut().for_each(|entry| entry.checked = false);
+        app.commit = Some(page);
+
+        let drawn = commit_frame(&ctx, &mut app);
+        let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "全选").center());
+        let page = app.commit.as_ref().unwrap();
+        assert!(page.entries[0].checked, "普通改动该被全选勾上");
+        assert!(page.entries[2].checked, "冲突项按「全选」的字面意思也勾上");
+        assert!(!page.entries[1].checked, "屏蔽项不能被全选勾上");
+        assert_eq!(page.commit_targets(), vec![r"D:\wc\src\main.java".to_owned()]);
+
+        // 「只选可提交项」同一道闸：屏蔽的未版本化项不回来
+        let drawn = commit_frame(&ctx, &mut app);
+        let _ = commit_click(&ctx, &mut app, rect_of(&drawn, "只选可提交项").center());
+        let page = app.commit.as_ref().unwrap();
+        assert!(page.entries[0].checked);
+        assert!(!page.entries[1].checked, "屏蔽项连「恢复默认勾选」也不该被勾上");
+    }
+
+    /// 顶栏那枚开关：一条都没屏蔽时不占位；屏蔽了就把条数写在标签上。
+    /// 默认被屏蔽的行连列表都不出现，点开才列出来并带上「已屏蔽」，此时它依然不在提交清单里。
+    #[test]
+    fn show_excluded_toggle_reveals_the_greyed_rows() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.cfg.dirs[0].path = r"D:\wc".to_owned();
+        let mut page = CommitPage::new(0, "测试".to_owned());
+        page.set_entries(vec![
+            entry_at(Item::Modified, r"src\main.java"),
+            entry_at(Item::Modified, r"bin\tool.exe"),
+        ]);
+        app.commit = Some(page);
+
+        // 还没写规则：既没有开关，两条改动都照常列着
+        let drawn = commit_frame(&ctx, &mut app);
+        assert!(!has(&drawn, "显示屏蔽的 1 项"), "没屏蔽任何东西时不该占一个开关位");
+        assert!(has(&drawn, "本次修改内容：共 2 项"));
+
+        app.cfg.dirs[0].commit_excludes = "bin\\".to_owned();
+        let drawn = commit_frame(&ctx, &mut app);
+        assert!(has(&drawn, "显示屏蔽的 1 项"), "{:?}", texts_of(&drawn));
+        assert!(has(&drawn, "本次修改内容：共 1 项"), "总数要扣掉被屏蔽的那条");
+        assert!(
+            !drawn.iter().any(|(text, _)| text.contains("tool.exe")),
+            "被屏蔽的行默认不该出现在列表里：{:?}",
+            texts_of(&drawn)
+        );
+
+        let drawn = commit_click(&ctx, &mut app, rect_of(&drawn, "显示屏蔽的 1 项").center());
+        assert!(
+            drawn.iter().any(|(text, _)| text.contains("tool.exe")),
+            "开关打开后那一行要能看见：{:?}",
+            texts_of(&drawn)
+        );
+        assert!(has(&drawn, "已屏蔽"));
+        // 让人看见不等于让人勾上：清单口径一个字都不能变
+        let page = app.commit.as_ref().unwrap();
+        assert_eq!(page.commit_targets(), vec![r"D:\wc\src\main.java".to_owned()]);
+    }
+
+    /// 过滤框是单行的，多个关键字用 `;` 隔开、任一命中即留下（OR）；空段丢掉、统一转小写，
+    /// 中文关键字照样能命中。
+    #[test]
+    fn multi_keyword_filter_keeps_any_needle_that_matches() {
+        assert_eq!(
+            filter_needles("  ;; 报告 ;  Main  ; "),
+            vec!["报告".to_owned(), "main".to_owned()],
+            "空段不该占一条，大小写折叠后再比对"
+        );
+        let mut page = CommitPage::new(0, "测试".to_owned());
+        page.set_entries(vec![
+            entry_at(Item::Modified, r"src\视图\报告.java"),
+            entry_at(Item::Modified, r"src\main.java"),
+            entry_at(Item::Modified, r"docs\note.md"),
+        ]);
+        page.filter = "报告;note".to_owned();
+        assert_eq!(page.visible(), vec![0, 2], "两个关键字是或关系");
+        page.filter = "MAIN".to_owned();
+        assert_eq!(page.visible(), vec![1], "过滤不区分大小写");
+        page.filter = "不存在的关键字".to_owned();
+        assert!(page.visible().is_empty());
+    }
+
+    /// 弹窗里敲的一行屏蔽规则要走完整条链：写回目录配置 → 落盘 → 下一帧提交页按它重算掩码。
+    /// 中间断掉任何一环都是「写了规则却照提」。
+    #[test]
+    fn commit_rules_dialog_persists_excludes() {
+        let _appdata = crate::testbed::lock_appdata();
+        // 落盘这件事不能被上次运行留下的 config.json 顶包：先清干净再指过去
+        let appdata = std::env::temp_dir().join("repo_manager_commit_rules_test");
+        let _ = std::fs::remove_dir_all(&appdata);
+        std::env::set_var("APPDATA", &appdata);
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.cfg.dirs[0].path = r"D:\wc".to_owned();
+        let entries = vec![
+            entry_at(Item::Modified, r"src\main.java"),
+            entry_at(Item::Unversioned, r"bin\tool.exe"),
+        ];
+        let mut page = CommitPage::new(0, "测试".to_owned());
+        page.set_entries(entries.clone());
+        app.commit = Some(page);
+        // 窗口里的命中数按最近一次读取的完整清单现算，这就是检测 / 现读落进 DirView 的那份
+        app.dirs[0].changed = Some(2);
+        app.dirs[0].all_changes = entries;
+        // 入口在目录行的「更多」里，菜单链路另有用例；这里直接从同一份状态起窗口
+        app.commit_rules = Some(crate::CommitRules::new(0, ""));
+        // 新窗口第一帧只是把尺寸算出来，形状要第二帧才落纸
+        let _ = rules_frame(&ctx, &mut app, Vec::new());
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        assert!(has(&drawn, "差异比对过滤条件 · 存本目录配置"), "{:?}", texts_of(&drawn));
+        assert!(has(&drawn, "当前未命中任何条目"));
+
+        // 点进屏蔽框拿焦点，再喂一个文本事件
+        let field = rect_containing(&drawn, "*.log").center();
+        let mut click = Vec::new();
+        pointer(&mut click, field);
+        let _ = rules_frame(&ctx, &mut app, click);
+        let _ = rules_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text("bin\\".to_owned())],
+        );
+
+        assert_eq!(app.cfg.dirs[0].commit_excludes, "bin\\", "窗口里那行要写回目录配置");
+        let saved = std::fs::read_to_string(crate::config::config_file()).unwrap_or_default();
+        assert!(
+            saved.contains(r#""commit_excludes": "bin\\""#),
+            "改了配置就得真的落盘：{saved}"
+        );
+
+        // 下一帧：提交页按新规则重算掩码，窗口预览与提交清单跟着同一个口径走
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            has(&drawn, "当前命中 1 项：不进提交清单，提交页上也看不到"),
+            "{:?}",
+            texts_of(&drawn)
+        );
+        let page = app.commit.as_ref().unwrap();
+        assert_eq!(page.hidden_count(), 1);
+        assert_eq!(page.commit_targets(), vec![r"D:\wc\src\main.java".to_owned()]);
+    }
+
+    /// 弹窗两格各写各的字段：上面那格是目录行同款的 BC 筛选条件（配置里是 `;` 串、
+    /// 框里一行一条），下面那格才是屏蔽规则。串了格就是「调了差异口径却把文件屏蔽掉了」。
+    #[test]
+    fn commit_rules_dialog_keeps_the_two_fields_apart() {
+        let _appdata = crate::testbed::lock_appdata();
+        let appdata = std::env::temp_dir().join("repo_manager_bc_filter_dialog_test");
+        let _ = std::fs::remove_dir_all(&appdata);
+        std::env::set_var("APPDATA", &appdata);
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.cfg.dirs[0].path = r"D:\wc".to_owned();
+        // 框里两行 = 打开窗口时从一份两行的 BC 串拆出来的行视图
+        app.commit_rules = Some(crate::CommitRules::new(0, "-*.iml\n-bin\\"));
+
+        let _ = rules_frame(&ctx, &mut app, Vec::new());
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        assert!(has(&drawn, "屏蔽可提交项 · 存本目录配置"), "{:?}", texts_of(&drawn));
+
+        assert_eq!(
+            app.cfg.dirs[0].bc_filter, "-*.iml;-bin\\",
+            "行视图要拼回 BC 那套分号串，换行留在配置里会把规则拆散"
+        );
+        assert!(
+            app.cfg.dirs[0].commit_excludes.is_empty(),
+            "过滤条件那格不该顺手写屏蔽规则"
+        );
+        let saved = std::fs::read_to_string(crate::config::config_file()).unwrap_or_default();
+        assert!(
+            saved.contains(r#""bc_filter": "-*.iml;-bin\\""#),
+            "改了筛选条件就得真的落盘：{saved}"
+        );
+
+        // 反过来：屏蔽框一个字都不该漏进 bc_filter
+        app.cfg.dirs[0].bc_filter.clear();
+        app.commit_rules = Some(crate::CommitRules::new(0, ""));
+        let _ = rules_frame(&ctx, &mut app, Vec::new());
+        let field = rect_containing(&rules_frame(&ctx, &mut app, Vec::new()), "*.log").center();
+        let mut click = Vec::new();
+        pointer(&mut click, field);
+        let _ = rules_frame(&ctx, &mut app, click);
+        let _ = rules_frame(&ctx, &mut app, vec![egui::Event::Text("logs\\".to_owned())]);
+        assert_eq!(app.cfg.dirs[0].commit_excludes, "logs\\");
+        assert!(app.cfg.dirs[0].bc_filter.is_empty(), "屏蔽规则不该写进 BC 筛选条件");
+    }
+
+    /// 「确认」是这扇窗的出口：按下要关窗，并按刚写下的规则重读本目录（起 Refresh 任务，
+    /// 它内部连本地差异比对一起跑）。规则改了却不重读，主页「待提交 N」和窗口里的命中数
+    /// 就还停在旧口径上，看上去像规则没生效
+    #[test]
+    fn commit_rules_dialog_confirm_closes_and_refreshes() {
+        let _appdata = crate::testbed::lock_appdata();
+        let appdata = std::env::temp_dir().join("repo_manager_rules_confirm_test");
+        let _ = std::fs::remove_dir_all(&appdata);
+        std::env::set_var("APPDATA", &appdata);
+        // 检测要求目录真实存在；svn.exe 只被 `available()` 查一句「文件在不在」，
+        // 指一个非 exe 的桩文件——进程起不来会立刻带错误返回，测试不等它落地
+        let wc = appdata.join("wc");
+        std::fs::create_dir_all(&wc).unwrap();
+        let stub = appdata.join("svn-stub.txt");
+        std::fs::write(&stub, "stub").unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        crate::fonts::install(&ctx, crate::fonts::AUTO);
+        let mut app = crate::testbed::stub_app(false);
+        app.cfg.dirs[0].path = wc.to_string_lossy().into_owned();
+        app.svn.exe = stub;
+        app.commit_rules = Some(crate::CommitRules::new(0, ""));
+        // 新窗口第一帧只是把尺寸算出来，形状要第二帧才落纸
+        let _ = rules_frame(&ctx, &mut app, Vec::new());
+        let drawn = rules_frame(&ctx, &mut app, Vec::new());
+        let confirm = drawn
+            .iter()
+            .find(|(text, _)| text == "确认")
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("窗口底部应有「确认」，实际：{:?}", texts_of(&drawn)));
+        assert!(
+            !app.pool.has(crate::jobs::Kind::Refresh, 0),
+            "只是开着窗口，不该起检测"
+        );
+
+        let mut click = Vec::new();
+        pointer(&mut click, confirm.center());
+        let _ = rules_frame(&ctx, &mut app, click);
+
+        assert!(app.commit_rules.is_none(), "点确认要顺手把窗口收掉");
+        assert!(
+            app.pool.has(crate::jobs::Kind::Refresh, 0),
+            "确认要按新规则重读一次本目录"
+        );
+    }
+
+    /// 同一批条目、同一个根、同一条规则，三个出口必须给出同一份清单：主页的「待提交 N」、
+    /// 「全部上传」的三份名单、提交页勾选出来的清单。旁路少滤一次就是「屏幕上看不见却照样传上去」。
+    #[test]
+    fn home_count_and_upload_all_agree_with_the_page() {
+        let root = Path::new("D:\\wc");
+        let raw = "bin\\\n# 编译日志\n*.log\nInfrastructure\\Model\\target\\\n";
+        let entries = vec![
+            entry_at(Item::Modified, r"src\main.java"),
+            entry_at(Item::Unversioned, r"bin\tool.exe"),
+            entry_at(Item::Missing, r"logs\debug.log"),
+            entry_at(Item::Modified, r"Infrastructure\Model\target\out.jar"),
+            entry_at(Item::Unversioned, r"src\obj\Debug\a.class"),
+            entry_at(Item::Missing, r"src\gone.java"),
+            entry_at(Item::Conflict, r"src\busted.java"),
+            entry_at(Item::Normal, r"src\untouched.java"),
+        ];
+
+        let mut page = CommitPage::new(0, "测试".to_owned());
+        page.set_entries(entries.clone());
+        page.apply_gate(root, raw);
+        let plan = upload_plan(&entries, root, raw);
+        let home = pending_entries(&entries, root, raw)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(page.hidden_count(), 3, "bin、*.log、根锚定的多段目录各挡一条");
+        let kept = vec![
+            r"D:\wc\src\main.java".to_owned(),
+            r"D:\wc\src\obj\Debug\a.class".to_owned(),
+            r"D:\wc\src\gone.java".to_owned(),
+        ];
+        assert_eq!(home, kept, "主页的数得和这份清单一样：{home:?}");
+        assert_eq!(plan.targets, kept, "「全部上传」要提交的就是这几条");
+        assert_eq!(page.commit_targets(), kept, "提交页勾选出来的必须是同一批");
+        assert_eq!(plan.adds, vec![r"D:\wc\src\obj\Debug\a.class".to_owned()]);
+        assert_eq!(plan.deletes, vec![r"D:\wc\src\gone.java".to_owned()]);
+        assert_eq!(page.selected_targets(Maintain::Add), plan.adds);
+        assert_eq!(page.selected_targets(Maintain::Delete), plan.deletes);
+        // 冲突项本来就提交不了，规则也别说它；两边都别把它算进任何一份名单
+        for list in [&home, &plan.targets, &page.commit_targets()] {
+            assert!(list.iter().all(|path| !path.contains("busted")), "{list:?}");
+            assert!(list.iter().all(|path| !path.contains("untouched")), "{list:?}");
+        }
     }
 }

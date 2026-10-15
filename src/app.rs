@@ -105,9 +105,6 @@ impl RepoApp {
             edit_label: None,
             label_buf: String::new(),
             label_focus: false,
-            edit_filter: None,
-            filter_buf: String::new(),
-            filter_focus: false,
             edit_group: None,
             group_buf: String::new(),
             group_focus: false,
@@ -125,6 +122,7 @@ impl RepoApp {
             batch_label: None,
             rollback: None,
             resolve: None,
+            commit_rules: None,
             svn_user: String::new(),
             user_probed: false,
             show_settings: false,
@@ -466,6 +464,7 @@ impl RepoApp {
                         last_date,
                         changed,
                         changes,
+                        all_changes,
                         conflicts,
                         blocked,
                         out_of_date,
@@ -481,6 +480,7 @@ impl RepoApp {
                         view.last_date = last_date;
                         view.changed = changed;
                         view.changes = changes;
+                        view.all_changes = all_changes;
                         view.conflicts = conflicts;
                         view.blocked = blocked;
                         view.out_of_date = out_of_date;
@@ -537,21 +537,36 @@ impl RepoApp {
                     // 先数完再把 entries 交给提交页（它拿走所有权）
                     let blocked = ok.then(|| crate::svn::blocked_count(&entries));
                     let listed = ok.then(|| crate::svn::blocked_entries(&entries));
+                    // 借用 view 之前先把这两样取出来：主页的数要和提交页用同一个口径
+                    let root = self.dir_path(index);
+                    let excludes = self
+                        .cfg
+                        .dirs
+                        .get(index)
+                        .map(|dir| dir.commit_excludes.clone())
+                        .unwrap_or_default();
                     if let Some(view) = self.dirs.get_mut(index) {
                         view.conflicts = blocked;
                         view.blocked = listed.unwrap_or_default();
                         if ok {
                             // 口径与「全部上传」一致：? / ! 提交时会自动补 add / delete，一并算待提交
-                            view.changes = entries
-                                .iter()
-                                .filter(|entry| entry.item.uploadable())
-                                .cloned()
-                                .collect();
+                            view.changes = root.as_ref().map_or_else(
+                                || {
+                                    entries
+                                        .iter()
+                                        .filter(|entry| entry.item.uploadable())
+                                        .cloned()
+                                        .collect()
+                                },
+                                |root| crate::commit::pending_entries(&entries, root, &excludes),
+                            );
                             view.changed = Some(view.changes.len());
+                            view.all_changes = entries.clone();
                         } else {
                             // 读失败就清掉旧数：宁可显示「未检测」也不能拿旧清单冒充现状
                             view.changed = None;
                             view.changes.clear();
+                            view.all_changes.clear();
                         }
                     }
                     // 「解决冲突」窗口开着时这一趟就是它的最新依据：窗口里可能已经挑好策略，
@@ -1165,6 +1180,7 @@ impl eframe::App for RepoApp {
         self.rollback_dialog(&ctx);
         self.resolve_dialog(&ctx);
         self.upload_all_dialog(&ctx);
+        self.commit_rules_dialog(&ctx);
         self.file_diff_window(&ctx);
         self.file_log_window(&ctx);
         self.worklog_window(&ctx);

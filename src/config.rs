@@ -14,6 +14,10 @@ pub struct DirConfig {
     /// 文件夹对比的名称筛选（如 `-*.iml;-*.classpath`），由本程序自己保存，
     /// 不再依赖本机 Beyond Compare 的对比记录，换台机器、换个人也能一致地带出
     pub bc_filter: String,
+    /// 本目录的「屏蔽可提交项」，提交页弹窗里那一框，一行一条（`bin\`、`*.log`、`#` 注释）。
+    /// 命中的条目默认从提交页消失，也不进提交清单、不计进主页「待提交 N 项」；
+    /// 写法与上面的 `bc_filter` 同一套（那边只管差异比较，两边各存各的）
+    pub commit_excludes: String,
     /// 手动分组名，空 = 未分组（列表里不画组标题）
     pub group: String,
     /// 目录标记的文字，空 = 无标记
@@ -261,6 +265,8 @@ mod tests {
         assert!(parsed.dirs[0].bc_target.is_empty());
         // 后加的「名称筛选」字段：老配置没有也要按空值补齐，且能写回
         assert!(parsed.dirs[0].bc_filter.is_empty());
+        // 「屏蔽可提交项」同样是后加字段：老配置没有要按空值补齐（= 一条都不屏蔽）
+        assert!(parsed.dirs[0].commit_excludes.is_empty());
         // 服务器端所在侧是后加的设置，老配置没有也要按默认值（左侧）补齐
         assert_eq!(parsed.bc_server_side, "left");
         assert_eq!(parsed.theme, "system");

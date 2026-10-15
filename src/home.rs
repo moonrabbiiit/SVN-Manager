@@ -5,8 +5,8 @@ use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, TextEdit, Ui, Ve
 use egui::Key;
 
 use crate::{
-    field_margin, ink, pale, pane_fill, pane_hover, pane_stroke, quiet, DirView, Maintain, RepoApp,
-    UploadAll,
+    field_margin, ink, pale, pane_fill, pane_hover, pane_stroke, quiet, CommitRules, DirView,
+    Maintain, RepoApp, UploadAll,
 };
 use crate::ui::AlignedRow;
 
@@ -269,7 +269,8 @@ impl RepoApp {
                         )
                         .on_hover_text(
                             "口径与「全部上传」一致：未版本化(?)、已丢失(!) 也算在内——\n\
-                             上传时它们会先加入版本控制或标记删除，再和改动一并提交，无需手动标记",
+                             上传时它们会先加入版本控制或标记删除，再和改动一并提交，无需手动标记\n\
+                             本目录已屏蔽的条目不算在内",
                         );
                     } else {
                         ui.label(
@@ -382,10 +383,6 @@ impl RepoApp {
                     });
                 });
             });
-            // 名称筛选的行内编辑器：Enter 或点别处提交，Esc 取消（交互同上面的别名编辑）
-            if self.edit_filter == Some(index) {
-                self.filter_editor(ui, index);
-            }
             ui.horizontal(|ui| {
                 match &view.info {
                     Some(info) => {
@@ -504,7 +501,7 @@ impl RepoApp {
             tip.push_str(&format!("未核对内容 {}\n", s.unverified));
         }
         if self.cfg.dirs.get(index).map(|d| d.bc_filter.trim()).unwrap_or_default().is_empty() {
-            tip.push_str("未设对比筛选条件（更多 → 设置对比筛选条件）\n");
+            tip.push_str("未设对比筛选条件（更多 → 差异过滤与提交屏蔽）\n");
         }
         if !s.samples.is_empty() {
             tip.push_str("点击打开 Beyond Compare：\n");
@@ -630,20 +627,18 @@ impl RepoApp {
             }
         }
         ui.separator();
-        // 对比筛选条件的编辑器放在目录行里，不放菜单里：
-        // menu_button 的菜单点任何地方都会收起，输入框一点就没了
+        // 两套规则装在同一个窗口里：上面那格是差异比对的名称筛选（只管「本地差异」那个数），
+        // 下面那格决定哪些改动不进提交清单。窗口是独立浮层，不受菜单点哪儿都收起的限制
         if ui
-            .button(if self.cfg.dirs[index].bc_filter.is_empty() {
-                "设置对比筛选条件"
-            } else {
-                "修改对比筛选条件"
-            })
-            .on_hover_text("文件夹对比的对比筛选条件，存在本程序配置里，不依赖本机 Beyond Compare 记录；换机器、换人也能一致地带出")
+            .button("差异过滤与提交屏蔽")
+            .on_hover_text(
+                "本目录的两套规则一起写，一行一条、存配置长期生效：差异比对的名称筛选（只管\
+                 「本地差异」那个数）、以及屏蔽可提交项（命中的不进提交清单，提交页上也看不到）",
+            )
             .clicked()
         {
-            self.edit_filter = Some(index);
-            self.filter_buf = self.cfg.dirs[index].bc_filter.clone();
-            self.filter_focus = true;
+            let bc = self.cfg.dirs[index].bc_filter.clone();
+            self.commit_rules = Some(CommitRules::new(index, &bc));
             ui.close();
         }
         // 本地差异和 Beyond Compare 显示对不上号（本软件报差异、BC 看不到）时，
@@ -736,44 +731,6 @@ impl RepoApp {
                 });
             }
         }
-    }
-
-    /// 对比筛选条件的输入框（带前缀说明），位置同上
-    fn filter_editor(&mut self, ui: &mut Ui, index: usize) {
-        ui.aligned_row(|ui| {
-            ui.label(RichText::new("对比筛选条件：").size(12.0));
-            let field = ui.add(
-                TextEdit::singleline(&mut self.filter_buf)
-                    .id_salt(("bc_filter", index))
-                    .desired_width(320.0)
-                    .margin(field_margin(ui))
-                    .hint_text("如 -*.iml;-*.classpath，多个用分号隔开；留空则走 BC 记录里的筛选"),
-            );
-            if self.filter_focus {
-                field.request_focus();
-                self.filter_focus = false;
-            }
-            let enter = field.has_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            let esc = field.has_focus() && ui.input(|i| i.key_pressed(Key::Escape));
-            if esc {
-                self.edit_filter = None;
-                self.hint("已取消修改对比筛选条件");
-            } else if enter || field.lost_focus() {
-                self.edit_filter = None;
-                let text = self.filter_buf.trim().to_owned();
-                if self.cfg.dirs[index].bc_filter != text {
-                    self.cfg.dirs[index].bc_filter.clone_from(&text);
-                    self.persist();
-                    // 筛选条件就是差异口径，改完立刻按新口径重算
-                    self.spawn_local_diff(index, false);
-                }
-                self.hint(if text.is_empty() {
-                    "已清空对比筛选条件，将退回 Beyond Compare 记录里的值".to_owned()
-                } else {
-                    format!("对比筛选条件已保存：{text}")
-                });
-            }
-        });
     }
 
     /// 配置里各目录在用的分组名：去重、排序，排除 exclude（自己当前的那份，点了也是白点）
@@ -1034,7 +991,7 @@ impl RepoApp {
         }
     }
 
-    /// 卡片里塞不下行内输入框，简约形态下别名 / 对比筛选条件单独占一行，摆在列表上方
+    /// 卡片里塞不下行内输入框，简约形态下别名单独占一行，摆在列表上方
     fn compact_editors(&mut self, ui: &mut Ui) {
         let total = self.cfg.dirs.len();
         let fill = pane_fill(ui);
@@ -1049,21 +1006,6 @@ impl RepoApp {
                     ui.aligned_row(|ui| {
                         ui.label(RichText::new(format!("修改别名 · {label}：")).size(12.0));
                         self.alias_editor(ui, index);
-                    });
-                });
-            ui.add_space(4.0);
-        }
-        if let Some(index) = self.edit_filter.filter(|i| *i < total) {
-            let label = self.dir_label(index);
-            Frame::new()
-                .inner_margin(6.0)
-                .corner_radius(8.0)
-                .stroke(egui::Stroke::new(1.0, pane_stroke(ui)))
-                .fill(fill)
-                .show(ui, |ui| {
-                    ui.aligned_row(|ui| {
-                        ui.label(RichText::new(format!("{label}")).size(12.0));
-                        self.filter_editor(ui, index);
                     });
                 });
             ui.add_space(4.0);
@@ -1619,8 +1561,9 @@ impl RepoApp {
         // 右侧竖排计数胶囊：可更新（原 ↓ 的活儿）、待提交（原 ↑ 的活儿）、本地差异（原 ↔ 的活儿），
         // 整列垂直居中；差异那枚只对绑定过本地端的卡片出现，不拿一枚 0 冒充「已经比过了」
         let update_tip = format!("服务器上有 {pending} 项本地还没更新\n点击立即更新该目录");
-        let commit_tip =
-            format!("本地有 {changed} 项待提交（口径同「全部上传」）\n点击打开该目录的提交页");
+        let commit_tip = format!(
+            "本地有 {changed} 项待提交（口径同「全部上传」，不含本目录已屏蔽的条目）\n点击打开该目录的提交页"
+        );
         // 整张卡没有一件事可做（可更新 / 待提交 / 差异全是 0）时胶囊一起转绿，
         // 这是「这目录很干净」的余光信号；只要有一件待办，0 的那几枚还是中性灰
         let all_clear = pending == 0
@@ -2616,6 +2559,75 @@ mod tests {
             Stage::rect_of(&texts, "▲ 上移").is_some(),
             "悬停「更多」应展开二级菜单，实际：{:?}",
             texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// 规则窗口的入口就在目录行的「更多」里，不必先进上传页：点它要按**这一行**开窗口，
+    /// 并把这一行的差异筛选条件（配置里是分号串）拆成一行一条带进框里
+    #[test]
+    fn row_menu_opens_the_rules_window_for_that_directory() {
+        let mut stage = Stage::new(false);
+        stage.app.cfg.dirs[1].bc_filter = "-*.iml;-bin\\".to_owned();
+        let texts = stage.step(None);
+        // 每行目录一枚「更多」，第二枚就是 dirs[1]（CRM）
+        let more = texts
+            .iter()
+            .filter(|(text, _)| text == "更多")
+            .nth(1)
+            .map(|(_, rect)| *rect)
+            .expect("第二行目录应有「更多」");
+        stage.step(Some(more.center()));
+        let texts = stage.step(None);
+        let item = Stage::rect_of(&texts, "差异过滤与提交屏蔽").unwrap_or_else(|| {
+            panic!(
+                "「更多」里应有规则入口，实际：{:?}",
+                texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+            )
+        });
+        let _ = stage.step(Some(item.center()));
+        let rules = stage.app.commit_rules.as_ref().expect("点规则入口要打开窗口");
+        assert_eq!(rules.dir, 1, "开的是这一行的规则");
+        assert_eq!(rules.filter_buf, "-*.iml\n-bin\\", "分号串要拆成一行一条");
+    }
+
+    /// 窗口认的是目录行下标，行序一变这个下标就指到别的目录上——「在 A 的规则框里改的却是 B」。
+    /// 上移 / 下移是两行对调，窗口没有可靠的换算可做，收掉；拖动搬运和移除行本来就是
+    /// 整段位移，跟 relocate / rollback 一样把下标换算过去或把越界的收掉
+    #[test]
+    fn rules_window_never_points_at_the_wrong_row() {
+        let _appdata = crate::testbed::lock_appdata();
+        let appdata = std::env::temp_dir().join("repo_manager_rules_index_test");
+        let _ = std::fs::remove_dir_all(&appdata);
+        std::env::set_var("APPDATA", &appdata);
+        let mut stage = Stage::new(false);
+
+        stage.app.commit_rules = Some(CommitRules::new(1, ""));
+        stage.app.move_directory(1, -1);
+        assert!(
+            stage.app.commit_rules.is_none(),
+            "窗口那一行跟别行对调过，留着就是拿下标改错的目录"
+        );
+
+        stage.app.commit_rules = Some(CommitRules::new(1, ""));
+        stage.app.shift_directory(2, 0, None);
+        assert_eq!(
+            stage.app.commit_rules.as_ref().map(|d| d.dir),
+            Some(2),
+            "第 3 行插到最前，原来第 2 行的窗口该跟着右移一位"
+        );
+
+        stage.app.commit_rules = Some(CommitRules::new(1, ""));
+        stage.app.remove_directory(0);
+        assert!(
+            stage.app.commit_rules.is_none(),
+            "上面少了一行，窗口指着的已不是原来那个目录"
+        );
+
+        stage.app.commit_rules = Some(CommitRules::new(0, ""));
+        stage.app.remove_directory(1);
+        assert!(
+            stage.app.commit_rules.is_some(),
+            "删的是窗口下面的行，第 1 行没动，不该无端收窗"
         );
     }
 
