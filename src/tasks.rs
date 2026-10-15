@@ -387,6 +387,13 @@ impl RepoApp {
             return;
         }
         let label = self.dir_label(index);
+        // 主页那个「待提交 N」也归屏蔽规则管：这里少滤一次，就是屏幕上看不见却照样传上去
+        let excludes = self
+            .cfg
+            .dirs
+            .get(index)
+            .map(|dir| dir.commit_excludes.clone())
+            .unwrap_or_default();
         self.pool
             .spawn(Kind::Refresh, index, format!("{label} 检测"), move |sink| {
                 let sink = if quiet { sink.muted() } else { sink };
@@ -406,6 +413,7 @@ impl RepoApp {
                         last_date: String::new(),
                         changed: None,
                         changes: Vec::new(),
+                        all_changes: Vec::new(),
                         conflicts: None,
                         blocked: Vec::new(),
                         out_of_date: None,
@@ -459,13 +467,10 @@ impl RepoApp {
                     let (local, local_run) = svn.status(&path);
                     (local, None, local_run)
                 };
-                // 统计口径与「全部上传」一致：? 会在提交时自动 add、! 自动 delete，
-                // 所以它们也算待提交项，用户看到的数量和真正提交上去的数量才对得上
-                let changes: Vec<crate::svn::StatusEntry> = entries
-                    .iter()
-                    .filter(|entry| entry.item.uploadable())
-                    .cloned()
-                    .collect();
+                // 统计口径与提交页、「全部上传」共用一个函数：? 会在提交时自动 add、! 自动 delete，
+                // 所以它们也算待提交项；本目录屏蔽规则挡掉的那些既看不见也不提交
+                let changes: Vec<crate::svn::StatusEntry> =
+                    crate::commit::pending_entries(&entries, &path, &excludes);
                 let changed = status.ok.then(|| changes.len());
                 // 冲突数在未过滤的 entries 上数：changes 里已经没有冲突条目了。
                 // status 读失败只能给 None——给 0 会把「没读到」显示成「没有冲突」
@@ -487,6 +492,7 @@ impl RepoApp {
                     last_date,
                     changed,
                     changes,
+                    all_changes: entries.clone(),
                     conflicts,
                     blocked: crate::svn::blocked_entries(&entries),
                     out_of_date,
@@ -526,6 +532,12 @@ impl RepoApp {
             return;
         }
         let label = self.dir_label(index);
+        let excludes = self
+            .cfg
+            .dirs
+            .get(index)
+            .map(|dir| dir.commit_excludes.clone())
+            .unwrap_or_default();
         self.pool
             .spawn(Kind::Refresh, index, format!("{label} 检测"), move |sink| {
                 let sink = if quiet { sink.muted() } else { sink };
@@ -543,6 +555,7 @@ impl RepoApp {
                         last_date: String::new(),
                         changed: None,
                         changes: Vec::new(),
+                        all_changes: Vec::new(),
                         conflicts: None,
                         blocked: Vec::new(),
                         out_of_date: None,
@@ -593,12 +606,9 @@ impl RepoApp {
                         last_date = tip_date;
                     }
                 }
-                // 统计口径与「全部上传」一致：? 会在提交时自动 add、! 自动 delete
-                let changes: Vec<crate::svn::StatusEntry> = entries
-                    .iter()
-                    .filter(|entry| entry.item.uploadable())
-                    .cloned()
-                    .collect();
+                // 统计口径与提交页、「全部上传」共用一个函数：? 会在提交时自动 add、! 自动 delete
+                let changes: Vec<crate::svn::StatusEntry> =
+                    crate::commit::pending_entries(&entries, &path, &excludes);
                 let changed = status_ok.then(|| changes.len());
                 // 冲突数在未过滤的 entries 上数：changes 里已经没有冲突条目了。
                 // status 读失败只能给 None——给 0 会把「没读到」显示成「没有冲突」
@@ -617,6 +627,7 @@ impl RepoApp {
                     last_date,
                     changed,
                     changes,
+                    all_changes: entries.clone(),
                     conflicts,
                     blocked: crate::svn::blocked_entries(&entries),
                     out_of_date,
@@ -1626,7 +1637,6 @@ impl RepoApp {
 
     pub fn remove_directory(&mut self, index: usize) {
         self.edit_label = None;
-        self.edit_filter = None;
         self.edit_group = None;
         self.edit_tag = None;
         if index >= self.cfg.dirs.len() {
@@ -1637,6 +1647,9 @@ impl RepoApp {
         if self.relocate.as_ref().is_some_and(|d| d.dir >= index) {
             // 行号变了，窗口里的地址可能已经对不上，直接关掉重新打开
             self.relocate = None;
+        }
+        if self.commit_rules.as_ref().is_some_and(|d| d.dir >= index) {
+            self.commit_rules = None;
         }
         self.sync_views();
         self.persist();
@@ -1674,9 +1687,11 @@ impl RepoApp {
         if self.relocate.as_ref().is_some_and(|d| d.dir == from || d.dir == target) {
             self.relocate = None;
         }
+        if self.commit_rules.as_ref().is_some_and(|d| d.dir == from || d.dir == target) {
+            self.commit_rules = None;
+        }
         self.selected = Some(target);
         self.edit_label = None;
-        self.edit_filter = None;
         self.edit_group = None;
         self.edit_tag = None;
         self.persist();
@@ -1721,7 +1736,6 @@ impl RepoApp {
         }
         self.selected = Some(insert);
         self.edit_label = None;
-        self.edit_filter = None;
         self.edit_group = None;
         self.edit_tag = None;
         if let Some(page) = self.commit.as_mut() {
@@ -1731,6 +1745,9 @@ impl RepoApp {
             page.dir = remap(page.dir);
         }
         if let Some(dialog) = self.relocate.as_mut() {
+            dialog.dir = remap(dialog.dir);
+        }
+        if let Some(dialog) = self.commit_rules.as_mut() {
             dialog.dir = remap(dialog.dir);
         }
         if let Some(dialog) = self.rollback.as_mut() {

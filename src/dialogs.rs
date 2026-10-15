@@ -1448,6 +1448,160 @@ impl RepoApp {
         // 按旧的 open 覆盖回去，窗口关不掉（点「稍后再说」等于没点）
         self.show_update_confirm = open && !later;
     }
+
+    // ---------------------------------------------------- 「差异过滤与提交屏蔽」窗口
+
+    /// 目录行「更多 → 差异过滤与提交屏蔽」开的那扇窗，装的是本目录的两套规则：
+    /// 上面一格是「本地差异比对」的过滤条件（`bc_filter`，这里是唯一编辑入口），
+    /// 下面一格是「屏蔽可提交项」（`commit_excludes`，决定哪些改动不进本次提交）。
+    /// 两格都落盘、长期生效；各管各的口径，互不牵连。边写边存，「确认」关窗并按新规则重读本目录。
+    pub(crate) fn commit_rules_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.commit_rules.clone() else {
+            return;
+        };
+        let dir = dialog.dir;
+        // 窗口开着时目录可能已被移除：这个窗口没有归属，直接收掉
+        if self.cfg.dirs.get(dir).is_none() {
+            self.commit_rules = None;
+            return;
+        }
+        let label = self.dir_label(dir);
+        // 命中数按最近一次读取的完整清单现算（被挡掉的那些也在里面）：这扇窗从主页「更多」
+        // 就能开，那时没有提交页的掩码可读，而 changes 早滤干净了、数出来永远是 0
+        let excludes = self.cfg.dirs[dir].commit_excludes.clone();
+        let read_once = self.dirs.get(dir).and_then(|view| view.changed).is_some();
+        let hidden = match (self.dirs.get(dir), self.dir_path(dir)) {
+            (Some(view), Some(root)) => {
+                crate::commit::excluded_count(&view.all_changes, &root, &excludes)
+            }
+            _ => 0,
+        };
+        // 过滤那格只能报上次比对的数：新条件要重跑一遍比对才落地
+        let diff_note = match self.dirs.get(dir).and_then(|view| view.local_diff.as_ref()) {
+            Some(summary) => format!("上次比对：本地差异 {} 项", summary.total()),
+            None => "上次比对：尚未比对".to_owned(),
+        };
+        let excludes_before = self.cfg.dirs[dir].commit_excludes.clone();
+        let mut open = true;
+        // 标题栏的 ✕ 由 `open` 管，「确认」按钮另记一笔：Window::open 已经把 open 借走，
+        // 闭包里再改就是同一份可变借用两次
+        let mut close = false;
+        let mut confirmed = false;
+        egui::Window::new(format!("差异过滤与提交屏蔽 · {label}"))
+            .open(&mut open)
+            .default_width(520.0)
+            .centered(ctx, "commit_rules")
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("本目录的两套规则，都是一行一条、存在配置里长期生效：上面只管差异比较，下面决定会不会被提交。")
+                        .weak()
+                        .size(11.5),
+                );
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("差异比对过滤条件 · 存本目录配置").strong().size(12.5));
+                let filter_field = ui.add(
+                    TextEdit::multiline(&mut dialog.filter_buf)
+                        .hint_text("-*.iml\n-.project\n-bin\\")
+                        .margin(field_margin(ui))
+                        .desired_rows(4)
+                        .min_size(Vec2::new(0.0, 78.0))
+                        .desired_width(f32::INFINITY),
+                );
+                if dialog.focus {
+                    filter_field.request_focus();
+                    dialog.focus = false;
+                }
+                ui.label(
+                    RichText::new(
+                        "写法照 Beyond Compare：`-` 开头是排除、`;` 分隔也认、结尾 \\ 是目录、`.\\` 锚定根目录、* 与 ? 通配。这一格只管差异比较，不影响会不会被提交。",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                ui.aligned_row(|ui| {
+                    ui.label(RichText::new(diff_note).weak().size(11.0));
+                    if ui.button("清空筛选条件").clicked() {
+                        dialog.filter_buf.clear();
+                    }
+                });
+                ui.add_space(8.0);
+
+                ui.label(RichText::new("屏蔽可提交项 · 存本目录配置").strong().size(12.5));
+                ui.add(
+                    TextEdit::multiline(&mut self.cfg.dirs[dir].commit_excludes)
+                        .hint_text("bin\\\n*.log\n.\\auth.json")
+                        .margin(field_margin(ui))
+                        .desired_rows(4)
+                        .min_size(Vec2::new(0.0, 78.0))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label(
+                    RichText::new(
+                        "语法与上面同一套，但不用写 `-`（缺了自动补）；多段路径不带 `.`\\ 锚定会自动补上，否则永不命中。两处规则各存各的，改一边不动另一边。",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                ui.aligned_row(|ui| {
+                    ui.label(
+                        RichText::new(if !read_once {
+                            "读取过本目录的修改状态后，这里才给得出命中数".to_owned()
+                        } else if hidden > 0 {
+                            format!("当前命中 {hidden} 项：不进提交清单，提交页上也看不到")
+                        } else {
+                            "当前未命中任何条目".to_owned()
+                        })
+                        .weak()
+                        .size(11.0),
+                    );
+                    if ui.button("清空屏蔽规则").clicked() {
+                        self.cfg.dirs[dir].commit_excludes.clear();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("确认").strong()))
+                        .on_hover_text(
+                            "关掉窗口，并按刚写下的规则重读一次本目录：主页的「待提交 N」「本地差异 N」\
+                             和这里的命中数一起跟上",
+                        )
+                        .clicked()
+                    {
+                        close = true;
+                        confirmed = true;
+                    }
+                });
+            });
+        // 行视图拼回配置里的分号串；只在真改过时写盘，每帧 persist 会把配置反复落盘
+        let filter = crate::commit::bc_filter_rules(&dialog.filter_buf);
+        let mut changed = false;
+        if self.cfg.dirs[dir].bc_filter != filter {
+            self.cfg.dirs[dir].bc_filter = filter;
+            dialog.filter_dirty = true;
+            changed = true;
+        }
+        if self.cfg.dirs[dir].commit_excludes != excludes_before {
+            changed = true;
+        }
+        if changed {
+            self.persist();
+        }
+        if open && !close {
+            self.commit_rules = Some(dialog);
+        } else {
+            self.commit_rules = None;
+            if confirmed {
+                // 确认是这扇窗唯一会主动重读的出口：检测带着本地差异比对一起跑，
+                // 主页的「待提交 N」「本地差异 N」和窗口里的命中数按新规则一次算齐
+                self.spawn_refresh(dir, false);
+            } else if dialog.filter_dirty {
+                // 筛选条件就是差异口径，改完在关窗时按新口径重算一次
+                self.spawn_local_diff(dir, false);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

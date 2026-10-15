@@ -391,35 +391,66 @@ pub fn ink(ui: &Ui, color: Color32) -> Color32 {
     }
 }
 
-/// 搜索高亮：把命中的 `needle` 片段用醒目底色标出来，其余文字保持原样。
-/// 忽略 ASCII 大小写；按字节匹配是安全的——UTF-8 的后续字节都落在 0x80..=0xBF，
-/// 可用作首字节的一定 >= 0xC2，所以命中位置必然在字符边界上，不会切坏中文。
-pub fn highlight(ui: &Ui, text: &str, needle: &str, font: FontId, color: Color32) -> LayoutJob {
+/// 多个关键字在 `text` 里的命中区间（原文字节位置，已排序、重叠已合并）。
+/// 大小写按 `char::to_lowercase` 逐字符折叠，与 `str::to_lowercase` 同一个口径——提交页的
+/// 过滤判定走的就是 `to_lowercase`，两边共用一套才不会出现「过滤留下了这条、高亮却不标」。
+/// 端点必然落在字符边界上：折叠是逐字符做的，一个原文字符折出几个字符都归给同一段。
+/// 关键字按原样匹配，调用方负责先转小写（提交页的 `filter_needles` 就是干这个的）。
+pub fn hit_ranges(text: &str, needles: &[String]) -> Vec<(usize, usize)> {
+    let mut folded = String::new();
+    // folded 的每个字节 → 它来自原文哪个字符的字节区间（按字节记，命中偏移直接可查）
+    let mut owners: Vec<(usize, usize)> = Vec::new();
+    for (start, c) in text.char_indices() {
+        let span = (start, start + c.len_utf8());
+        for lower in c.to_lowercase() {
+            folded.push(lower);
+            owners.extend(std::iter::repeat(span).take(lower.len_utf8()));
+        }
+    }
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for needle in needles {
+        let key = needle.as_str();
+        if key.is_empty() {
+            continue;
+        }
+        for (at, _) in folded.match_indices(key) {
+            let last = at + key.len() - 1;
+            hits.push((owners[at].0, owners[last].1));
+        }
+    }
+    hits.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in hits {
+        // 相邻也算连成一段：两个关键字挨着时中间不该留一条没涂色的缝
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+/// 搜索高亮：把命中的片段用醒目底色标出来，其余文字保持原样。关键字可以有多个（任一命中就标）。
+pub fn highlight(ui: &Ui, text: &str, needles: &[String], font: FontId, color: Color32) -> LayoutJob {
     let plain = TextFormat::simple(font, color);
     let mut job = LayoutJob::default();
-    let key = needle.trim().as_bytes();
-    if key.is_empty() {
+    let ranges = hit_ranges(text, needles);
+    if ranges.is_empty() {
         job.append(text, 0.0, plain);
         return job;
     }
     let dark = ui.visuals().dark_mode;
     let mark = mark_format(dark, &plain);
-    let bytes = text.as_bytes();
     let mut cursor = 0usize;
-    while cursor + key.len() <= bytes.len() {
-        let found = bytes[cursor..].windows(key.len()).position(|window| {
-            window
-                .iter()
-                .zip(key)
-                .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        });
-        let Some(offset) = found else { break };
-        let start = cursor + offset;
+    for (start, end) in ranges {
         job.append(&text[cursor..start], 0.0, plain.clone());
-        job.append(&text[start..start + key.len()], 0.0, mark.clone());
-        cursor = start + key.len();
+        job.append(&text[start..end], 0.0, mark.clone());
+        cursor = end;
     }
-    if cursor < bytes.len() {
+    if cursor < text.len() {
         job.append(&text[cursor..], 0.0, plain);
     }
     job
@@ -598,17 +629,18 @@ mod tests {
     use egui::{Context, RawInput, ThemePreference};
 
     /// 跑一遍高亮，把结果拆成「未命中的原文」与「命中的片段」，方便断言。
-    fn split(dark: bool, text: &str, needle: &str) -> (String, Vec<String>) {
+    fn split(dark: bool, text: &str, needles: &[&str]) -> (String, Vec<String>) {
         let ctx = Context::default();
         ctx.set_theme(if dark {
             ThemePreference::Dark
         } else {
             ThemePreference::Light
         });
+        let needles: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
         let mut plain = String::new();
         let mut marks: Vec<String> = Vec::new();
         let mut output = ctx.run_ui(RawInput::default(), |ui| {
-            let job = highlight(ui, text, needle, FontId::proportional(12.0), Color32::WHITE);
+            let job = highlight(ui, text, &needles, FontId::proportional(12.0), Color32::WHITE);
             for section in &job.sections {
                 let range = section.byte_range.start.0..section.byte_range.end.0;
                 let piece = &job.text[range];
@@ -629,16 +661,49 @@ mod tests {
 
     #[test]
     fn empty_needle_keeps_text_untouched() {
-        let (plain, marks) = split(true, "svn log -r HEAD:1", "   ");
+        let (plain, marks) = split(true, "svn log -r HEAD:1", &["   "]);
         assert_eq!(plain, "svn log -r HEAD:1");
         assert!(marks.is_empty(), "{marks:?}");
     }
 
     #[test]
     fn marks_every_match_case_insensitively() {
-        let (plain, marks) = split(true, "SVN svn svn/HRP.Hr", "svn");
+        let (plain, marks) = split(true, "SVN svn svn/HRP.Hr", &["svn"]);
         assert_eq!(marks, vec!["SVN", "svn", "svn"]);
         assert_eq!(plain, "  /HRP.Hr");
+    }
+
+    /// 多个关键字一起给：各自命中都要标，区间重叠的合并成一段（同一片字涂两遍底色会变深）。
+    #[test]
+    fn overlapping_needles_merge_into_one_mark() {
+        let (plain, marks) = split(true, r"src\svn\SvnFoo.java", &["svn", "svnfoo"]);
+        assert_eq!(marks, vec!["svn", "SvnFoo"], "{marks:?}");
+        assert_eq!(plain, r"src\\.java");
+    }
+
+    /// 命中判定要和 `str::to_lowercase` 完全同口径：过滤依据用的就是它，两边不一致就会出现
+    /// 「这一条留下了、高亮却不标」。顺带验证区间端点都落在字符边界上（切中文不 panic）。
+    #[test]
+    fn hit_ranges_agree_with_to_lowercase_contains() {
+        for text in [r"src\视图\SVN报告.java", r"报告\Report.txt", "纯中文没有英文"] {
+            for needle in ["svn", "报告", "视图", "repor", "中文"] {
+                let hits = hit_ranges(text, &[needle.to_lowercase()]);
+                assert_eq!(
+                    !hits.is_empty(),
+                    text.to_lowercase().contains(needle),
+                    "{text} / {needle}"
+                );
+                let mut rebuilt = String::new();
+                let mut cursor = 0;
+                for (start, end) in &hits {
+                    rebuilt.push_str(&text[cursor..*start]);
+                    rebuilt.push_str(&text[*start..*end]);
+                    cursor = *end;
+                }
+                rebuilt.push_str(&text[cursor..]);
+                assert_eq!(rebuilt, text, "区间必须能拼回原文：{hits:?}");
+            }
+        }
     }
 
     /// 相对亮度（WCAG 2.x）：对比度断言用，和视觉上的明暗感受一致
@@ -757,8 +822,8 @@ mod tests {
 
     #[test]
     fn multibyte_needle_splits_on_char_boundaries() {
-        // 前后夹着中文，确认按字节匹配不会把 UTF-8 序列切坏（切坏会直接 panic）
-        let (plain, marks) = split(false, "修复 药品明细 保存 药品", "药品");
+        // 前后夹着中文，确认命中区间的端点都落在字符边界上（切坏 UTF-8 序列会直接 panic）
+        let (plain, marks) = split(false, "修复 药品明细 保存 药品", &["药品"]);
         assert_eq!(marks, vec!["药品", "药品"]);
         assert_eq!(plain, "修复 明细 保存 ");
     }
